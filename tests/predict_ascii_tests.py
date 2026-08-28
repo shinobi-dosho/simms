@@ -208,6 +208,37 @@ def test_transient_lightcurve_is_independent_of_row_blocking(params):
     assert prepared.lightcurve[0].max() == pytest.approx(1.0, abs=1e-6)
 
 
+def test_mixed_catalogue_modulates_only_the_transient_source(params):
+    """A catalogue may hold a line, a transient and a plain source at once; only the
+    transient one gets a lightcurve, and the line one keeps its Gaussian spectrum."""
+    model = "\n".join(
+        [
+            "#format: name ra dec stokes_i line_peak line_width "
+            "transient_start transient_period transient_ingress transient_absorb",
+            "line 15.06deg -31.20deg 2.0 1.41e9 2e7 null null null null",
+            "trans 15.02deg -31.05deg 1.25 null null 100s 200 40 0.02",
+            "plain 14.95deg -30.90deg 3.0 null null null null null null",
+        ]
+    )
+    sky = ASCIISkymodel(params.write_temp_file(model), source_schema_file=SCHEMA)
+    assert [(s.is_line, s.is_transient) for s in sky.sources] == [(True, False), (False, True), (False, False)]
+
+    unique_times = 5.0e9 + np.arange(40) * 8.0
+    prepared = prepare_skymodel(sky, UNIFORM_FREQS, RA0, DEC0, ncorr=2, unique_times=unique_times)
+
+    # only the transient source varies in time
+    assert prepared.lightcurve[1].min() == pytest.approx(0.98, abs=1e-6)
+    assert np.array_equal(prepared.lightcurve[[0, 2]], np.ones((2, unique_times.size)))
+
+    # the line source's Stokes I follows the Gaussian, peaking at the channel nearest 1.41 GHz
+    stokes_i = prepared.bmat[0, 0].real
+    assert np.argmax(stokes_i) == int(np.argmin(np.abs(UNIFORM_FREQS - 1.41e9)))
+    assert stokes_i.max() == pytest.approx(2.0)  # UNIFORM_FREQS[1] sits on the line centre
+    assert stokes_i[0] < 2.0 and stokes_i[-1] < stokes_i[0]  # and falls off either side
+    # the plain source is flat at its catalogue flux
+    assert np.allclose(prepared.bmat[2, 0].real, 3.0)
+
+
 def test_transient_requires_unique_times(params):
     model = "\n".join(
         [

@@ -35,6 +35,36 @@ ASCII sky model schema
 - **Continuum sources** need a reference frequency (``cont_reffreq``) and at
   least one power-law coefficient (``cont_coeff_1`` = spectral index,
   ``cont_coeff_2`` = curvature, ...).
+- **Transient sources** are modulated by a logistic transit lightcurve:
+  ``transient_start`` (from the start of the observation), ``transient_period``
+  (the whole event, ingress and egress included), ``transient_ingress`` and
+  ``transient_absorb`` (peak fractional flux drop). The time fields default to
+  seconds; write ``30min`` for anything else. The lightcurve only scales the
+  spectrum, so a source may be a spectral line *and* a transient.
+
+A type is claimed only when **all** of its fields are given -- a source with
+some but not all of the ``line_*`` or ``transient_*`` fields is an error, not
+silently a plain source.
+
+Mixing source types in one catalogue
+....................................
+
+A catalogue is a single table, so a file holding more than one source type
+carries every type's columns and the rows that are not of a given type mark
+those columns unset with ``null`` (or an empty field, with
+``--ascii-delimiter ,``):
+
+.. code-block:: text
+
+    #format: name ra dec stokes_i line_peak line_width transient_start transient_period transient_ingress transient_absorb
+    aline  0h24m20s -30d12m33s 1.0 1.42GHz 10MHz null null null null
+    atrans 0h25m00s -30d10m00s 2.0 null    null  100  500  50   0.5
+    both   0h23m40s -30d14m00s 3.0 1.30GHz 5MHz  200  400  40   0.2
+    plain  0h24m00s -30d13m00s 4.0 null    null  null null null null
+
+An unset column behaves exactly as if it were absent from the header for that
+row. ``null``, ``none``, ``nan`` and an empty field are all accepted, in any
+case.
 
 See :doc:`schemas` for the full schema, and use ``--ascii-species`` to select
 a non-default catalogue mapping (e.g. ``bdsf_gaul`` for a PyBDSF catalogue).
@@ -51,19 +81,25 @@ Tune the prediction with ``--pixel-tol`` (minimum pixel brightness considered,
 default ``1e-7``), ``--fft-precision`` (``single``/``double``), and
 ``--no-do-wstacking`` to disable w-stacking.
 
-Adding or subtracting an existing column
-------------------------------------------
+Adding to or subtracting from an existing column
+-------------------------------------------------
 
-Once visibilities are simulated into one column, add or subtract them
-against another:
+``--mode`` says how the freshly simulated visibilities reach ``--column``.
+The default, ``sim``, overwrites it. ``add`` and ``subtract`` instead combine
+the simulation with an existing column, which defaults to ``--column`` itself:
 
 .. code-block:: console
 
-    $ simms skysim --ic DATA --column MODEL_DATA --mode add visdata.ms
-    $ simms skysim --ic DATA --column MODEL_DATA --mode subtract visdata.ms
+    # add the sky model on top of what is already in DATA
+    $ simms skysim --ascii-sky skymodel.txt --column DATA --mode add visdata.ms
 
-``--ic``/``--input-column`` is the source column; ``--column`` is where the
-result is written; ``--mode`` defaults to ``simulate``.
+    # subtract the sky model from DATA, writing the residual to CORRECTED_DATA
+    $ simms skysim --ascii-sky skymodel.txt --ic DATA --column CORRECTED_DATA \
+        --mode subtract visdata.ms
+
+``--ic``/``--input-column`` names the column to combine with when it is not
+``--column``; it must already exist. Every mode still needs something to
+simulate -- a sky model, ``--sefd``, or both.
 
 Thermal noise
 -------------

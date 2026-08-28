@@ -538,16 +538,26 @@ def runit(opts):
     if simvis is None:
         raise RuntimeError("Nothing to simulate: provide a sky model (--ascii-sky/--fits-sky/--wsclean-sky) or --sefd.")
 
-    if opts.input_column:
-        if not hasattr(msds, opts.input_column):
-            raise RuntimeError(f"Specified input-column '{opts.input_column}' does not exist in the MS")
-        incol = getattr(msds, opts.input_column).data
-        if opts.mode == "add":
-            outvis = incol + simvis
-        elif opts.mode == "subtract":
-            outvis = incol - simvis
-        elif opts.mode == "sim":
-            outvis = simvis
+    # 'add'/'subtract' combine the simulation with an existing column. --input-column
+    # names it, but "add to DATA" is what the mode means without one, so it defaults to
+    # the output column -- otherwise the mode was silently a no-op that overwrote it.
+    input_column = opts.input_column
+    if opts.mode in ("add", "subtract") and not input_column:
+        input_column = opts.column
+        log.info("--mode %s with no --input-column: combining with '%s'.", opts.mode, input_column)
+    elif opts.mode == "sim" and input_column:
+        log.warning("--input-column '%s' is ignored in 'sim' mode, which overwrites '%s'.", input_column, opts.column)
+        input_column = None
+
+    if input_column:
+        if not hasattr(msds, input_column):
+            raise RuntimeError(
+                f"Specified input-column '{input_column}' does not exist in the MS. "
+                f"--mode {opts.mode} needs an existing column to combine with; run with "
+                f"--mode sim first, or point --input-column at a column that is there."
+            )
+        incol = getattr(msds, input_column).data
+        outvis = incol + simvis if opts.mode == "add" else incol - simvis
     else:
         outvis = simvis
 
@@ -710,11 +720,14 @@ def skysim(
         None, description="Non-simms sky model type.", json_schema_extra={"abbreviation": "asp"}
     ),
     input_column: str | None = Field(
-        None, description="Input column (see option --mode).", json_schema_extra={"abbreviation": "ic"}
+        None,
+        description="Column that 'add'/'subtract' combine the simulation with. Defaults to --column.",
+        json_schema_extra={"abbreviation": "ic"},
     ),
     mode: Literal["sim", "add", "subtract"] = Field(
         "sim",
-        description="Simulation mode: 'sim' creates a new column, 'add' adds to it, 'subtract' subtracts from it.",
+        description="How the simulation reaches --column: 'sim' overwrites it, 'add' adds the simulation to "
+        "--input-column, 'subtract' subtracts it from --input-column. --input-column defaults to --column.",
     ),
     source_schema: str | None = Field(
         None,

@@ -15,6 +15,7 @@ from simms import SCHEMADIR
 from simms.exceptions import (
     ASCIISkymodelError,
     ASCIISourceError,
+    SkymodelSchemaError,
 )
 from simms.skymodel.source_factory import (
     StokesData,
@@ -31,6 +32,21 @@ from simms.skymodel.source_factory import (
 from simms.utilities import ObjDict, load_yaml, quantity_to_value
 
 DEFAULT_SOURCE_SCHEMA = os.path.join(SCHEMADIR, "source_schema.yaml")
+
+# A catalogue is one table, so a file holding more than one source type has to carry
+# every type's columns; the rows that are not of a given type mark theirs as unset with
+# one of these tokens (or an empty field, for a delimited file). An unset column behaves
+# exactly as if it were absent from the header for that row -- in particular it does not
+# make the source claim a source type whose values are all None.
+NULL_TOKENS = frozenset({"", "null", "none", "nan"})
+
+
+def is_unset(value: str | float | int | None) -> bool:
+    """True if an ASCII field marks the parameter as not set for this source."""
+    if value is None:
+        return True
+    return isinstance(value, str) and value.strip().lower() in NULL_TOKENS
+
 
 PTYPE_MAPPER = {
     # parameter type: (converter, default_units, null_value)
@@ -130,8 +146,16 @@ class ASCIISource:
 
         Notes
         -----
-        This method updates the instance in place.
+        This method updates the instance in place. A value that :func:`is_unset`
+        recognises (an empty field, or ``null``/``none``/``nan``) leaves the
+        parameter unset, as if the column were absent from the header.
         """
+        if is_unset(value):
+            # Leave the parameter off the source entirely: registering it would put the
+            # field in existing_fields, and a null-valued line_* or transient_* column
+            # would then type the source as a line/transient source whose parameters are
+            # all None. See NULL_TOKENS.
+            return
         param = getattr(self.parameters, field)
         param.set_value(value)
         setattr(self, field, param.value)
@@ -427,10 +451,17 @@ class ASCIISkymodel:
                     )
 
                 source = ASCIISource(self.schema)
-                for param, value in zip(header, rowdata, strict=True):
-                    source.set_source_param(alias_to_field[param], value)
-                # source has been fully set, finalise and add it to rest of the sources
-                source.finalise()
+                try:
+                    for param, value in zip(header, rowdata, strict=True):
+                        source.set_source_param(alias_to_field[param], value)
+                    # source has been fully set, finalise and add it to rest of the sources
+                    source.finalise()
+                except (ASCIISourceError, SkymodelSchemaError, ValueError, aunits.UnitsError) as exc:
+                    # Point at the offending row: the parse and validation errors name a
+                    # field but not which source it came from, which is useless in a
+                    # catalogue of thousands. Re-raise the same type so callers that
+                    # discriminate on ASCIISourceError still see it.
+                    raise type(exc)(f"{self.skymodel_file}, line {counter + 2}: {exc}") from exc
                 # Record the source's line index in the file (header is line 0, so the first
                 # data line -- counter 0 -- is line 1). Lets consumers map a parsed source back
                 # to its original text line without re-deriving the comment/blank-line skips.

@@ -99,9 +99,9 @@ parameters:
     units: null
     ptype: number
   transient_start:
-    info: Beginning of transient event relative to observation start
+    info: Beginning of transient event relative to observation start; default units
     alias: null
-    units: null
+    units: s
     ptype: time
   transient_period:
     info:  Total time of transient event, including ingress and egress
