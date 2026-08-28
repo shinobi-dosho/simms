@@ -81,19 +81,25 @@ Tune the prediction with ``--pixel-tol`` (minimum pixel brightness considered,
 default ``1e-7``), ``--fft-precision`` (``single``/``double``), and
 ``--no-do-wstacking`` to disable w-stacking.
 
-Adding or subtracting an existing column
-------------------------------------------
+Adding to or subtracting from an existing column
+-------------------------------------------------
 
-Once visibilities are simulated into one column, add or subtract them
-against another:
+``--mode`` says how the freshly simulated visibilities reach ``--column``.
+The default, ``sim``, overwrites it. ``add`` and ``subtract`` instead combine
+the simulation with an existing column, which defaults to ``--column`` itself:
 
 .. code-block:: console
 
-    $ simms skysim --ic DATA --column MODEL_DATA --mode add visdata.ms
-    $ simms skysim --ic DATA --column MODEL_DATA --mode subtract visdata.ms
+    # add the sky model on top of what is already in DATA
+    $ simms skysim --ascii-sky skymodel.txt --column DATA --mode add visdata.ms
 
-``--ic``/``--input-column`` is the source column; ``--column`` is where the
-result is written; ``--mode`` defaults to ``simulate``.
+    # subtract the sky model from DATA, writing the residual to CORRECTED_DATA
+    $ simms skysim --ascii-sky skymodel.txt --ic DATA --column CORRECTED_DATA \
+        --mode subtract visdata.ms
+
+``--ic``/``--input-column`` names the column to combine with when it is not
+``--column``; it must already exist. Every mode still needs something to
+simulate -- a sky model, ``--sefd``, or both.
 
 Thermal noise
 -------------
