@@ -525,3 +525,79 @@ def test_transient_brightness_matrix_time_axis():
     mapper = [0, 0, 5, 19]
     bmatrix_mapped = src.get_brightness_matrix(freqs, ncorr=4, unique_times=unique_times, time_index_mapper=mapper)
     assert bmatrix_mapped.shape == (4, 4, 3)
+
+
+MIXED_HEADER = (
+    "#format: name ra dec stokes_i line_peak line_width "
+    "transient_start transient_period transient_ingress transient_absorb"
+)
+
+
+def test_mixed_source_types_in_one_catalogue(params):
+    # A catalogue is one table, so a file holding a line source and a transient source
+    # must carry both sets of columns; the rows that are not of a type null theirs out.
+    # Before this was handled, a null column still typed the source, and the line source
+    # checks tripped over the resulting None line_width.
+    model = ASCIISkymodel(
+        params.write_temp_file(
+            "\n".join(
+                [
+                    MIXED_HEADER,
+                    "LINE 0.0 -30.0 1.0 1.42e9 1e7 null null null null",
+                    "TRANS 0.1 -30.1 2.0 null null 100 500 50 0.5",
+                    "BOTH 0.2 -30.2 3.0 1.3e9 5e6 200 400 40 0.2",
+                    "PLAIN 0.3 -30.3 4.0 null null null null null null",
+                    "",
+                ]
+            )
+        )
+    )
+    types = {src.name: (src.is_line, src.is_transient) for src in model.sources}
+    assert types == {
+        "LINE": (True, False),
+        "TRANS": (False, True),
+        "BOTH": (True, True),
+        "PLAIN": (False, False),
+    }
+    assert model.has_transient is True
+
+    # a nulled field is not merely defaulted, it is absent
+    assert getattr(model.sources[1], "line_peak", None) is None
+
+    # and the model still predicts: only the transient sources pick up a time axis
+    freqs = np.array([1.30e9, 1.42e9])
+    unique_times = 1e9 + 60.0 * np.arange(10)
+    shapes = [src.get_brightness_matrix(freqs, ncorr=2, unique_times=unique_times).shape for src in model.sources]
+    assert shapes == [(2, 2), (2, 10, 2), (2, 10, 2), (2, 2)]
+
+
+def test_empty_field_in_delimited_catalogue_is_unset(params):
+    # A comma-delimited catalogue marks a column unset by leaving it empty
+    model = ASCIISkymodel(
+        params.write_temp_file(
+            "#format: name,ra,dec,stokes_i,line_peak,line_width\nSrc,0.0,-30.0,1.0,,\n",
+        ),
+        delimiter=",",
+    )
+    assert model.sources[0].is_line is False
+
+
+def test_transient_start_accepts_a_bare_number(params):
+    # transient_start defaults to seconds like the other transient fields; a bare
+    # number used to raise a dimensionless-to-seconds UnitConversionError.
+    src = parse_single_source(
+        params,
+        "#format: ra dec stokes_i transient_start transient_period transient_ingress transient_absorb\n"
+        "0 -30 1.0 100 500 50 0.5\n",
+    )
+    assert src.is_transient is True
+    assert src.transient_start == 100.0
+
+
+def test_parse_error_names_the_offending_row(params):
+    with pytest.raises(ASCIISourceError, match="line 3"):
+        ASCIISkymodel(
+            params.write_temp_file(
+                "#format: ra dec stokes_i line_peak line_width\n0 -30 1.0 1.42e9 1e7\n0 -31 1.0 1.42e9 0\n"
+            )
+        )
