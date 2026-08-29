@@ -111,6 +111,55 @@ Thermal noise
 Provide either ``--sefd`` (System Equivalent Flux Density, in Jy) or
 ``--tsys-over-eta`` (:math:`T_\mathrm{sys}/\eta`).
 
+Use ``--random-seed`` to make the noise realisation reproducible at a given
+chunking.
+
+Corruptions
+-----------
+
+``skysim`` can apply RIME Jones corruptions to the predicted visibilities from
+a YAML specification:
+
+.. code-block:: console
+
+    $ simms skysim --ascii-sky skymodel.txt --column DATA \
+        --corruptions corruptions.yaml --random-seed 42 visdata.ms
+
+The file describes an ordered list of terms and a specification for each one:
+
+.. code-block:: yaml
+
+    gains:
+      terms: [G, B]
+      spec:
+        - label: G
+          diagonal: true
+          complex: true
+          axes: [time]
+          period:
+            time: "2min"
+          amplitude: 0.1
+        - label: B
+          diagonal: true
+          complex: true
+          axes: [frequency]
+          period:
+            frequency: "8MHz"
+          amplitude: 0.05
+
+Term labels are arbitrary strings. ``terms`` gives the multiplication order;
+the per-baseline corruption is :math:`V'_{pq} = J_p(t,f) \, V_{pq}(t,f) \,
+J_q(t,f)^H`.  ``diagonal: true`` means the term is a scalar times the identity
+(so both polarisations receive the same gain); ``diagonal: false`` produces a
+full 2x2 Jones matrix and requires a 4-correlation MS.  ``complex: true`` uses
+a complex sinusoid, ``false`` a real cosine.
+
+``axes`` selects which dimensions vary (``time`` and/or ``frequency``).  ``period``
+is a mapping from axis name to value; values can be raw numbers (seconds for
+``time``, Hz for ``frequency``) or ``astropy`` strings such as ``"2min"`` or
+``"2MHz"``.  A scalar ``period`` is accepted as shorthand when a term has a
+single axis.
+
 Chunking large MSs
 -------------------
 
