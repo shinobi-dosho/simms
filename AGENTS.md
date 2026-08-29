@@ -76,9 +76,13 @@ other tables ship as ordinary bundled package data.
 `skysim` applies RIME Jones corruptions after prediction when `--corruptions` points to a YAML
 spec. The spec lists an ordered `terms` array of arbitrary labels and a `spec` array describing each
 term: `axes` (`time` and/or `frequency`), `diagonal`/`complex` flags, `amplitude`, and `period`.
+Omitting `diagonal` follows the MS -- full 2x2 Jones on a 4-correlation MS, scalar gain otherwise;
+an explicit `diagonal: false` on a 2-correlation MS is an error, not a downgrade.
 Periods are in seconds/Hz or `astropy`-compatible strings (e.g. `"2min"`, `"2MHz"`). The
 per-baseline corruption is `V' = J_p V J_q^H`, with terms multiplied left-to-right in the order
-given. Non-diagonal (full 2x2) terms require a 4-correlation MS. `--seed-noise` seeds thermal
+given. Non-diagonal (full 2x2) terms require a 4-correlation MS. Corruptions are applied to the
+model *before* thermal noise is added (`V' = J_p V J_q^H + n`), so the noise is never
+gain-modulated. `--seed-noise` seeds thermal
 noise and `--seed-gains` the corruption terms, so corruptions cannot alter the noise realisation.
 `--seed` is a deprecated alias for `--seed-noise` (the same value gives the same noise).
 

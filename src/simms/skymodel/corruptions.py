@@ -19,10 +19,17 @@ DIMENSION_UNITS = {
 
 @dataclass
 class TermSpec:
-    """Description of a single Jones corruption term."""
+    """Description of a single Jones corruption term.
+
+    ``diagonal`` is tri-state: ``None`` (the default, i.e. the key was left out
+    of the YAML) means "whatever the MS can carry" -- a full 2x2 Jones on a
+    4-correlation MS, a scalar gain otherwise. Setting it explicitly overrides
+    that, and an explicit ``false`` on a non-4-correlation MS is an error rather
+    than a silent downgrade.
+    """
 
     label: str
-    diagonal: bool = True
+    diagonal: bool | None = None
     complex: bool = True
     axes: list[Literal["time", "frequency"]] = field(default_factory=list)
     period: float | int | str | dict[str, float | int | str] | None = None
@@ -92,6 +99,17 @@ def load_corruption_spec(path: str) -> CorruptionSpec:
     return CorruptionSpec(terms=terms, spec=specs)
 
 
+def resolve_diagonal(spec: TermSpec, ncorr: int) -> bool:
+    """Resolve a term's ``diagonal`` flag against the MS correlation count.
+
+    An unset flag follows the MS: a 4-correlation MS can carry a full 2x2 Jones,
+    so it gets one; anything else can only carry a scalar gain.
+    """
+    if spec.diagonal is None:
+        return ncorr != 4
+    return spec.diagonal
+
+
 def validate_spec(spec: CorruptionSpec, ncorr: int) -> None:
     """Raise RuntimeError if the specification is inconsistent with the MS."""
     labels = [s.label for s in spec.spec]
@@ -128,16 +146,17 @@ def validate_spec(spec: CorruptionSpec, ncorr: int) -> None:
         if s.amplitude < 0:
             raise RuntimeError(f"Corruption term '{s.label}' amplitude must be non-negative")
 
-    if any(not s.diagonal for s in spec.spec) and ncorr != 4:
+    if any(s.diagonal is False for s in spec.spec) and ncorr != 4:
         raise RuntimeError("Non-diagonal (full) Jones corruptions require a 4-correlation MS")
 
 
-def _build_term_params(spec: TermSpec, nant: int, random_seed: int | None) -> dict:
+def _build_term_params(spec: TermSpec, nant: int, random_seed: int | None, ncorr: int) -> dict:
     """Build deterministic numpy parameters for a single term."""
+    diagonal = resolve_diagonal(spec, ncorr)
     rng = np.random.default_rng(_term_seed(random_seed, spec.label))
     params = {
         "label": spec.label,
-        "diagonal": spec.diagonal,
+        "diagonal": diagonal,
         "complex": spec.complex,
         "axes": spec.axes,
         "period": _normalise_period(spec.period, spec.axes),
@@ -145,7 +164,7 @@ def _build_term_params(spec: TermSpec, nant: int, random_seed: int | None) -> di
         "phases": {axis: rng.random(nant) for axis in spec.axes},
     }
 
-    if not spec.diagonal:
+    if not diagonal:
         if spec.complex:
             magnitude = rng.random((nant, 2, 2))
             phase = 2.0 * np.pi * rng.random((nant, 2, 2))
@@ -157,10 +176,10 @@ def _build_term_params(spec: TermSpec, nant: int, random_seed: int | None) -> di
     return params
 
 
-def _build_all_term_params(spec: CorruptionSpec, nant: int, random_seed: int | None) -> list[dict]:
+def _build_all_term_params(spec: CorruptionSpec, nant: int, random_seed: int | None, ncorr: int) -> list[dict]:
     """Build parameters for every term in multiplication order."""
     label_to_spec = {s.label: s for s in spec.spec}
-    return [_build_term_params(label_to_spec[label], nant, random_seed) for label in spec.terms]
+    return [_build_term_params(label_to_spec[label], nant, random_seed, ncorr) for label in spec.terms]
 
 
 def _compute_oscillation(params: dict, time: np.ndarray, freqs: np.ndarray, t0: float, freq0: float) -> np.ndarray:
@@ -310,8 +329,9 @@ def apply_corruptions(
     freq0 = float(freqs[0])
     nant = max(int(antenna1.max().compute()), int(antenna2.max().compute())) + 1
 
-    validate_spec(spec, ncorr=vis.shape[-1])
-    term_params = _build_all_term_params(spec, nant, random_seed)
+    ncorr = vis.shape[-1]
+    validate_spec(spec, ncorr=ncorr)
+    term_params = _build_all_term_params(spec, nant, random_seed, ncorr)
 
     return da.blockwise(
         _corrupt_block,

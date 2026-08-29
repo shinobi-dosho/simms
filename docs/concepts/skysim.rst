@@ -151,8 +151,11 @@ Term labels are arbitrary strings. ``terms`` gives the multiplication order;
 the per-baseline corruption is :math:`V'_{pq} = J_p(t,f) \, V_{pq}(t,f) \,
 J_q(t,f)^H`.  ``diagonal: true`` means the term is a scalar times the identity
 (so both polarisations receive the same gain); ``diagonal: false`` produces a
-full 2x2 Jones matrix and requires a 4-correlation MS.  ``complex: true`` uses
-a complex sinusoid, ``false`` a real cosine.
+full 2x2 Jones matrix and requires a 4-correlation MS.  Leaving ``diagonal``
+out follows the MS: a 4-correlation MS gets the full 2x2 Jones, anything else
+the scalar gain.  An explicit ``diagonal: false`` on a 2-correlation MS is an
+error rather than a silent downgrade.  ``complex: true`` uses a complex
+sinusoid, ``false`` a real cosine.
 
 ``axes`` selects which dimensions vary (``time`` and/or ``frequency``).  ``period``
 is a mapping from axis name to value; values can be raw numbers (seconds for
@@ -164,6 +167,12 @@ The random per-antenna phases (and matrices, for full terms) draw from
 ``--seed-gains``; omitting it gives a deterministic per-label draw. Corruptions
 never touch the thermal-noise stream, which is seeded separately by
 ``--seed-noise``.
+
+Gains corrupt the sky signal only.  Receiver noise enters the signal chain
+after the antenna gains, so a noisy run computes :math:`V'_{pq} = J_p V_{pq}
+J_q^H + n_{pq}`: ``--sefd`` noise is added after the corruptions and is not
+gain-modulated.  A noise-only run (``--sefd`` with no sky model) therefore has
+nothing for ``--corruptions`` to act on, and warns.
 
 Chunking large MSs
 -------------------

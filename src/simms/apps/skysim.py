@@ -531,6 +531,27 @@ def runit(opts):
                 concatenate=True,
             )
 
+    # Corruptions go on the model, before the noise. Receiver noise enters the
+    # signal chain after the antenna gains, so a noisy RIME is
+    # V' = J_p V J_q^H + n -- corrupting the sum would gain-modulate the noise.
+    if opts.corruptions:
+        if simvis is None:
+            log.warning(
+                "--corruptions has no effect on a noise-only run: gains apply to the sky signal, "
+                "and thermal noise is added after the gain chain."
+            )
+        else:
+            spec = load_corruption_spec(opts.corruptions)
+            simvis = apply_corruptions(
+                simvis,
+                msds.TIME.data,
+                msds.ANTENNA1.data,
+                msds.ANTENNA2.data,
+                freqs,
+                spec,
+                random_seed=opts.seed_gains,
+            )
+
     # Thermal noise, added once for every path. With --seed-noise the draw is
     # reproducible across runs at a given chunking; changing the chunking changes
     # the realisation, as dask keys each block's stream to its position in the grid.
@@ -543,18 +564,6 @@ def runit(opts):
             seed=seed_noise,
         )
         simvis = noise if simvis is None else simvis + noise
-
-    if simvis is not None and opts.corruptions:
-        spec = load_corruption_spec(opts.corruptions)
-        simvis = apply_corruptions(
-            simvis,
-            msds.TIME.data,
-            msds.ANTENNA1.data,
-            msds.ANTENNA2.data,
-            freqs,
-            spec,
-            random_seed=opts.seed_gains,
-        )
 
     if simvis is None:
         raise RuntimeError("Nothing to simulate: provide a sky model (--ascii-sky/--fits-sky/--wsclean-sky) or --sefd.")

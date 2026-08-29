@@ -6,9 +6,13 @@
   raw numbers (seconds/Hz) or `astropy`-compatible strings such as `"2min"` and
   `"2MHz"`. The per-baseline corruption is `V' = J_p V J_q^H`, with terms
   multiplied in the order listed. Full (non-diagonal) terms require a
-  4-correlation MS. Frequency phases are referenced to the first channel of the
-  MS, so a corruption is invariant under channel chunking, and gains are sized
-  for the whole array even when a row chunk does not contain every antenna.
+  4-correlation MS; omitting `diagonal` follows the MS, giving a full 2x2 Jones
+  on a 4-correlation MS and a scalar gain otherwise. Corruptions are applied to
+  the model before thermal noise is added (`V' = J_p V J_q^H + n`), so `--sefd`
+  noise is not gain-modulated. Frequency phases are referenced to the first
+  channel of the MS, so a corruption is invariant under channel chunking, and
+  gains are sized for the whole array even when a row chunk does not contain
+  every antenna.
 - `skysim`: deprecate `--seed` in favour of `--seed-noise` (the same value gives
   the same noise realisation; a deprecation warning is emitted). Corruption
   terms draw from their own `--seed-gains`, so adding corruptions cannot change

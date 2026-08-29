@@ -681,3 +681,119 @@ def test_frequency_term_is_invariant_under_channel_chunking():
         return apply_corruptions(vis, time, a1, a2, freqs, spec, random_seed=1).compute()
 
     np.testing.assert_allclose(run(nchan), run(4), rtol=1e-13, atol=1e-14)
+
+
+_UNSET_DIAGONAL_YAML = """
+gains:
+  terms: [J]
+  spec:
+    - label: J
+      complex: true
+      axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.1
+"""
+
+
+def _explicit_diagonal_yaml(diagonal: str) -> str:
+    return f"""
+gains:
+  terms: [J]
+  spec:
+    - label: J
+      diagonal: {diagonal}
+      complex: true
+      axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.1
+"""
+
+
+def test_unset_diagonal_is_full_jones_on_four_correlations(gt4):
+    """An omitted 'diagonal' follows the MS: 4 corrs can carry a full 2x2 Jones."""
+    unset = gt4.write_yaml(_UNSET_DIAGONAL_YAML)
+    explicit = gt4.write_yaml(_explicit_diagonal_yaml("false"))
+
+    skysim.runit(skysim_opts(gt4.ms, ascii_sky=gt4.sky, column="DATA", corruptions=unset, seed_gains=3))
+    from_unset = read_column(gt4.ms, "DATA")
+
+    skysim.runit(skysim_opts(gt4.ms, ascii_sky=gt4.sky, column="DATA", corruptions=explicit, seed_gains=3))
+    from_explicit = read_column(gt4.ms, "DATA")
+
+    np.testing.assert_array_equal(from_unset, from_explicit)
+
+    # And it is genuinely the full-Jones path, not the scalar one: a scalar gain
+    # leaves the (zero) cross-hands zero, a full Jones mixes flux into them.
+    skysim.runit(skysim_opts(gt4.ms, ascii_sky=gt4.sky, column="DATA"))
+    clean = read_column(gt4.ms, "DATA")
+    assert np.allclose(clean[..., 1], 0.0) and np.allclose(clean[..., 2], 0.0)
+    assert not np.allclose(from_unset[..., 1], 0.0)
+
+
+def test_unset_diagonal_is_scalar_on_two_correlations(gt2):
+    """An omitted 'diagonal' falls back to a scalar gain when the MS has 2 corrs."""
+    unset = gt2.write_yaml(_UNSET_DIAGONAL_YAML)
+    explicit = gt2.write_yaml(_explicit_diagonal_yaml("true"))
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=unset, seed_gains=3))
+    from_unset = read_column(gt2.ms, "DATA")
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=explicit, seed_gains=3))
+    from_explicit = read_column(gt2.ms, "DATA")
+
+    np.testing.assert_array_equal(from_unset, from_explicit)
+
+
+def test_noise_is_added_after_the_gain_chain(gt2):
+    """A noisy RIME is J_p V J_q^H + n, so the noise itself is never gain-modulated.
+
+    With no sky model there is nothing to corrupt, so the visibilities must be
+    the bare noise realisation whether or not --corruptions is given.
+    """
+    sefd = 500.0
+    yaml_path = gt2.write_yaml(_explicit_diagonal_yaml("true"))
+
+    skysim.runit(skysim_opts(gt2.ms, column="DATA", sefd=sefd, seed_noise=99))
+    noise_only = read_column(gt2.ms, "DATA")
+
+    skysim.runit(
+        skysim_opts(
+            gt2.ms,
+            column="DATA",
+            sefd=sefd,
+            seed_noise=99,
+            seed_gains=5,
+            corruptions=yaml_path,
+        )
+    )
+    with_corruptions = read_column(gt2.ms, "DATA")
+
+    assert not np.allclose(noise_only, 0.0)
+    np.testing.assert_array_equal(noise_only, with_corruptions)
+
+
+def test_corruptions_leave_the_noise_component_untouched(gt2):
+    """Sky + noise: subtracting the corrupted-model run from the noisy run must
+    return the same noise realisation as a noise-only run.
+
+    Under the old ordering the noise was multiplied by the gains, so this
+    residual would differ from the bare realisation by the gain amplitude (10%
+    here). The tolerance is set by complex64 rounding on the ~2 Jy model that
+    cancels in the subtraction, not by the noise.
+    """
+    sefd = 500.0
+    yaml_path = gt2.write_yaml(_explicit_diagonal_yaml("true"))
+    opts = dict(corruptions=yaml_path, seed_gains=5)
+
+    skysim.runit(skysim_opts(gt2.ms, column="DATA", sefd=sefd, seed_noise=99))
+    noise_only = read_column(gt2.ms, "DATA")
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", **opts))
+    corrupted_model = read_column(gt2.ms, "DATA")
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", sefd=sefd, seed_noise=99, **opts))
+    both = read_column(gt2.ms, "DATA")
+
+    np.testing.assert_allclose(both - corrupted_model, noise_only, rtol=1e-4, atol=1e-6)
