@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import dask.array as da
 import numpy as np
 import pytest
@@ -441,7 +443,13 @@ gains:
 
 
 def test_corruptions_do_not_change_the_noise_realisation(gt2):
-    """Noise draws from --seed-noise only, so adding corruptions leaves it unchanged."""
+    """--seed-gains does not perturb the --seed-noise RNG stream.
+
+    The amplitude is 0, so the gain is exactly 1 and this passes under either
+    noise/gain ordering -- it pins the seed independence, not the ordering. The
+    ordering is covered by test_noise_is_added_after_the_gain_chain and
+    test_corruptions_leave_the_noise_component_untouched.
+    """
     sefd = 500.0
     yaml_path = gt2.write_yaml(
         """
@@ -733,9 +741,19 @@ def test_unset_diagonal_is_full_jones_on_four_correlations(gt4):
 
 
 def test_unset_diagonal_is_scalar_on_two_correlations(gt2):
-    """An omitted 'diagonal' falls back to a scalar gain when the MS has 2 corrs."""
+    """An omitted 'diagonal' falls back to a scalar gain when the MS has 2 corrs.
+
+    This is a no-regression guard, not a test of the tri-state change: 2-corr
+    behaviour is deliberately what it always was, so it passes against the old
+    ``diagonal: bool = True`` default too. It has teeth only because it pins the
+    result to the analytic scalar gain -- a resolution that produced anything
+    other than the scalar term would fail here (or raise).
+    """
     unset = gt2.write_yaml(_UNSET_DIAGONAL_YAML)
     explicit = gt2.write_yaml(_explicit_diagonal_yaml("true"))
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA"))
+    clean = read_column(gt2.ms, "DATA")
 
     skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=unset, seed_gains=3))
     from_unset = read_column(gt2.ms, "DATA")
@@ -745,12 +763,18 @@ def test_unset_diagonal_is_scalar_on_two_correlations(gt2):
 
     np.testing.assert_array_equal(from_unset, from_explicit)
 
+    time, ant1, ant2 = read_aux(gt2.ms)
+    expected = expected_diagonal_factor(time, ant1, ant2, 120.0, 0.1, 3, label="J").astype(from_unset.dtype)
+    np.testing.assert_allclose(from_unset[:, 0, 0] / clean[:, 0, 0], expected, rtol=1e-6, atol=1e-7)
+
 
 def test_noise_is_added_after_the_gain_chain(gt2):
     """A noisy RIME is J_p V J_q^H + n, so the noise itself is never gain-modulated.
 
-    With no sky model there is nothing to corrupt, so the visibilities must be
-    the bare noise realisation whether or not --corruptions is given.
+    This exercises the no-model branch: with no sky model there is nothing to
+    corrupt, so the visibilities must be the bare noise realisation whether or
+    not --corruptions is given. Under the old ordering the gains multiplied the
+    noise, so this failed by the gain amplitude.
     """
     sefd = 500.0
     yaml_path = gt2.write_yaml(_explicit_diagonal_yaml("true"))
@@ -796,4 +820,86 @@ def test_corruptions_leave_the_noise_component_untouched(gt2):
     skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", sefd=sefd, seed_noise=99, **opts))
     both = read_column(gt2.ms, "DATA")
 
+    # atol binds: one float32 ulp at the fixture's 2 Jy model is ~1.2e-7, and the
+    # old gain-modulated noise differed by ~|g-1|*|n| ~ 5e-3. Raising the fixture
+    # source flux by an order of magnitude would eat this margin.
     np.testing.assert_allclose(both - corrupted_model, noise_only, rtol=1e-4, atol=1e-6)
+
+
+def test_falsy_diagonal_is_rejected_up_front(gt2):
+    """YAML `diagonal: 0` is a full-Jones request and must fail validation.
+
+    It parses as int, not bool, so an identity check against False lets it reach
+    the block function and raise from inside a dask task instead of here.
+    """
+    yaml_path = gt2.write_yaml(
+        """
+gains:
+  terms: [J]
+  spec:
+    - label: J
+      diagonal: 0
+      complex: true
+      axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.1
+"""
+    )
+    with pytest.raises(RuntimeError, match="4-correlation"):
+        skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path, seed_gains=1))
+
+
+def test_bad_spec_still_fails_on_a_noise_only_run(gt2):
+    """A noise-only run has nothing to corrupt, but must not silently accept a
+    broken --corruptions file and write a clean-looking noise column."""
+    yaml_path = gt2.write_yaml(
+        """
+gains:
+  terms: [G]
+  spec:
+    - label: NOT_G
+      diagonal: true
+      complex: true
+      axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.1
+"""
+    )
+    with pytest.raises(RuntimeError, match="not described in the spec"):
+        skysim.runit(skysim_opts(gt2.ms, column="DATA", sefd=500.0, seed_noise=1, corruptions=yaml_path))
+
+
+def test_noise_only_run_warns_that_corruptions_are_ignored(gt2):
+    """The user must be told --corruptions did nothing, not left to infer it.
+
+    Captures on skysim's own logger rather than via caplog, and overrides
+    log_level: the shared test opts set it to CRITICAL, and runit applies that
+    to the skysim logger, so a WARNING is filtered out before any handler.
+    """
+    yaml_path = gt2.write_yaml(_explicit_diagonal_yaml("true"))
+
+    messages = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    handler = _Capture(level=logging.WARNING)
+    skysim.log.addHandler(handler)
+    try:
+        skysim.runit(
+            skysim_opts(
+                gt2.ms,
+                column="DATA",
+                sefd=500.0,
+                seed_noise=1,
+                corruptions=yaml_path,
+                log_level="WARNING",
+            )
+        )
+    finally:
+        skysim.log.removeHandler(handler)
+
+    assert any("no effect on a noise-only run" in m for m in messages)

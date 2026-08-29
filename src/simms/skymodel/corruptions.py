@@ -146,7 +146,11 @@ def validate_spec(spec: CorruptionSpec, ncorr: int) -> None:
         if s.amplitude < 0:
             raise RuntimeError(f"Corruption term '{s.label}' amplitude must be non-negative")
 
-    if any(s.diagonal is False for s in spec.spec) and ncorr != 4:
+    # Resolve before testing: `is False` would miss a falsy non-bool from YAML
+    # (`diagonal: 0` parses as int), letting a full-Jones term reach the block
+    # function and fail there instead of here. Equivalent for an unset flag,
+    # which resolves to True whenever ncorr != 4.
+    if any(not resolve_diagonal(s, ncorr) for s in spec.spec) and ncorr != 4:
         raise RuntimeError("Non-diagonal (full) Jones corruptions require a 4-correlation MS")
 
 
@@ -231,9 +235,13 @@ def _corrupt_block(
 ) -> np.ndarray:
     """Apply RIME corruptions to one (row, chan) chunk.
 
-    ``nant``, ``t0`` and ``freq0`` are global (whole-MS) values: sizing gains off
-    this block's own antenna range, or referencing phases to its first channel,
-    would make the result depend on where the chunk boundaries fall.
+    ``nant``, ``t0`` and ``freq0`` span the caller's whole selection: sizing gains
+    off this block's own antenna range, or referencing phases to its first
+    channel, would make the result depend on where the chunk boundaries fall.
+
+    Note the references are per *selection*, not per MS -- ``skysim`` calls this
+    for one field and one SPW at a time, so separate runs over different fields
+    or SPWs of the same MS do not share a time or frequency origin.
     """
     vis = np.asarray(vis)
     time = np.asarray(time)
@@ -248,7 +256,7 @@ def _corrupt_block(
 
     if any_full:
         # Build combined 2x2 Jones per antenna/time/freq.
-        jones = np.broadcast_to(np.eye(2), (nant, nrow, freqs.size, 2, 2)).astype(np.complex128).copy()
+        jones = np.broadcast_to(np.eye(2), (nant, nrow, freqs.size, 2, 2)).astype(np.complex128)
 
         for params in term_params:
             oscillation = _compute_oscillation(params, time, freqs, t0, freq0)
@@ -325,6 +333,8 @@ def apply_corruptions(
     dask.array.Array
         Corrupted visibilities with the same shape and chunking as ``vis``.
     """
+    # Phase origins for the whole selection, so chunk boundaries cannot shift them.
+    # They are *not* MS-wide: `freqs` is one SPW and `time` one field.
     t0 = float(time.min().compute())
     freq0 = float(freqs[0])
     nant = max(int(antenna1.max().compute()), int(antenna2.max().compute())) + 1

@@ -9,10 +9,11 @@
   4-correlation MS; omitting `diagonal` follows the MS, giving a full 2x2 Jones
   on a 4-correlation MS and a scalar gain otherwise. Corruptions are applied to
   the model before thermal noise is added (`V' = J_p V J_q^H + n`), so `--sefd`
-  noise is not gain-modulated. Frequency phases are referenced to the first
-  channel of the MS, so a corruption is invariant under channel chunking, and
-  gains are sized for the whole array even when a row chunk does not contain
-  every antenna.
+  noise is not gain-modulated. Phase references and the gain array size are taken
+  once over the whole selection rather than per dask block, so a corruption is
+  invariant under row and channel chunking; note the references are per field
+  and per SPW, so separate runs over different fields or SPWs of one MS do not
+  share a time or frequency origin.
 - `skysim`: deprecate `--seed` in favour of `--seed-noise` (the same value gives
   the same noise realisation; a deprecation warning is emitted). Corruption
   terms draw from their own `--seed-gains`, so adding corruptions cannot change

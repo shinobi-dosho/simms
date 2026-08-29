@@ -18,7 +18,7 @@ from tqdm.dask import TqdmCallback
 from simms import BIN, SCHEMADIR, set_logger
 from simms.skymodel.ascii_skies import ASCIISkymodel
 from simms.skymodel.beams import load_beam_config, resolve_antenna_beams
-from simms.skymodel.corruptions import apply_corruptions, load_corruption_spec
+from simms.skymodel.corruptions import apply_corruptions, load_corruption_spec, validate_spec
 from simms.skymodel.fits_skies import component_sky_from_fits_dft, predict_fits_channel_block, prepare_fits_sky
 from simms.skymodel.mstools import (
     attach_beam,
@@ -535,13 +535,18 @@ def runit(opts):
     # signal chain after the antenna gains, so a noisy RIME is
     # V' = J_p V J_q^H + n -- corrupting the sum would gain-modulate the noise.
     if opts.corruptions:
+        # Loaded and validated even when there is nothing to corrupt: a malformed
+        # spec must fail here rather than let a noise-only run write a clean
+        # column that looks like it was corrupted.
+        spec = load_corruption_spec(opts.corruptions)
         if simvis is None:
-            log.warning(
-                "--corruptions has no effect on a noise-only run: gains apply to the sky signal, "
-                "and thermal noise is added after the gain chain."
-            )
+            validate_spec(spec, ncorr=ncorr)
+            if vis_noise:
+                log.warning(
+                    "--corruptions has no effect on a noise-only run: gains apply to the sky signal, "
+                    "and thermal noise is added after the gain chain."
+                )
         else:
-            spec = load_corruption_spec(opts.corruptions)
             simvis = apply_corruptions(
                 simvis,
                 msds.TIME.data,
