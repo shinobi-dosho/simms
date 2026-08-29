@@ -965,15 +965,19 @@ def array_lonlat(positions):
     return loc.lon.to_value(u.rad), loc.lat.to_value(u.rad)
 
 
-# POINTING.DIRECTION measure frames that name a horizontal (az/el-type) direction. These
-# map to a *time-dependent* sky position, so a single fixed beam centre is meaningless.
+# Direction measure frames that name a horizontal (az/el-type) direction. These map to a
+# *time-dependent* sky position, so a single fixed beam centre is meaningless.
 _HORIZONTAL_POINTING_FRAMES = frozenset({"AZEL", "AZELGEO", "AZELSW", "AZELNE", "HADEC"})
 # Equatorial frames handled silently on the fast path (a constant RA/Dec direction).
 _EQUATORIAL_POINTING_FRAMES = frozenset({"J2000", "ICRS"})
+# FIELD columns tried, in order, when POINTING.DIRECTION is unusable. Phase-rotation tools
+# (chgcentre, phaseshift) move PHASE_DIR only and leave these at the pointing centre, so they
+# are the last record of where the dishes pointed once POINTING is gone.
+_FIELD_POINTING_COLUMNS = ("REFERENCE_DIR", "DELAY_DIR")
 
 
-def _pointing_direction_frame(ms):
-    """Measure reference of ``POINTING.DIRECTION`` (upper-case), or ``""`` if unavailable.
+def _direction_frame(ms, subtable, column):
+    """Measure reference of a direction column (upper-case), or ``""`` if unavailable.
 
     Reads the column's ``MEASINFO``/``Ref`` keyword via casacore. A missing table or keyword
     yields ``""`` (treated as equatorial by the caller, preserving the legacy fast path).
@@ -981,53 +985,104 @@ def _pointing_direction_frame(ms):
     try:
         from casacore.tables import table
 
-        with table(f"{ms}::POINTING", ack=False) as tab:
-            measinfo = tab.getcolkeywords("DIRECTION").get("MEASINFO", {})
+        with table(f"{ms}::{subtable}", ack=False) as tab:
+            measinfo = tab.getcolkeywords(column).get("MEASINFO", {})
         return str(measinfo.get("Ref", "")).upper()
     except Exception:
         return ""
 
 
-def read_pointing_centre(ms, fallback_ra0, fallback_dec0):
-    """Antenna pointing centre (radians) from ``POINTING.DIRECTION``.
+def _warn_nonstandard_frame(frame, label):
+    """Warn when a direction column's frame is equatorial-but-unusual (e.g. ``B1950``)."""
+    if frame and frame not in _EQUATORIAL_POINTING_FRAMES:
+        log.warning(
+            "%s frame %r is treated as a fixed RA/Dec beam centre; if it is not equatorial the "
+            "primary beam may be mis-centred.",
+            label,
+            frame,
+        )
 
-    This is where the dishes point, and hence where the primary beam is centred -- distinct
-    from ``FIELD.PHASE_DIR`` (the correlator phase centre, a freely-shiftable quantity). Reads
-    the poly order-0 term of the first row's direction and falls back to the given phase
-    centre, with a warning, when the MS has no usable POINTING table.
 
-    The direction is interpreted as a fixed sky position, which requires an equatorial measure
-    frame. ``J2000``/``ICRS`` (and an absent keyword, as older simms MSs may have) take the
-    fast path silently; another equatorial frame is accepted with a warning; a **horizontal**
-    frame (``AZEL`` etc.) raises :class:`NotImplementedError`, since it maps to a
-    time-dependent sky direction that a single beam centre cannot represent.
+def _read_direction(ms, subtable, column, row):
+    """Order-0 poly term of ``row`` of a ``(nrow, npoly, 2)`` direction column, or ``None``.
+
+    ``None`` means "not usable as a beam centre": the subtable or column is absent, the row is
+    missing, or the value is not a finite ``(ra, dec)`` pair. ``(0, 0)`` is *not* treated as
+    unset -- it is a real sky position.
     """
     from daskms import xds_from_table
 
-    frame = _pointing_direction_frame(ms)
+    label = f"{subtable}.{column}"
+    try:
+        ds = xds_from_table(f"{ms}::{subtable}")[0]
+        if column not in ds:
+            raise ValueError(f"no {column} column")
+        data = ds[column].data
+        if data.shape[0] <= row:
+            raise ValueError(f"only {data.shape[0]} row(s), wanted row {row}")
+        radec = np.asarray(data[row, 0].compute(), dtype=np.float64)
+    except Exception as exc:
+        log.debug("No usable %s (%s).", label, exc)
+        return None
+    if radec.shape != (2,) or not np.all(np.isfinite(radec)):
+        log.debug("No usable %s (direction %r is not a finite (ra, dec) pair).", label, radec)
+        return None
+    return float(radec[0]), float(radec[1])
+
+
+def read_pointing_centre(ms, fallback_ra0, fallback_dec0, field_id=0):
+    """Antenna pointing centre (radians), tried in order of how faithfully it records the pointing.
+
+    This is where the dishes point, and hence where the primary beam is centred -- distinct
+    from ``FIELD.PHASE_DIR`` (the correlator phase centre, a freely-shiftable quantity). The
+    chain is
+
+    ``POINTING.DIRECTION`` -> ``FIELD.REFERENCE_DIR`` -> ``FIELD.DELAY_DIR`` -> the given
+    phase centre, with a warning.
+
+    The ``FIELD`` fallbacks matter on a rephased MS: ``chgcentre``/``phaseshift`` move
+    ``PHASE_DIR`` alone and leave ``REFERENCE_DIR``/``DELAY_DIR`` at the pointing, so dropping
+    straight to the phase centre centres the beam on the wrong place. Each candidate is
+    validated rather than blindly preferred -- an absent column or a non-finite value is
+    skipped -- since some writers leave ``REFERENCE_DIR`` unpopulated.
+
+    The direction is interpreted as a fixed sky position, which requires an equatorial measure
+    frame. ``J2000``/``ICRS`` (and an absent keyword, as older simms MSs may have) take the
+    fast path silently; another equatorial frame is accepted with a warning. A **horizontal**
+    frame (``AZEL`` etc.) maps to a time-dependent sky direction that a single beam centre
+    cannot represent: on ``POINTING.DIRECTION`` -- the authoritative record, with nothing
+    better to fall back to -- it raises :class:`NotImplementedError`; on a ``FIELD`` fallback
+    it merely disqualifies that candidate, and the chain continues.
+    """
+    frame = _direction_frame(ms, "POINTING", "DIRECTION")
     if frame in _HORIZONTAL_POINTING_FRAMES:
         raise NotImplementedError(
             f"POINTING.DIRECTION is in the horizontal frame {frame!r}, which maps to a "
             f"time-dependent sky position; a fixed primary-beam centre is unsupported. Supply "
             f"a J2000/ICRS POINTING table or a target-tracking MS."
         )
-    if frame and frame not in _EQUATORIAL_POINTING_FRAMES:
-        log.warning(
-            "POINTING.DIRECTION frame %r is treated as a fixed RA/Dec beam centre; if it is "
-            "not equatorial the primary beam may be mis-centred.",
-            frame,
-        )
+    _warn_nonstandard_frame(frame, "POINTING.DIRECTION")
+    centre = _read_direction(ms, "POINTING", "DIRECTION", 0)
+    if centre is not None:
+        return centre
 
-    try:
-        pnt = xds_from_table(f"{ms}::POINTING")[0]
-        direction = pnt.DIRECTION.data
-        if direction.shape[0] == 0:
-            raise ValueError("empty POINTING table")
-        radec = np.asarray(direction[0, 0].compute(), dtype=np.float64)
-        return float(radec[0]), float(radec[1])
-    except Exception as exc:
-        log.warning("No usable POINTING.DIRECTION (%s); using the phase centre as the beam centre.", exc)
-        return float(fallback_ra0), float(fallback_dec0)
+    for column in _FIELD_POINTING_COLUMNS:
+        frame = _direction_frame(ms, "FIELD", column)
+        if frame in _HORIZONTAL_POINTING_FRAMES:
+            log.debug("Skipping FIELD.%s as a beam centre (horizontal frame %r).", column, frame)
+            continue
+        centre = _read_direction(ms, "FIELD", column, int(field_id))
+        if centre is None:
+            continue
+        _warn_nonstandard_frame(frame, f"FIELD.{column}")
+        log.info("No usable POINTING.DIRECTION; centring the primary beam on FIELD.%s.", column)
+        return centre
+
+    log.warning(
+        "No usable POINTING.DIRECTION, FIELD.REFERENCE_DIR or FIELD.DELAY_DIR; using the phase "
+        "centre as the beam centre. If this MS has been rephased, the beam is mis-centred."
+    )
+    return float(fallback_ra0), float(fallback_dec0)
 
 
 def reproject_lm(ell, emm, from_ra0, from_dec0, to_ra0, to_dec0):

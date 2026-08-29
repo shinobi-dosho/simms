@@ -22,6 +22,16 @@ and can be shifted freely. Conflating the two silently mis-centres the beam. See
 ``POINTING`` is keyed by ``(ANTENNA_ID, TIME)``, so each antenna has its own
 pointing record and the beam centre is well defined per antenna.
 
+When an MS has no usable ``POINTING.DIRECTION``, the beam centre is taken from
+``FIELD.REFERENCE_DIR``, then ``FIELD.DELAY_DIR``, and only then from the phase
+centre (with a warning). Phase-rotation tools -- ``chgcentre``, ``phaseshift`` --
+move ``PHASE_DIR`` alone and leave the other two at the pointing, so on a
+rephased MS those columns are the last honest record of where the dishes were
+looking. Each candidate is validated before it is used: an absent column or a
+non-finite value is skipped, since some writers leave ``REFERENCE_DIR``
+unpopulated. On an MS that has not been rephased all four directions are equal
+and the chain changes nothing.
+
 Choosing a beam model
 -----------------------
 

@@ -113,7 +113,7 @@ class _BeamContext:
         from simms.skymodel.beams import read_pointing_centre
 
         self.phase_ra0, self.phase_dec0 = ra0, dec0
-        self.ra0, self.dec0 = read_pointing_centre(ms, ra0, dec0)
+        self.ra0, self.dec0 = read_pointing_centre(ms, ra0, dec0, opts.field_id)
         self.ncorr = ncorr
         self.t_start = float(t0)
         self.duration = float(t1 - t0) + float(interval)

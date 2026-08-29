@@ -30,7 +30,10 @@ the primary beam:
   primary beam is centred on.
 
 Use :func:`simms.skymodel.beams.read_pointing_centre` to get the beam centre
-rather than reading ``FIELD.PHASE_DIR`` directly.
+rather than reading ``FIELD.PHASE_DIR`` directly. It walks
+``POINTING.DIRECTION`` -> ``FIELD.REFERENCE_DIR`` -> ``FIELD.DELAY_DIR`` ->
+``PHASE_DIR``, which keeps the beam on the pointing after a ``chgcentre`` or
+``phaseshift``: those move ``PHASE_DIR`` only.
 
 ``POINTING`` is keyed by ``(ANTENNA_ID, TIME)``
 --------------------------------------------------

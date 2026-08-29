@@ -1041,3 +1041,103 @@ def test_read_pointing_centre_warns_on_nonstandard_equatorial(caplog):
         centre = read_pointing_centre(ms, 1.0, 1.0)
     assert centre == pytest.approx((0.5, -0.7))
     assert any("B1950" in r.message for r in caplog.records)
+
+
+# --- FIELD fallbacks for the beam centre (#175) ----------------------------------
+
+
+def _write_field_ms(base_dir, pointing=None, field=None, field_ref=None, nrow=1):
+    """A minimal MS with an optional ``POINTING`` table and chosen ``FIELD`` direction columns.
+
+    ``pointing`` is an ``(ra, dec)`` pair or ``None`` (no POINTING table at all). ``field`` maps
+    a FIELD column name to a per-row list of ``(ra, dec)`` pairs; a column absent from the mapping
+    is absent from the table. ``field_ref`` sets the MEASINFO ``Ref`` on every FIELD column.
+    """
+    from casacore.tables import makearrcoldesc, maketabdesc, table
+
+    ms = os.path.join(base_dir, "field.ms")
+    mt = table(ms, maketabdesc([makearrcoldesc("DUMMY", 0.0)]), nrow=1, ack=False)
+    if pointing is not None:
+        pnt = os.path.join(ms, "POINTING")
+        pt = table(pnt, maketabdesc([makearrcoldesc("DIRECTION", 0.0, ndim=2)]), nrow=1, ack=False)
+        pt.putcell("DIRECTION", 0, np.array([list(pointing)], dtype=float))
+        pt.putcolkeyword("DIRECTION", "MEASINFO", {"type": "direction", "Ref": "J2000"})
+        pt.flush()
+        pt.close()
+        mt.putkeyword("POINTING", f"Table: {pnt}")
+    field = field or {}
+    fld = os.path.join(ms, "FIELD")
+    cols = [makearrcoldesc(col, 0.0, ndim=2) for col in field] or [makearrcoldesc("DUMMY", 0.0)]
+    ft = table(fld, maketabdesc(cols), nrow=nrow, ack=False)
+    for col, rows in field.items():
+        for row, radec in enumerate(rows):
+            ft.putcell(col, row, np.array([list(radec)], dtype=float))  # (npoly=1, radec=2)
+        if field_ref is not None:
+            ft.putcolkeyword(col, "MEASINFO", {"type": "direction", "Ref": field_ref})
+    ft.flush()
+    ft.close()
+    mt.putkeyword("FIELD", f"Table: {fld}")
+    mt.flush()
+    mt.close()
+    return ms
+
+
+def test_read_pointing_centre_prefers_pointing_over_field():
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_field_ms(it.random_named_directory(), pointing=(0.5, -0.7), field={"REFERENCE_DIR": [(0.9, -0.1)]})
+    assert read_pointing_centre(ms, 1.0, 1.0) == pytest.approx((0.5, -0.7))
+
+
+def test_read_pointing_centre_falls_back_to_reference_dir():
+    # The rephased-MS case: no POINTING, and PHASE_DIR (the fallback) has been moved away from
+    # the pointing that REFERENCE_DIR still records.
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_field_ms(it.random_named_directory(), field={"REFERENCE_DIR": [(0.3, -0.4)]})
+    assert read_pointing_centre(ms, 1.0, 1.0) == pytest.approx((0.3, -0.4))
+
+
+def test_read_pointing_centre_falls_back_to_delay_dir():
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_field_ms(it.random_named_directory(), field={"DELAY_DIR": [(0.3, -0.4)]})
+    assert read_pointing_centre(ms, 1.0, 1.0) == pytest.approx((0.3, -0.4))
+
+
+def test_read_pointing_centre_skips_nonfinite_reference_dir():
+    # Some writers leave REFERENCE_DIR unpopulated; preferring garbage over the next candidate
+    # would be a regression. (0, 0) is *not* a sentinel -- it is a real sky position.
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_field_ms(
+        it.random_named_directory(),
+        field={"REFERENCE_DIR": [(np.nan, np.nan)], "DELAY_DIR": [(0.3, -0.4)]},
+    )
+    assert read_pointing_centre(ms, 1.0, 1.0) == pytest.approx((0.3, -0.4))
+
+
+def test_read_pointing_centre_field_row_follows_field_id():
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_field_ms(it.random_named_directory(), field={"REFERENCE_DIR": [(0.3, -0.4), (0.8, -0.9)]}, nrow=2)
+    assert read_pointing_centre(ms, 1.0, 1.0, field_id=1) == pytest.approx((0.8, -0.9))
+
+
+def test_read_pointing_centre_skips_azel_field_column():
+    # A horizontal frame disqualifies a FIELD candidate rather than raising: unlike
+    # POINTING.DIRECTION, there is something further down the chain to fall back to.
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_field_ms(it.random_named_directory(), field={"REFERENCE_DIR": [(0.3, -0.4)]}, field_ref="AZEL")
+    assert read_pointing_centre(ms, 1.0, 1.0) == pytest.approx((1.0, 1.0))
+
+
+def test_read_pointing_centre_warns_when_chain_reaches_phase_centre(caplog):
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_field_ms(it.random_named_directory())
+    with caplog.at_level("WARNING", logger="skysim"):
+        centre = read_pointing_centre(ms, 1.0, 1.0)
+    assert centre == pytest.approx((1.0, 1.0))
+    assert any("phase centre as the beam centre" in r.message for r in caplog.records)
