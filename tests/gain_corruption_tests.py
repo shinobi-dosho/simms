@@ -11,7 +11,13 @@ import pytest
 from daskms import xds_from_ms, xds_from_table
 
 from simms.apps import skysim
-from simms.skymodel.corruptions import CorruptionSpec, TermSpec, apply_corruptions, load_corruption_spec
+from simms.skymodel.corruptions import (
+    CorruptionSpec,
+    TermSpec,
+    apply_corruptions,
+    load_corruption_spec,
+    validate_spec,
+)
 from simms.telescope.generate_ms import create_ms
 
 from . import InitTest, skysim_opts
@@ -322,7 +328,7 @@ gains:
       amplitude: 0.1
 """
     )
-    with pytest.raises(RuntimeError, match="4-correlation"):
+    with pytest.raises(RuntimeError, match="needs 4 correlations"):
         skysim.runit(
             skysim_opts(
                 gt2.ms,
@@ -847,7 +853,7 @@ gains:
       amplitude: 0.1
 """
     )
-    with pytest.raises(RuntimeError, match="4-correlation"):
+    with pytest.raises(RuntimeError, match="needs 4 correlations"):
         skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path, seed_gains=1))
 
 
@@ -944,3 +950,203 @@ def test_gain_memory_does_not_scale_with_antenna_count():
     small = _corruption_peak_bytes(4)
     large = _corruption_peak_bytes(256)
     assert large < 2 * small, f"peak grew with antenna count: {small} -> {large} bytes"
+
+
+def read_nant(ms):
+    """Antenna count from the ANTENNA subtable -- the authoritative source."""
+    return xds_from_table(f"{ms}::ANTENNA")[0].sizes["row"]
+
+
+def expected_feed_factor(time, ant1, ant2, period, amplitude, random_seed, feed_p, feed_q, nant, label="J"):
+    """Reference for one correlation of a `type: diagonal` time-varying term."""
+    from simms.skymodel.corruptions import _stable_label_hash
+
+    rng = np.random.default_rng((random_seed or 0) + _stable_label_hash(label))
+    phases = rng.random((nant, 2))
+    t0 = float(time.min())
+
+    def gain(ant, feed):
+        phase = 2.0 * np.pi * ((time - t0) / period + phases[ant, feed])
+        return 1.0 + amplitude * (np.cos(phase) + 1j * np.sin(phase))
+
+    return gain(ant1, feed_p) * np.conj(gain(ant2, feed_q))
+
+
+_DIAGONAL_TYPE_YAML = """
+gains:
+  terms: [J]
+  spec:
+    - label: J
+      type: diagonal
+      complex: true
+      axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.1
+"""
+
+
+def test_diagonal_type_gives_independent_feed_gains(gt2):
+    """`type: diagonal` is diag(g_x, g_y): XX and YY get different gains.
+
+    A scalar term drives both hands identically, so this is the term the boolean
+    `diagonal: true` could never express.
+    """
+    yaml_path = gt2.write_yaml(_DIAGONAL_TYPE_YAML)
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA"))
+    clean = read_column(gt2.ms, "DATA")
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path, seed_gains=4))
+    corrupted = read_column(gt2.ms, "DATA")
+
+    xx = corrupted[:, 0, 0] / clean[:, 0, 0]
+    yy = corrupted[:, 0, 1] / clean[:, 0, 1]
+    assert not np.allclose(xx, yy), "both feeds got the same gain; this is a scalar term, not diagonal"
+
+    time, ant1, ant2 = read_aux(gt2.ms)
+    nant = read_nant(gt2.ms)
+    for corr, feed in ((0, 0), (1, 1)):
+        expected = expected_feed_factor(time, ant1, ant2, 120.0, 0.1, 4, feed, feed, nant)
+        np.testing.assert_allclose(
+            corrupted[:, 0, corr] / clean[:, 0, corr], expected.astype(corrupted.dtype), rtol=1e-6, atol=1e-7
+        )
+
+
+def test_diagonal_type_mixes_feeds_in_the_cross_hands():
+    """On 4 correlations XY sees feed x on antenna p and feed y on antenna q.
+
+    Driven at the corruption layer with all four correlations set to 1: the
+    fixture sky is Stokes I only, so the cross-hands are zero in a predicted
+    column and would carry no signal to check.
+    """
+    nrow, nchan, nant = 16, 3, 6
+    rng = np.random.default_rng(0)
+    ant1 = rng.integers(0, nant, nrow)
+    ant2 = (ant1 + 1 + rng.integers(0, nant - 1, nrow)) % nant
+    time = np.arange(nrow, dtype=float) * 30.0
+    freqs = np.linspace(1.420e9, 1.428e9, nchan)
+
+    spec = CorruptionSpec(
+        terms=["J"],
+        spec=[TermSpec(label="J", type="diagonal", axes=["time"], period=120.0, amplitude=0.1)],
+    )
+    vis = da.from_array(np.ones((nrow, nchan, 4), np.complex128), chunks=-1)
+    corrupted = apply_corruptions(
+        vis,
+        da.from_array(time, chunks=-1),
+        da.from_array(ant1, chunks=-1),
+        da.from_array(ant2, chunks=-1),
+        freqs,
+        spec,
+        random_seed=4,
+        nant=nant,
+    ).compute()
+
+    for corr, (fp, fq) in enumerate(((0, 0), (0, 1), (1, 0), (1, 1))):
+        expected = expected_feed_factor(time, ant1, ant2, 120.0, 0.1, 4, fp, fq, nant)
+        np.testing.assert_allclose(corrupted[:, 0, corr], expected, rtol=1e-11, atol=1e-13)
+
+    # The cross-hands must differ from the parallel hands: that is the mixing.
+    assert not np.allclose(corrupted[:, 0, 1], corrupted[:, 0, 0])
+
+
+def test_scalar_type_matches_deprecated_diagonal_true(gt2):
+    scalar = gt2.write_yaml(_UNSET_DIAGONAL_YAML.replace("      complex:", "      type: scalar\n      complex:"))
+    deprecated = gt2.write_yaml(_explicit_diagonal_yaml("true"))
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=scalar, seed_gains=3))
+    from_type = read_column(gt2.ms, "DATA")
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=deprecated, seed_gains=3))
+    from_bool = read_column(gt2.ms, "DATA")
+
+    np.testing.assert_array_equal(from_type, from_bool)
+
+
+def test_full_type_matches_deprecated_diagonal_false(gt4):
+    full = gt4.write_yaml(_UNSET_DIAGONAL_YAML.replace("      complex:", "      type: full\n      complex:"))
+    deprecated = gt4.write_yaml(_explicit_diagonal_yaml("false"))
+
+    skysim.runit(skysim_opts(gt4.ms, ascii_sky=gt4.sky, column="DATA", corruptions=full, seed_gains=3))
+    from_type = read_column(gt4.ms, "DATA")
+
+    skysim.runit(skysim_opts(gt4.ms, ascii_sky=gt4.sky, column="DATA", corruptions=deprecated, seed_gains=3))
+    from_bool = read_column(gt4.ms, "DATA")
+
+    np.testing.assert_array_equal(from_type, from_bool)
+
+
+def test_type_and_deprecated_diagonal_together_is_an_error(gt2):
+    yaml_path = gt2.write_yaml(
+        _UNSET_DIAGONAL_YAML.replace("      complex:", "      type: scalar\n      diagonal: true\n      complex:")
+    )
+    with pytest.raises(RuntimeError, match="both 'type' and the deprecated 'diagonal'"):
+        skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path, seed_gains=1))
+
+
+def test_unknown_type_is_an_error(gt2):
+    yaml_path = gt2.write_yaml(_UNSET_DIAGONAL_YAML.replace("      complex:", "      type: leakage\n      complex:"))
+    with pytest.raises(RuntimeError, match="unknown type 'leakage'"):
+        skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path, seed_gains=1))
+
+
+def test_diagonal_type_needs_at_least_two_correlations():
+    """diag(g_x, g_y) has nothing to say about a single-correlation MS."""
+    spec = CorruptionSpec(
+        terms=["J"],
+        spec=[TermSpec(label="J", type="diagonal", axes=["time"], period=120.0, amplitude=0.1)],
+    )
+    with pytest.raises(RuntimeError, match="needs 2 or 4 correlations"):
+        validate_spec(spec, ncorr=1)
+
+
+def test_explicit_references_make_gains_selection_independent():
+    """Regression: t0/freq0/nant taken from the rows in hand made the same
+    antenna's gain differ between a per-field or per-SPW run and a whole-MS one.
+    Passing MS-wide references pins them."""
+    nrow, nchan, ncorr, nant = 24, 6, 2, 8
+    rng = np.random.default_rng(0)
+    ant1 = rng.integers(0, nant, nrow)
+    ant2 = (ant1 + 1 + rng.integers(0, nant - 1, nrow)) % nant
+    time = np.arange(nrow, dtype=float) * 30.0
+    freqs = np.linspace(1.420e9, 1.440e9, nchan)
+    spec = CorruptionSpec(
+        terms=["J"],
+        spec=[
+            TermSpec(
+                label="J",
+                type="scalar",
+                axes=["time", "frequency"],
+                period={"time": 200.0, "frequency": 8e6},
+                amplitude=0.1,
+            )
+        ],
+    )
+    refs = dict(nant=nant, time_ref=float(time[0]), freq_ref=float(freqs[0]))
+
+    def run(rows, chans, **kwargs):
+        vis = da.from_array(np.ones((len(rows), len(chans), ncorr), np.complex128), chunks=-1)
+        return apply_corruptions(
+            vis,
+            da.from_array(time[rows], chunks=-1),
+            da.from_array(ant1[rows], chunks=-1),
+            da.from_array(ant2[rows], chunks=-1),
+            freqs[chans],
+            spec,
+            random_seed=1,
+            **kwargs,
+        ).compute()
+
+    whole = run(np.arange(nrow), np.arange(nchan), **refs)
+    # A later, narrower selection: different first row, different first channel,
+    # and it happens to omit the highest-numbered antenna.
+    rows = np.array([i for i in range(8, nrow) if ant1[i] != nant - 1 and ant2[i] != nant - 1])
+    chans = np.arange(2, nchan)
+
+    with_refs = run(rows, chans, **refs)
+    np.testing.assert_array_equal(with_refs, whole[np.ix_(rows, chans)])
+
+    # Without them the same rows get different gains -- the bug being guarded.
+    without_refs = run(rows, chans)
+    assert not np.allclose(without_refs, whole[np.ix_(rows, chans)])

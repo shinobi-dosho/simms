@@ -6,14 +6,20 @@
   raw numbers (seconds/Hz) or `astropy`-compatible strings such as `"2min"` and
   `"2MHz"`. The per-baseline corruption is `V' = J_p V J_q^H`, with terms
   multiplied in the order listed. Full (non-diagonal) terms require a
-  4-correlation MS; omitting `diagonal` follows the MS, giving a full 2x2 Jones
-  on a 4-correlation MS and a scalar gain otherwise. Corruptions are applied to
+  4-correlation MS. `type` selects the Jones form -- `scalar` (`g I`), `diagonal`
+  (`diag(g_x, g_y)`, independent per-feed gains, needs at least 2 correlations)
+  or `full` (dense 2x2, needs 4) -- and omitting it follows the MS, giving
+  `full` on a 4-correlation MS and `scalar` otherwise. The boolean
+  `diagonal: true/false` is deprecated in favour of `type: scalar/full`; it
+  warns and still works, and never meant the new `diagonal` form. Corruptions are applied to
   the model before thermal noise is added (`V' = J_p V J_q^H + n`), so `--sefd`
   noise is not gain-modulated. Phase references and the gain array size are taken
   once over the whole selection rather than per dask block, so a corruption is
   invariant under row and channel chunking; note the references are per field
-  and per SPW, so separate runs over different fields or SPWs of one MS do not
-  share a time or frequency origin. Gains are evaluated per row rather than as
+  and per SPW. `skysim` therefore passes MS-wide references -- the earliest time,
+  the lowest frequency across all SPWs, and the `ANTENNA` table's row count -- so
+  separate `--field-id`/`--spw-id` runs over one MS give the same antenna the
+  same gain. Gains are evaluated per row rather than as
   an `(nant, nrow, nchan)` cube that was then indexed down to two slices, so
   peak memory no longer scales with the size of the array: a 64-antenna,
   1024-channel MS needed ~9.8 GiB per block (~39 GiB for full Jones) at the

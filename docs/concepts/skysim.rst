@@ -133,14 +133,14 @@ The file describes an ordered list of terms and a specification for each one:
       terms: [G, B]
       spec:
         - label: G
-          diagonal: true
+          type: scalar
           complex: true
           axes: [time]
           period:
             time: "2min"
           amplitude: 0.1
         - label: B
-          diagonal: true
+          type: scalar
           complex: true
           axes: [frequency]
           period:
@@ -149,13 +149,29 @@ The file describes an ordered list of terms and a specification for each one:
 
 Term labels are arbitrary strings. ``terms`` gives the multiplication order;
 the per-baseline corruption is :math:`V'_{pq} = J_p(t,f) \, V_{pq}(t,f) \,
-J_q(t,f)^H`.  ``diagonal: true`` means the term is a scalar times the identity
-(so both polarisations receive the same gain); ``diagonal: false`` produces a
-full 2x2 Jones matrix and requires a 4-correlation MS.  Leaving ``diagonal``
-out follows the MS: a 4-correlation MS gets the full 2x2 Jones, anything else
-the scalar gain.  An explicit ``diagonal: false`` on a 2-correlation MS is an
-error rather than a silent downgrade.  ``complex: true`` uses a complex
-sinusoid, ``false`` a real cosine.
+J_q(t,f)^H`.
+
+``type`` selects the Jones form:
+
+``scalar``
+    :math:`g I` -- one gain per antenna, both polarisations identical.
+``diagonal``
+    :math:`\mathrm{diag}(g_x, g_y)` -- independent per-feed gains with no
+    leakage.  Needs at least 2 correlations; on a 4-correlation MS the
+    cross-hands mix feeds, so XY sees :math:`g_x` on antenna p and
+    :math:`g_y` on antenna q.
+``full``
+    a dense 2x2 Jones with leakage.  Requires a 4-correlation MS.
+
+Leaving ``type`` out follows the MS: a 4-correlation MS gets ``full``,
+anything else ``scalar``.  An explicit type the MS cannot carry is an error
+rather than a silent downgrade.
+
+``diagonal: true``/``false`` is the deprecated boolean spelling of ``scalar``
+and ``full``; it warns and still works.  Note it never meant the ``diagonal``
+type -- that form was previously unreachable.
+
+``complex: true`` uses a complex sinusoid, ``false`` a real cosine.
 
 ``axes`` selects which dimensions vary (``time`` and/or ``frequency``).  ``period``
 is a mapping from axis name to value; values can be raw numbers (seconds for
@@ -167,6 +183,12 @@ The random per-antenna phases (and matrices, for full terms) draw from
 ``--seed-gains``; omitting it gives a deterministic per-label draw. Corruptions
 never touch the thermal-noise stream, which is seeded separately by
 ``--seed-noise``.
+
+Phases are referenced to the earliest time and lowest frequency in the *MS*,
+and gains are sized from the ``ANTENNA`` table, not from the rows a given run
+happens to select.  Separate ``--field-id`` or ``--spw-id`` runs over one MS
+therefore give the same antenna the same gain, and the result does not depend
+on dask chunk boundaries.
 
 Gains corrupt the sky signal only.  Receiver noise enters the signal chain
 after the antenna gains, so a noisy run computes :math:`V'_{pq} = J_p V_{pq}

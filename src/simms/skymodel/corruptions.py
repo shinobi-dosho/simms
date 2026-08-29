@@ -3,32 +3,59 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
 import astropy.units as u
+import dask
 import dask.array as da
 import numpy as np
 import yaml
+
+from simms import BIN
+
+log = logging.getLogger(BIN.skysim)
 
 DIMENSION_UNITS = {
     "time": u.s,
     "frequency": u.Hz,
 }
 
+TermType = Literal["scalar", "diagonal", "full"]
+
+#: Feeds each term type draws independent random phases for. ``scalar`` and
+#: ``full`` share one phase per antenna; ``diagonal`` gets one per feed.
+TERM_FEEDS: dict[str, int] = {"scalar": 1, "diagonal": 2, "full": 1}
+
+#: Correlation counts each term type can be represented in.
+TERM_NCORR: dict[str, tuple[int, ...]] = {"scalar": (1, 2, 4), "diagonal": (2, 4), "full": (4,)}
+
 
 @dataclass
 class TermSpec:
     """Description of a single Jones corruption term.
 
-    ``diagonal`` is tri-state: ``None`` (the default, i.e. the key was left out
-    of the YAML) means "whatever the MS can carry" -- a full 2x2 Jones on a
-    4-correlation MS, a scalar gain otherwise. Setting it explicitly overrides
-    that, and an explicit ``false`` on a non-4-correlation MS is an error rather
-    than a silent downgrade.
+    ``type`` selects the Jones form:
+
+    ``scalar``
+        ``g * I`` -- one gain per antenna, both polarisations identical.
+    ``diagonal``
+        ``diag(g_x, g_y)`` -- independent per-feed gains, no leakage. Needs at
+        least 2 correlations.
+    ``full``
+        a dense 2x2 Jones with leakage. Needs a 4-correlation MS.
+
+    Left unset it follows the MS: ``full`` on a 4-correlation MS, ``scalar``
+    otherwise. An explicit type that the MS cannot carry is an error rather than
+    a silent downgrade.
+
+    ``diagonal`` is the deprecated boolean spelling: ``true`` means ``scalar``
+    and ``false`` means ``full`` (note it never meant the ``diagonal`` type).
     """
 
     label: str
+    type: TermType | None = None
     diagonal: bool | None = None
     complex: bool = True
     axes: list[Literal["time", "frequency"]] = field(default_factory=list)
@@ -99,15 +126,36 @@ def load_corruption_spec(path: str) -> CorruptionSpec:
     return CorruptionSpec(terms=terms, spec=specs)
 
 
-def resolve_diagonal(spec: TermSpec, ncorr: int) -> bool:
-    """Resolve a term's ``diagonal`` flag against the MS correlation count.
+def resolve_type(spec: TermSpec, ncorr: int) -> str:
+    """Resolve a term's Jones form against the MS correlation count.
 
-    An unset flag follows the MS: a 4-correlation MS can carry a full 2x2 Jones,
+    An unset type follows the MS: a 4-correlation MS can carry a full 2x2 Jones,
     so it gets one; anything else can only carry a scalar gain.
     """
-    if spec.diagonal is None:
-        return ncorr != 4
-    return spec.diagonal
+    if spec.type is not None and spec.diagonal is not None:
+        raise RuntimeError(
+            f"Corruption term '{spec.label}' sets both 'type' and the deprecated 'diagonal'; use 'type' only"
+        )
+
+    if spec.type is not None:
+        if spec.type not in TERM_FEEDS:
+            raise RuntimeError(
+                f"Corruption term '{spec.label}' has unknown type '{spec.type}'; expected one of {sorted(TERM_FEEDS)}"
+            )
+        return spec.type
+
+    if spec.diagonal is not None:
+        resolved = "scalar" if spec.diagonal else "full"
+        log.warning(
+            "Corruption term '%s': 'diagonal: %s' is deprecated; use 'type: %s'. Note the new "
+            "'diagonal' type is diag(g_x, g_y), which the boolean never meant.",
+            spec.label,
+            str(bool(spec.diagonal)).lower(),
+            resolved,
+        )
+        return resolved
+
+    return "full" if ncorr == 4 else "scalar"
 
 
 def validate_spec(spec: CorruptionSpec, ncorr: int) -> None:
@@ -146,29 +194,37 @@ def validate_spec(spec: CorruptionSpec, ncorr: int) -> None:
         if s.amplitude < 0:
             raise RuntimeError(f"Corruption term '{s.label}' amplitude must be non-negative")
 
-    # Resolve before testing: `is False` would miss a falsy non-bool from YAML
-    # (`diagonal: 0` parses as int), letting a full-Jones term reach the block
-    # function and fail there instead of here. Equivalent for an unset flag,
-    # which resolves to True whenever ncorr != 4.
-    if any(not resolve_diagonal(s, ncorr) for s in spec.spec) and ncorr != 4:
-        raise RuntimeError("Non-diagonal (full) Jones corruptions require a 4-correlation MS")
+    # Resolve before testing: a falsy non-bool from YAML (`diagonal: 0` parses as
+    # int) would slip past an identity check and only fail inside the block
+    # function, losing the clear up-front error.
+    for s_ in spec.spec:
+        term_type = resolve_type(s_, ncorr)
+        allowed = TERM_NCORR[term_type]
+        if ncorr not in allowed:
+            raise RuntimeError(
+                f"Corruption term '{s_.label}' is type '{term_type}', which needs "
+                f"{' or '.join(str(n) for n in allowed)} correlations; this MS has {ncorr}"
+            )
 
 
 def _build_term_params(spec: TermSpec, nant: int, random_seed: int | None, ncorr: int) -> dict:
     """Build deterministic numpy parameters for a single term."""
-    diagonal = resolve_diagonal(spec, ncorr)
+    term_type = resolve_type(spec, ncorr)
+    nfeed = TERM_FEEDS[term_type]
     rng = np.random.default_rng(_term_seed(random_seed, spec.label))
     params = {
         "label": spec.label,
-        "diagonal": diagonal,
+        "type": term_type,
+        "nfeed": nfeed,
         "complex": spec.complex,
         "axes": spec.axes,
         "period": _normalise_period(spec.period, spec.axes),
         "amplitude": float(spec.amplitude),
-        "phases": {axis: rng.random(nant) for axis in spec.axes},
+        # (nant, nfeed): one phase per antenna, or one per antenna per feed.
+        "phases": {axis: rng.random((nant, nfeed)) for axis in spec.axes},
     }
 
-    if not diagonal:
+    if term_type == "full":
         if spec.complex:
             magnitude = rng.random((nant, 2, 2))
             phase = 2.0 * np.pi * rng.random((nant, 2, 2))
@@ -201,20 +257,22 @@ def _compute_oscillation(
     numbers for ``nant`` times less memory -- only the two indexed slices were
     ever used.
 
-    Returns an array of shape ``(nrow, nchan)``.
+    Returns an array of shape ``(nrow, nchan, nfeed)``, where ``nfeed`` is 1 for
+    ``scalar`` and ``full`` terms and 2 for ``diagonal`` ones.
     """
-    oscillation = np.ones((time.size, freqs.size), dtype=np.complex128)
+    oscillation = np.ones((time.size, freqs.size, params["nfeed"]), dtype=np.complex128)
 
     for axis in params["axes"]:
         period = params["period"][axis]
-        phases = params["phases"][axis][ant]  # (nrow,)
+        phases = params["phases"][axis][ant]  # (nrow, nfeed)
 
         if axis == "time":
-            phase = 2.0 * np.pi * ((time - t0) / period + phases)  # (nrow,)
+            phase = 2.0 * np.pi * ((time[:, None] - t0) / period + phases)  # (nrow, nfeed)
             trig = np.cos(phase) + 1j * np.sin(phase) if params["complex"] else np.cos(phase)
-            oscillation *= trig[:, None]
+            oscillation *= trig[:, None, :]
         else:
-            phase = 2.0 * np.pi * ((freqs[None, :] - freq0) / period + phases[:, None])  # (nrow, nchan)
+            # (nrow, nchan, nfeed)
+            phase = 2.0 * np.pi * ((freqs[None, :, None] - freq0) / period + phases[:, None, :])
             trig = np.cos(phase) + 1j * np.sin(phase) if params["complex"] else np.cos(phase)
             oscillation *= trig
 
@@ -224,10 +282,31 @@ def _compute_oscillation(
 def _antenna_gain(
     term_params: list[dict], time: np.ndarray, freqs: np.ndarray, t0: float, freq0: float, ant: np.ndarray
 ) -> np.ndarray:
-    """Combined scalar gain for the antenna observing each row: ``(nrow, nchan)``."""
+    """Combined scalar gain for the antenna observing each row: ``(nrow, nchan)``.
+
+    Only valid when every term is ``scalar``; this is the common case and avoids
+    carrying a feed axis that would hold two copies of the same number.
+    """
     gain = np.ones((time.size, freqs.size), dtype=np.complex128)
     for params in term_params:
         oscillation = _compute_oscillation(params, time, freqs, t0, freq0, ant)
+        gain *= 1.0 + params["amplitude"] * oscillation[..., 0]
+    return gain
+
+
+def _antenna_feed_gain(
+    term_params: list[dict], time: np.ndarray, freqs: np.ndarray, t0: float, freq0: float, ant: np.ndarray
+) -> np.ndarray:
+    """Combined per-feed gain for the antenna observing each row: ``(nrow, nchan, 2)``.
+
+    Valid when no term is ``full``, so the combined Jones stays diagonal and only
+    its two diagonal entries need carrying. A ``scalar`` term contributes the
+    same gain to both feeds.
+    """
+    gain = np.ones((time.size, freqs.size, 2), dtype=np.complex128)
+    for params in term_params:
+        oscillation = _compute_oscillation(params, time, freqs, t0, freq0, ant)
+        # A scalar term has nfeed == 1 and broadcasts across both feeds.
         gain *= 1.0 + params["amplitude"] * oscillation
     return gain
 
@@ -240,11 +319,14 @@ def _antenna_jones(
     for params in term_params:
         oscillation = _compute_oscillation(params, time, freqs, t0, freq0, ant)
         amp = params["amplitude"]
-        if params["diagonal"]:
-            jones *= (1.0 + amp * oscillation)[:, :, None, None]
+        if params["type"] == "scalar":
+            jones *= (1.0 + amp * oscillation[..., 0])[:, :, None, None]
+        elif params["type"] == "diagonal":
+            # diag(g_x, g_y): scale row i of the accumulated Jones by feed i.
+            jones = jones * (1.0 + amp * oscillation)[:, :, :, None]
         else:
             matrix = params["matrix"][ant][:, None, :, :]  # (nrow, 1, 2, 2)
-            term_jones = np.eye(2) + amp * oscillation[:, :, None, None] * matrix
+            term_jones = np.eye(2) + amp * oscillation[..., 0][:, :, None, None] * matrix
             jones = np.einsum("rfij,rfjk->rfik", jones, term_jones)
     return jones
 
@@ -283,12 +365,12 @@ def _corrupt_block(
     ncorr = vis.shape[-1]
     nrow = vis.shape[0]
 
-    any_full = any(not p["diagonal"] for p in term_params)
+    types = {p["type"] for p in term_params}
 
-    if any_full:
+    if "full" in types:
         if ncorr != 4:
             # This should have been caught by validation, but keep a clear message.
-            raise RuntimeError("Non-diagonal Jones corruptions require a 4-correlation MS")
+            raise RuntimeError("Full Jones corruptions require a 4-correlation MS")
 
         # Apply J_p V J_q^H per row/chan.
         jp = _antenna_jones(term_params, time, freqs, t0, freq0, antenna1)
@@ -306,8 +388,28 @@ def _corrupt_block(
         out[..., 1] = vout[..., 0, 1]
         out[..., 2] = vout[..., 1, 0]
         out[..., 3] = vout[..., 1, 1]
+    elif "diagonal" in types:
+        # Combined Jones is diag(g_x, g_y), so V' = diag(g_p) V diag(g_q)^H picks
+        # one feed from each antenna per correlation. Carrying the two diagonal
+        # entries is enough; the off-diagonal entries stay zero.
+        gp = _antenna_feed_gain(term_params, time, freqs, t0, freq0, antenna1)
+        gq = _antenna_feed_gain(term_params, time, freqs, t0, freq0, antenna2)
+        gq_conj = np.conj(gq)
+
+        out = np.empty_like(vis)
+        if ncorr == 4:
+            # [XX, XY, YX, YY] <-> feeds [(x,x), (x,y), (y,x), (y,y)].
+            for corr, (fp, fq) in enumerate(((0, 0), (0, 1), (1, 0), (1, 1))):
+                out[..., corr] = vis[..., corr] * gp[..., fp] * gq_conj[..., fq]
+        elif ncorr == 2:
+            # [XX, YY]: each parallel hand sees its own feed on both antennas.
+            for corr in (0, 1):
+                out[..., corr] = vis[..., corr] * gp[..., corr] * gq_conj[..., corr]
+        else:
+            # This should have been caught by validation, but keep a clear message.
+            raise RuntimeError("Diagonal Jones corruptions require at least 2 correlations")
     else:
-        # All terms diagonal: scalar gain per row/chan.
+        # Every term is scalar: one gain per antenna, identical on both feeds.
         gp = _antenna_gain(term_params, time, freqs, t0, freq0, antenna1)
         gq = _antenna_gain(term_params, time, freqs, t0, freq0, antenna2)
         out = vis * (gp * np.conj(gq))[:, :, None]
@@ -323,6 +425,9 @@ def apply_corruptions(
     freqs: np.ndarray,
     spec: CorruptionSpec,
     random_seed: int | None = None,
+    nant: int | None = None,
+    time_ref: float | None = None,
+    freq_ref: float | None = None,
 ) -> da.Array:
     """Apply RIME corruptions to a lazy visibility array.
 
@@ -340,17 +445,38 @@ def apply_corruptions(
         Global seed for reproducible randomness. ``None`` is *not* fresh entropy:
         each term falls back to a deterministic hash of its label, so an
         unseeded run is reproducible (and two same-hash terms share phases).
+    nant : int or None, optional
+        Number of antennas to size the per-antenna gains for. Defaults to the
+        highest index present in ``antenna1``/``antenna2``, which is only the
+        antennas in this selection; pass the ``ANTENNA`` table's row count so
+        every field of an MS draws the same per-antenna phases.
+    time_ref, freq_ref : float or None, optional
+        Phase origins for the ``time`` and ``frequency`` axes. Default to the
+        earliest time and lowest frequency in this selection, which for a
+        multi-field or multi-SPW MS differs between runs; pass the MS-wide
+        values so every run shares one origin.
 
     Returns
     -------
     dask.array.Array
         Corrupted visibilities with the same shape and chunking as ``vis``.
     """
-    # Phase origins for the whole selection, so chunk boundaries cannot shift them.
-    # They are *not* MS-wide: `freqs` is one SPW and `time` one field.
-    t0 = float(time.min().compute())
-    freq0 = float(freqs[0])
-    nant = max(int(antenna1.max().compute()), int(antenna2.max().compute())) + 1
+    # Phase origins and array size, fixed across the whole computation so chunk
+    # boundaries cannot shift them. The fallbacks describe this selection only --
+    # `freqs` is one SPW and `time` one field -- so a caller with the MS in hand
+    # should pass the MS-wide values instead.
+    if time_ref is None or nant is None:
+        needed = [time.min()] if time_ref is None else []
+        if nant is None:
+            needed += [antenna1.max(), antenna2.max()]
+        computed = list(dask.compute(*needed))
+        if time_ref is None:
+            time_ref = float(computed.pop(0))
+        if nant is None:
+            nant = max(int(computed[0]), int(computed[1])) + 1
+
+    t0 = float(time_ref)
+    freq0 = float(freqs.min()) if freq_ref is None else float(freq_ref)
 
     ncorr = vis.shape[-1]
     validate_spec(spec, ncorr=ncorr)

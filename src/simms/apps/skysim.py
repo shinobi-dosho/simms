@@ -547,6 +547,16 @@ def runit(opts):
                     "and thermal noise is added after the gain chain."
                 )
         else:
+            # Phase origins and array size come from the MS, not from this
+            # field/SPW selection: skysim runs one field and one SPW at a time,
+            # so selection-derived references would give the same antenna a
+            # different gain in each run over the same MS.
+            ant_ds = xds_from_table(f"{ms}::ANTENNA")[0]
+            ms_nant = ant_ds.sizes["row"]
+            all_freqs = xds_from_table(f"{ms}::SPECTRAL_WINDOW")[0].CHAN_FREQ.data
+            ms_freq0 = float(all_freqs.min().compute())
+            ms_t0 = float(xds_from_ms(ms, columns=["TIME"], group_cols=[])[0].TIME.data.min().compute())
+
             simvis = apply_corruptions(
                 simvis,
                 msds.TIME.data,
@@ -555,6 +565,9 @@ def runit(opts):
                 freqs,
                 spec,
                 random_seed=opts.seed_gains,
+                nant=ms_nant,
+                time_ref=ms_t0,
+                freq_ref=ms_freq0,
             )
 
     # Thermal noise, added once for every path. With --seed-noise the draw is

@@ -75,12 +75,17 @@ other tables ship as ordinary bundled package data.
 
 `skysim` applies RIME Jones corruptions after prediction when `--corruptions` points to a YAML
 spec. The spec lists an ordered `terms` array of arbitrary labels and a `spec` array describing each
-term: `axes` (`time` and/or `frequency`), `diagonal`/`complex` flags, `amplitude`, and `period`.
-Omitting `diagonal` follows the MS -- full 2x2 Jones on a 4-correlation MS, scalar gain otherwise;
-an explicit `diagonal: false` on a 2-correlation MS is an error, not a downgrade.
+term: `axes` (`time` and/or `frequency`), `type`, `complex`, `amplitude`, and `period`.
+`type` is `scalar` (`g I`), `diagonal` (`diag(g_x, g_y)`, needs >= 2 correlations) or `full`
+(dense 2x2, needs 4). Omitting it follows the MS -- `full` on a 4-correlation MS, `scalar`
+otherwise; an explicit type the MS cannot carry is an error, not a downgrade. The boolean
+`diagonal: true/false` is deprecated and maps to `scalar`/`full` (it never meant the `diagonal`
+type).
 Periods are in seconds/Hz or `astropy`-compatible strings (e.g. `"2min"`, `"2MHz"`). The
 per-baseline corruption is `V' = J_p V J_q^H`, with terms multiplied left-to-right in the order
-given. Non-diagonal (full 2x2) terms require a 4-correlation MS. Corruptions are applied to the
+given. Phase origins come from the whole MS (earliest time, lowest frequency) and the gain array
+from the `ANTENNA` table, not from the field/SPW a run selects, so per-field runs agree.
+Corruptions are applied to the
 model *before* thermal noise is added (`V' = J_p V J_q^H + n`), so the noise is never
 gain-modulated. `--seed-noise` seeds thermal
 noise and `--seed-gains` the corruption terms, so corruptions cannot alter the noise realisation.
