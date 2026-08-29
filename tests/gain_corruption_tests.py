@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import tracemalloc
 
 import dask.array as da
 import numpy as np
@@ -903,3 +904,43 @@ def test_noise_only_run_warns_that_corruptions_are_ignored(gt2):
         skysim.log.removeHandler(handler)
 
     assert any("no effect on a noise-only run" in m for m in messages)
+
+
+def _corruption_peak_bytes(nant, nrow=400, nchan=64, ncorr=2):
+    """Peak allocation while computing one corrupted block with `nant` antennas."""
+    rng = np.random.default_rng(0)
+    ant1 = rng.integers(0, nant, nrow)
+    ant2 = (ant1 + 1) % nant
+    vis = da.from_array(np.ones((nrow, nchan, ncorr), np.complex128), chunks=(nrow, nchan, ncorr))
+    time = da.from_array(np.arange(nrow, dtype=float) * 8.0, chunks=nrow)
+    spec = CorruptionSpec(
+        terms=["G"],
+        spec=[TermSpec(label="G", diagonal=True, axes=["time"], period=120.0, amplitude=0.1)],
+    )
+    corrupted = apply_corruptions(
+        vis,
+        time,
+        da.from_array(ant1, chunks=nrow),
+        da.from_array(ant2, chunks=nrow),
+        np.linspace(1.42e9, 1.45e9, nchan),
+        spec,
+        random_seed=1,
+    )
+    tracemalloc.start()
+    try:
+        corrupted.compute()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_gain_memory_does_not_scale_with_antenna_count():
+    """Regression: gains were built as an (nant, nrow, nchan) cube and then
+    indexed down to the two (nrow, nchan) slices that are actually used, so peak
+    memory scaled with the size of the array -- tens of GiB per block at the
+    default chunking on a real MS. Only the per-row gains are built now, so a
+    64x larger array must not cost measurably more memory.
+    """
+    small = _corruption_peak_bytes(4)
+    large = _corruption_peak_bytes(256)
+    assert large < 2 * small, f"peak grew with antenna count: {small} -> {large} bytes"

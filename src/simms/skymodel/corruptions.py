@@ -186,39 +186,67 @@ def _build_all_term_params(spec: CorruptionSpec, nant: int, random_seed: int | N
     return [_build_term_params(label_to_spec[label], nant, random_seed, ncorr) for label in spec.terms]
 
 
-def _compute_oscillation(params: dict, time: np.ndarray, freqs: np.ndarray, t0: float, freq0: float) -> np.ndarray:
-    """Compute the scalar oscillation for a term.
+def _compute_oscillation(
+    params: dict, time: np.ndarray, freqs: np.ndarray, t0: float, freq0: float, ant: np.ndarray
+) -> np.ndarray:
+    """Compute a term's scalar oscillation for the antenna observing each row.
 
-    ``t0`` and ``freq0`` are the *global* phase references (first time/first
-    channel of the MS), passed in so blockwise blocks all evaluate the same
-    phase regardless of where chunk boundaries fall.
+    ``t0`` and ``freq0`` are the phase references for the caller's whole
+    selection, passed in so every block evaluates the same phase regardless of
+    where chunk boundaries fall.
 
-    Returns an array of shape ``(nant, nrow, nchan)``.
+    ``ant`` is the per-row antenna index (``ANTENNA1`` or ``ANTENNA2``), so the
+    result is ``(nrow, nchan)``. Evaluating per row rather than building the
+    full ``(nant, nrow, nchan)`` cube and indexing it afterwards gives the same
+    numbers for ``nant`` times less memory -- only the two indexed slices were
+    ever used.
+
+    Returns an array of shape ``(nrow, nchan)``.
     """
-    nant = next(iter(params["phases"].values())).size
-    nrow = time.size
-    nchan = freqs.size
-    oscillation = np.ones((nant, nrow, nchan), dtype=np.complex128)
-
-    reference = {"time": t0, "frequency": freq0}
-    x_values = {"time": time, "frequency": freqs}
+    oscillation = np.ones((time.size, freqs.size), dtype=np.complex128)
 
     for axis in params["axes"]:
         period = params["period"][axis]
-        phases = params["phases"][axis]  # (nant,)
-        x = x_values[axis]
-        x0 = reference[axis]
-
-        phase = 2.0 * np.pi * ((x[None, :] - x0) / period + phases[:, None])
+        phases = params["phases"][axis][ant]  # (nrow,)
 
         if axis == "time":
+            phase = 2.0 * np.pi * ((time - t0) / period + phases)  # (nrow,)
             trig = np.cos(phase) + 1j * np.sin(phase) if params["complex"] else np.cos(phase)
-            oscillation *= trig[:, :, None]
+            oscillation *= trig[:, None]
         else:
+            phase = 2.0 * np.pi * ((freqs[None, :] - freq0) / period + phases[:, None])  # (nrow, nchan)
             trig = np.cos(phase) + 1j * np.sin(phase) if params["complex"] else np.cos(phase)
-            oscillation *= trig[:, None, :]
+            oscillation *= trig
 
     return oscillation
+
+
+def _antenna_gain(
+    term_params: list[dict], time: np.ndarray, freqs: np.ndarray, t0: float, freq0: float, ant: np.ndarray
+) -> np.ndarray:
+    """Combined scalar gain for the antenna observing each row: ``(nrow, nchan)``."""
+    gain = np.ones((time.size, freqs.size), dtype=np.complex128)
+    for params in term_params:
+        oscillation = _compute_oscillation(params, time, freqs, t0, freq0, ant)
+        gain *= 1.0 + params["amplitude"] * oscillation
+    return gain
+
+
+def _antenna_jones(
+    term_params: list[dict], time: np.ndarray, freqs: np.ndarray, t0: float, freq0: float, ant: np.ndarray
+) -> np.ndarray:
+    """Combined 2x2 Jones for the antenna observing each row: ``(nrow, nchan, 2, 2)``."""
+    jones = np.broadcast_to(np.eye(2), (time.size, freqs.size, 2, 2)).astype(np.complex128)
+    for params in term_params:
+        oscillation = _compute_oscillation(params, time, freqs, t0, freq0, ant)
+        amp = params["amplitude"]
+        if params["diagonal"]:
+            jones *= (1.0 + amp * oscillation)[:, :, None, None]
+        else:
+            matrix = params["matrix"][ant][:, None, :, :]  # (nrow, 1, 2, 2)
+            term_jones = np.eye(2) + amp * oscillation[:, :, None, None] * matrix
+            jones = np.einsum("rfij,rfjk->rfik", jones, term_jones)
+    return jones
 
 
 def _corrupt_block(
@@ -229,19 +257,23 @@ def _corrupt_block(
     freqs: np.ndarray,
     t0: float,
     freq0: float,
-    nant: int,
     term_params: list[dict],
     out_dtype: np.dtype,
 ) -> np.ndarray:
     """Apply RIME corruptions to one (row, chan) chunk.
 
-    ``nant``, ``t0`` and ``freq0`` span the caller's whole selection: sizing gains
-    off this block's own antenna range, or referencing phases to its first
-    channel, would make the result depend on where the chunk boundaries fall.
+    ``t0`` and ``freq0`` span the caller's whole selection, and the per-antenna
+    phases in ``term_params`` are sized for its whole array: deriving either
+    from this block would make the result depend on where the chunk boundaries
+    fall.
 
     Note the references are per *selection*, not per MS -- ``skysim`` calls this
     for one field and one SPW at a time, so separate runs over different fields
     or SPWs of the same MS do not share a time or frequency origin.
+
+    Gains are evaluated per row, never per antenna: an ``(nant, nrow, nchan)``
+    cube is ``nant`` times larger than the two slices that get used, which at
+    the default chunking runs to tens of GiB on a real array.
     """
     vis = np.asarray(vis)
     time = np.asarray(time)
@@ -250,54 +282,35 @@ def _corrupt_block(
     freqs = np.asarray(freqs)
     ncorr = vis.shape[-1]
     nrow = vis.shape[0]
-    rows = np.arange(nrow)
 
     any_full = any(not p["diagonal"] for p in term_params)
 
     if any_full:
-        # Build combined 2x2 Jones per antenna/time/freq.
-        jones = np.broadcast_to(np.eye(2), (nant, nrow, freqs.size, 2, 2)).astype(np.complex128)
-
-        for params in term_params:
-            oscillation = _compute_oscillation(params, time, freqs, t0, freq0)
-            amp = params["amplitude"]
-            if params["diagonal"]:
-                scalar = 1.0 + amp * oscillation  # (nant, nrow, nchan)
-                jones *= scalar[:, :, :, None, None]
-            else:
-                matrix = params["matrix"][:, None, None, :, :]  # (nant, 1, 1, 2, 2)
-                term_jones = np.eye(2) + amp * oscillation[:, :, :, None, None] * matrix
-                jones = np.einsum("anfij,anfjk->anfik", jones, term_jones)
-
-        # Apply J_p V J_q^H per row/chan.
-        jp = jones[antenna1, rows, :, :, :]  # (nrow, nchan, 2, 2)
-        jq = jones[antenna2, rows, :, :, :]
-        jq_h = np.conj(jq.swapaxes(-2, -1))
-
-        if ncorr == 4:
-            vmat = np.empty((nrow, freqs.size, 2, 2), dtype=np.complex128)
-            vmat[..., 0, 0] = vis[..., 0]
-            vmat[..., 0, 1] = vis[..., 1]
-            vmat[..., 1, 0] = vis[..., 2]
-            vmat[..., 1, 1] = vis[..., 3]
-            vout = np.einsum("rcij,rcjk,rckl->rcil", jp, vmat, jq_h)
-            out = np.empty_like(vis)
-            out[..., 0] = vout[..., 0, 0]
-            out[..., 1] = vout[..., 0, 1]
-            out[..., 2] = vout[..., 1, 0]
-            out[..., 3] = vout[..., 1, 1]
-        else:
+        if ncorr != 4:
             # This should have been caught by validation, but keep a clear message.
             raise RuntimeError("Non-diagonal Jones corruptions require a 4-correlation MS")
-    else:
-        # All terms diagonal: scalar gain per antenna/time/freq.
-        combined = np.ones((nant, nrow, freqs.size), dtype=np.complex128)
-        for params in term_params:
-            oscillation = _compute_oscillation(params, time, freqs, t0, freq0)
-            combined *= 1.0 + params["amplitude"] * oscillation
 
-        factor = combined[antenna1, rows, :] * np.conj(combined[antenna2, rows, :])
-        out = vis * factor[:, :, None]
+        # Apply J_p V J_q^H per row/chan.
+        jp = _antenna_jones(term_params, time, freqs, t0, freq0, antenna1)
+        jq = _antenna_jones(term_params, time, freqs, t0, freq0, antenna2)
+        jq_h = np.conj(jq.swapaxes(-2, -1))
+
+        vmat = np.empty((nrow, freqs.size, 2, 2), dtype=np.complex128)
+        vmat[..., 0, 0] = vis[..., 0]
+        vmat[..., 0, 1] = vis[..., 1]
+        vmat[..., 1, 0] = vis[..., 2]
+        vmat[..., 1, 1] = vis[..., 3]
+        vout = np.einsum("rcij,rcjk,rckl->rcil", jp, vmat, jq_h)
+        out = np.empty_like(vis)
+        out[..., 0] = vout[..., 0, 0]
+        out[..., 1] = vout[..., 0, 1]
+        out[..., 2] = vout[..., 1, 0]
+        out[..., 3] = vout[..., 1, 1]
+    else:
+        # All terms diagonal: scalar gain per row/chan.
+        gp = _antenna_gain(term_params, time, freqs, t0, freq0, antenna1)
+        gq = _antenna_gain(term_params, time, freqs, t0, freq0, antenna2)
+        out = vis * (gp * np.conj(gq))[:, :, None]
 
     return out.astype(out_dtype, copy=False)
 
@@ -359,7 +372,6 @@ def apply_corruptions(
         dtype=vis.dtype,
         t0=t0,
         freq0=freq0,
-        nant=nant,
         term_params=term_params,
         out_dtype=vis.dtype,
         meta=np.empty((0, 0, vis.shape[-1]), dtype=vis.dtype),

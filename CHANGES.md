@@ -13,7 +13,11 @@
   once over the whole selection rather than per dask block, so a corruption is
   invariant under row and channel chunking; note the references are per field
   and per SPW, so separate runs over different fields or SPWs of one MS do not
-  share a time or frequency origin.
+  share a time or frequency origin. Gains are evaluated per row rather than as
+  an `(nant, nrow, nchan)` cube that was then indexed down to two slices, so
+  peak memory no longer scales with the size of the array: a 64-antenna,
+  1024-channel MS needed ~9.8 GiB per block (~39 GiB for full Jones) at the
+  default `--row-chunks`, which made `--corruptions` unusable on a real MS.
 - `skysim`: deprecate `--seed` in favour of `--seed-noise` (the same value gives
   the same noise realisation; a deprecation warning is emitted). Corruption
   terms draw from their own `--seed-gains`, so adding corruptions cannot change
