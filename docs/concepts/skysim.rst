@@ -111,8 +111,8 @@ Thermal noise
 Provide either ``--sefd`` (System Equivalent Flux Density, in Jy) or
 ``--tsys-over-eta`` (:math:`T_\mathrm{sys}/\eta`).
 
-Use ``--random-seed`` to make the noise realisation reproducible at a given
-chunking.
+Use ``--seed-noise`` to make the noise realisation reproducible at a given
+chunking. (``--seed`` is the deprecated pre-3.1 name for the same option.)
 
 Corruptions
 -----------
@@ -123,7 +123,7 @@ a YAML specification:
 .. code-block:: console
 
     $ simms skysim --ascii-sky skymodel.txt --column DATA \
-        --corruptions corruptions.yaml --random-seed 42 visdata.ms
+        --corruptions corruptions.yaml --seed-gains 42 visdata.ms
 
 The file describes an ordered list of terms and a specification for each one:
 
@@ -159,6 +159,11 @@ is a mapping from axis name to value; values can be raw numbers (seconds for
 ``time``, Hz for ``frequency``) or ``astropy`` strings such as ``"2min"`` or
 ``"2MHz"``.  A scalar ``period`` is accepted as shorthand when a term has a
 single axis.
+
+The random per-antenna phases (and matrices, for full terms) draw from
+``--seed-gains``; omitting it gives a deterministic per-label draw. Corruptions
+never touch the thermal-noise stream, which is seeded separately by
+``--seed-noise``.
 
 Chunking large MSs
 -------------------

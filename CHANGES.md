@@ -8,9 +8,10 @@
   multiplied in the order listed. Full (non-diagonal) terms require a
   4-correlation MS. `--gain-period`, `--gain-amplitude` and `--gain-seed` have
   been removed in favour of this framework.
-- `skysim`: rename `--seed` to `--random-seed`. It now seeds both thermal noise
-  and corruption terms; noise uses an isolated sub-seed so adding corruptions
-  does not change the noise realisation.
+- `skysim`: deprecate `--seed` in favour of `--seed-noise` (the same value gives
+  the same noise realisation; a deprecation warning is emitted). Corruption
+  terms draw from their own `--seed-gains`, so adding corruptions cannot change
+  the noise realisation.
 - `skysim`: `--row-chunks` is now an upper bound rather than a fixed chunk size.
   A fixed size tied the task count to the length of the MS, so a short track
   produced fewer chunks than workers and left most of them idle (76608 rows at

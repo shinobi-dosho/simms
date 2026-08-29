@@ -78,9 +78,9 @@ spec. The spec lists an ordered `terms` array of arbitrary labels and a `spec` a
 term: `axes` (`time` and/or `frequency`), `diagonal`/`complex` flags, `amplitude`, and `period`.
 Periods are in seconds/Hz or `astropy`-compatible strings (e.g. `"2min"`, `"2MHz"`). The
 per-baseline corruption is `V' = J_p V J_q^H`, with terms multiplied left-to-right in the order
-given. Non-diagonal (full 2x2) terms require a 4-correlation MS. `--random-seed` seeds both thermal
-noise and corruption terms, using isolated sub-seeds so corruptions do not alter the noise
-realisation.
+given. Non-diagonal (full 2x2) terms require a 4-correlation MS. `--seed-noise` seeds thermal
+noise and `--seed-gains` the corruption terms, so corruptions cannot alter the noise realisation.
+`--seed` is a deprecated alias for `--seed-noise` (the same value gives the same noise).
 
 ## Git
 

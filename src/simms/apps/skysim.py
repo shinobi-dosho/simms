@@ -18,7 +18,7 @@ from tqdm.dask import TqdmCallback
 from simms import BIN, SCHEMADIR, set_logger
 from simms.skymodel.ascii_skies import ASCIISkymodel
 from simms.skymodel.beams import load_beam_config, resolve_antenna_beams
-from simms.skymodel.corruptions import apply_corruptions, load_corruption_spec, noise_seed
+from simms.skymodel.corruptions import apply_corruptions, load_corruption_spec
 from simms.skymodel.fits_skies import component_sky_from_fits_dft, predict_fits_channel_block, prepare_fits_sky
 from simms.skymodel.mstools import (
     attach_beam,
@@ -232,6 +232,14 @@ class _BeamContext:
 def runit(opts):
     # Set logger here, so subsequent modeules get it via logging.getLogger(<name>)
     set_logger(BIN.skysim, opts.log_level)
+
+    # --seed only ever seeded the thermal noise, so it maps onto --seed-noise.
+    seed_noise = opts.seed_noise
+    if opts.seed is not None:
+        log.warning("--seed is deprecated; use --seed-noise (the realisation for a given value is unchanged).")
+        if seed_noise is None:
+            seed_noise = opts.seed
+
     ms = opts.ms
     ascii_sky = opts.ascii_sky
     fs = opts.fits_sky
@@ -523,7 +531,7 @@ def runit(opts):
                 concatenate=True,
             )
 
-    # Thermal noise, added once for every path. With --random-seed the draw is
+    # Thermal noise, added once for every path. With --seed-noise the draw is
     # reproducible across runs at a given chunking; changing the chunking changes
     # the realisation, as dask keys each block's stream to its position in the grid.
     if vis_noise:
@@ -532,7 +540,7 @@ def runit(opts):
             (msds.UVW.data.chunks[0], chan_chunks, ncorr),
             vis_noise,
             vis_dtype,
-            seed=noise_seed(opts.random_seed),
+            seed=seed_noise,
         )
         simvis = noise if simvis is None else simvis + noise
 
@@ -545,7 +553,7 @@ def runit(opts):
             msds.ANTENNA2.data,
             freqs,
             spec,
-            random_seed=opts.random_seed,
+            random_seed=opts.seed_gains,
         )
 
     if simvis is None:
@@ -723,11 +731,21 @@ def skysim(
     field_id: int = Field(0, description="Field ID.", json_schema_extra={"abbreviation": "fi"}),
     spw_id: int = Field(0, description="Spectral Window ID."),
     sefd: float | None = Field(None, description="Add noise using this SEFD value."),
-    random_seed: int | None = Field(
+    seed_noise: int | None = Field(
         None,
-        description="Random seed for thermal noise and corruption terms. Omit for a non-reproducible run. "
-        "The realisation also depends on the row chunking, which --nworkers feeds into, so "
-        "reproducing a previous run needs the same --random-seed, --row-chunks and --nworkers.",
+        description="Random seed for the thermal noise. Omit for a non-reproducible run. The "
+        "realisation also depends on the row chunking, which --nworkers feeds into, so "
+        "reproducing a previous run needs the same --seed-noise, --row-chunks and --nworkers. "
+        "This is the renamed --seed; the same value gives the same noise.",
+    ),
+    seed_gains: int | None = Field(
+        None,
+        description="Random seed for the corruption terms' random phases/matrices. Omit for a "
+        "deterministic per-label draw; the thermal noise stream is unaffected either way.",
+    ),
+    seed: int | None = Field(
+        None,
+        description="Deprecated alias for --seed-noise; --seed-noise wins if both are given.",
     ),
     corruptions: str | None = Field(
         None,

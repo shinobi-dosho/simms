@@ -11,9 +11,6 @@ import dask.array as da
 import numpy as np
 import yaml
 
-# Fixed offset so that the noise stream is independent of corruption-term hashes.
-NOISE_SALT = 0xFFFF_FFFF
-
 DIMENSION_UNITS = {
     "time": u.s,
     "frequency": u.Hz,
@@ -51,13 +48,6 @@ def _term_seed(random_seed: int | None, label: str) -> int | None:
     if random_seed is None:
         return label_hash
     return random_seed + label_hash
-
-
-def noise_seed(random_seed: int | None) -> int | None:
-    """Seed for the thermal-noise stream, isolated from corruption-term seeds."""
-    if random_seed is None:
-        return None
-    return random_seed + NOISE_SALT
 
 
 def _parse_period(value: float | int | str, axis: str) -> float:

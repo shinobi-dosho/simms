@@ -116,7 +116,7 @@ gains:
             ascii_sky=gt2.sky,
             column="DATA",
             corruptions=yaml_path,
-            random_seed=seed,
+            seed_gains=seed,
         )
     )
     corrupted = read_column(gt2.ms, "DATA")
@@ -150,7 +150,7 @@ gains:
             ascii_sky=gt2.sky,
             column="DATA",
             corruptions=yaml_path,
-            random_seed=3,
+            seed_gains=3,
         )
     )
     corrupted = read_column(gt2.ms, "DATA")
@@ -189,7 +189,7 @@ gains:
             ascii_sky=gt2.sky,
             column="DATA",
             corruptions=yaml_path,
-            random_seed=seed,
+            seed_gains=seed,
         )
     )
     corrupted = read_column(gt2.ms, "DATA")
@@ -226,7 +226,7 @@ gains:
             ascii_sky=gt2.sky,
             column="DATA",
             corruptions=yaml_path,
-            random_seed=seed,
+            seed_gains=seed,
         )
     )
     corrupted = read_column(gt2.ms, "DATA")
@@ -275,7 +275,7 @@ gains:
             ascii_sky=gt2.sky,
             column="DATA",
             corruptions=yaml_path,
-            random_seed=seed,
+            seed_gains=seed,
         )
     )
     corrupted = read_column(gt2.ms, "DATA")
@@ -325,7 +325,7 @@ gains:
                 ascii_sky=gt2.sky,
                 column="DATA",
                 corruptions=yaml_path,
-                random_seed=1,
+                seed_gains=1,
             )
         )
 
@@ -355,7 +355,7 @@ gains:
             ascii_sky=gt4.sky,
             column="DATA",
             corruptions=yaml_path,
-            random_seed=2,
+            seed_gains=2,
         )
     )
     corrupted = read_column(gt4.ms, "DATA")
@@ -363,7 +363,7 @@ gains:
     assert not np.allclose(corrupted, clean)
 
 
-def test_random_seed_makes_corruptions_reproducible(gt2):
+def test_seed_gains_makes_corruptions_reproducible(gt2):
     yaml_path = gt2.write_yaml(
         """
 gains:
@@ -385,7 +385,7 @@ gains:
                 ascii_sky=gt2.sky,
                 column="DATA",
                 corruptions=yaml_path,
-                random_seed=42,
+                seed_gains=42,
             )
         )
     first = read_column(gt2.ms, "DATA")
@@ -393,7 +393,7 @@ gains:
     np.testing.assert_array_equal(first, second)
 
 
-def test_different_random_seed_gives_different_corruption(gt2):
+def test_different_seed_gains_gives_different_corruption(gt2):
     yaml_path = gt2.write_yaml(
         """
 gains:
@@ -414,7 +414,7 @@ gains:
             ascii_sky=gt2.sky,
             column="DATA",
             corruptions=yaml_path,
-            random_seed=1,
+            seed_gains=1,
         )
     )
     first = read_column(gt2.ms, "DATA")
@@ -424,15 +424,15 @@ gains:
             ascii_sky=gt2.sky,
             column="DATA",
             corruptions=yaml_path,
-            random_seed=2,
+            seed_gains=2,
         )
     )
     second = read_column(gt2.ms, "DATA")
     assert not np.allclose(first, second)
 
 
-def test_noise_seed_is_isolated_from_corruption_seed(gt2):
-    """Adding corruptions should not change the thermal noise realisation."""
+def test_corruptions_do_not_change_the_noise_realisation(gt2):
+    """Noise draws from --seed-noise only, so adding corruptions leaves it unchanged."""
     sefd = 500.0
     yaml_path = gt2.write_yaml(
         """
@@ -448,7 +448,7 @@ gains:
       amplitude: 0.0
 """
     )
-    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", sefd=sefd, random_seed=99))
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", sefd=sefd, seed_noise=99))
     noise_only = read_column(gt2.ms, "DATA")
 
     skysim.runit(
@@ -457,12 +457,24 @@ gains:
             ascii_sky=gt2.sky,
             column="DATA",
             sefd=sefd,
-            random_seed=99,
+            seed_noise=99,
+            seed_gains=5,
             corruptions=yaml_path,
         )
     )
     noise_with_corruptions = read_column(gt2.ms, "DATA")
     np.testing.assert_allclose(noise_only, noise_with_corruptions, rtol=1e-11, atol=1e-13)
+
+
+def test_deprecated_seed_alias_matches_seed_noise(gt2):
+    """--seed maps onto --seed-noise, reproducing the pre-rename realisation."""
+    sefd = 500.0
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", sefd=sefd, seed=99))
+    legacy = read_column(gt2.ms, "DATA")
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", sefd=sefd, seed_noise=99))
+    renamed = read_column(gt2.ms, "DATA")
+    np.testing.assert_array_equal(legacy, renamed)
 
 
 @pytest.mark.parametrize(
@@ -550,7 +562,7 @@ def test_invalid_specs_raise(gt2, yaml_content, match):
                 ascii_sky=gt2.sky,
                 column="DATA",
                 corruptions=yaml_path,
-                random_seed=1,
+                seed_gains=1,
             )
         )
 
@@ -576,7 +588,7 @@ gains:
             ascii_sky=gt2.sky,
             column="DATA",
             corruptions=yaml_path,
-            random_seed=1,
+            seed_gains=1,
         )
     )
     assert np.all(np.isfinite(read_column(gt2.ms, "DATA")))
