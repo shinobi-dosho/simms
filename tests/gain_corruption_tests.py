@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import dask.array as da
 import numpy as np
 import pytest
 from daskms import xds_from_ms, xds_from_table
 
 from simms.apps import skysim
-from simms.skymodel.corruptions import apply_corruptions, load_corruption_spec
+from simms.skymodel.corruptions import CorruptionSpec, TermSpec, apply_corruptions, load_corruption_spec
 from simms.telescope.generate_ms import create_ms
 
 from . import InitTest, skysim_opts
@@ -378,17 +379,25 @@ gains:
       amplitude: 0.1
 """
     )
-    for _ in range(2):
-        skysim.runit(
-            skysim_opts(
-                gt2.ms,
-                ascii_sky=gt2.sky,
-                column="DATA",
-                corruptions=yaml_path,
-                seed_gains=42,
-            )
+    skysim.runit(
+        skysim_opts(
+            gt2.ms,
+            ascii_sky=gt2.sky,
+            column="DATA",
+            corruptions=yaml_path,
+            seed_gains=42,
         )
+    )
     first = read_column(gt2.ms, "DATA")
+    skysim.runit(
+        skysim_opts(
+            gt2.ms,
+            ascii_sky=gt2.sky,
+            column="DATA",
+            corruptions=yaml_path,
+            seed_gains=42,
+        )
+    )
     second = read_column(gt2.ms, "DATA")
     np.testing.assert_array_equal(first, second)
 
@@ -628,3 +637,47 @@ gains:
     time, ant1, ant2 = read_aux(gt2.ms)
     expected = expected_diagonal_factor(time, ant1, ant2, 120.0, 0.1, 1, label="G").astype(corrupted.dtype)
     np.testing.assert_allclose(corrupted[:, 0, 0] / clean[:, 0, 0], expected, rtol=1e-6, atol=1e-7)
+
+
+def test_row_chunk_without_highest_antenna():
+    """Regression: gains sized off a block's antenna range crash on any block
+    that does not contain the highest-numbered antenna."""
+    nrow, nchan, ncorr = 16, 2, 2
+    # First 8 rows only use antennas 0-2; the next 8 use 0-7.
+    ant1 = np.array([0, 1, 2, 0, 1, 2, 0, 1, 0, 1, 2, 3, 4, 5, 6, 7])
+    ant2 = np.array([1, 2, 0, 1, 2, 0, 1, 2, 7, 6, 5, 4, 3, 2, 1, 0])
+    vis = da.from_array(np.ones((nrow, nchan, ncorr), dtype=np.complex128), chunks=(8, nchan, ncorr))
+    time = da.from_array(np.arange(nrow, dtype=float) * 60.0, chunks=8)
+    a1 = da.from_array(ant1, chunks=8)
+    a2 = da.from_array(ant2, chunks=8)
+    freqs = np.linspace(1.420e9, 1.428e9, nchan)
+
+    spec = CorruptionSpec(
+        terms=["G"],
+        spec=[TermSpec(label="G", axes=["time"], period=120.0, amplitude=0.1)],
+    )
+    result = apply_corruptions(vis, time, a1, a2, freqs, spec, random_seed=1).compute()
+    assert np.all(np.isfinite(result))
+
+
+def test_frequency_term_is_invariant_under_channel_chunking():
+    """Regression: the frequency phase reference is the MS's first channel, not
+    the block's first channel -- chunk boundaries must not restart the sinusoid."""
+    nrow, nchan, ncorr = 4, 8, 2
+    ant1 = np.zeros(nrow, dtype=int)
+    ant2 = np.ones(nrow, dtype=int)
+    freqs = np.linspace(1.420e9, 1.436e9, nchan)
+
+    spec = CorruptionSpec(
+        terms=["B"],
+        spec=[TermSpec(label="B", axes=["frequency"], period=8e6, amplitude=0.5)],
+    )
+
+    def run(chan_chunk):
+        vis = da.from_array(np.ones((nrow, nchan, ncorr), dtype=np.complex128), chunks=(nrow, chan_chunk, ncorr))
+        time = da.from_array(np.arange(nrow, dtype=float) * 60.0, chunks=nrow)
+        a1 = da.from_array(ant1, chunks=nrow)
+        a2 = da.from_array(ant2, chunks=nrow)
+        return apply_corruptions(vis, time, a1, a2, freqs, spec, random_seed=1).compute()
+
+    np.testing.assert_allclose(run(nchan), run(4), rtol=1e-13, atol=1e-14)

@@ -163,8 +163,12 @@ def _build_all_term_params(spec: CorruptionSpec, nant: int, random_seed: int | N
     return [_build_term_params(label_to_spec[label], nant, random_seed) for label in spec.terms]
 
 
-def _compute_oscillation(params: dict, time: np.ndarray, freqs: np.ndarray, t0: float) -> np.ndarray:
+def _compute_oscillation(params: dict, time: np.ndarray, freqs: np.ndarray, t0: float, freq0: float) -> np.ndarray:
     """Compute the scalar oscillation for a term.
+
+    ``t0`` and ``freq0`` are the *global* phase references (first time/first
+    channel of the MS), passed in so blockwise blocks all evaluate the same
+    phase regardless of where chunk boundaries fall.
 
     Returns an array of shape ``(nant, nrow, nchan)``.
     """
@@ -173,7 +177,7 @@ def _compute_oscillation(params: dict, time: np.ndarray, freqs: np.ndarray, t0: 
     nchan = freqs.size
     oscillation = np.ones((nant, nrow, nchan), dtype=np.complex128)
 
-    reference = {"time": t0, "frequency": float(freqs[0])}
+    reference = {"time": t0, "frequency": freq0}
     x_values = {"time": time, "frequency": freqs}
 
     for axis in params["axes"]:
@@ -201,10 +205,17 @@ def _corrupt_block(
     antenna2: np.ndarray,
     freqs: np.ndarray,
     t0: float,
+    freq0: float,
+    nant: int,
     term_params: list[dict],
     out_dtype: np.dtype,
 ) -> np.ndarray:
-    """Apply RIME corruptions to one (row, chan) chunk."""
+    """Apply RIME corruptions to one (row, chan) chunk.
+
+    ``nant``, ``t0`` and ``freq0`` are global (whole-MS) values: sizing gains off
+    this block's own antenna range, or referencing phases to its first channel,
+    would make the result depend on where the chunk boundaries fall.
+    """
     vis = np.asarray(vis)
     time = np.asarray(time)
     antenna1 = np.asarray(antenna1)
@@ -214,17 +225,14 @@ def _corrupt_block(
     nrow = vis.shape[0]
     rows = np.arange(nrow)
 
-    nant = max(int(antenna1.max()), int(antenna2.max())) + 1
-
     any_full = any(not p["diagonal"] for p in term_params)
 
     if any_full:
         # Build combined 2x2 Jones per antenna/time/freq.
-        jones = np.stack([np.eye(2) for _ in range(nant * nrow * freqs.size)], axis=0)
-        jones = jones.reshape((nant, nrow, freqs.size, 2, 2)).astype(np.complex128)
+        jones = np.broadcast_to(np.eye(2), (nant, nrow, freqs.size, 2, 2)).astype(np.complex128).copy()
 
         for params in term_params:
-            oscillation = _compute_oscillation(params, time, freqs, t0)
+            oscillation = _compute_oscillation(params, time, freqs, t0, freq0)
             amp = params["amplitude"]
             if params["diagonal"]:
                 scalar = 1.0 + amp * oscillation  # (nant, nrow, nchan)
@@ -258,7 +266,7 @@ def _corrupt_block(
         # All terms diagonal: scalar gain per antenna/time/freq.
         combined = np.ones((nant, nrow, freqs.size), dtype=np.complex128)
         for params in term_params:
-            oscillation = _compute_oscillation(params, time, freqs, t0)
+            oscillation = _compute_oscillation(params, time, freqs, t0, freq0)
             combined *= 1.0 + params["amplitude"] * oscillation
 
         factor = combined[antenna1, rows, :] * np.conj(combined[antenna2, rows, :])
@@ -289,7 +297,9 @@ def apply_corruptions(
     spec : CorruptionSpec
         Parsed corruption specification.
     random_seed : int or None, optional
-        Global seed for reproducible randomness.
+        Global seed for reproducible randomness. ``None`` is *not* fresh entropy:
+        each term falls back to a deterministic hash of its label, so an
+        unseeded run is reproducible (and two same-hash terms share phases).
 
     Returns
     -------
@@ -297,6 +307,7 @@ def apply_corruptions(
         Corrupted visibilities with the same shape and chunking as ``vis``.
     """
     t0 = float(time.min().compute())
+    freq0 = float(freqs[0])
     nant = max(int(antenna1.max().compute()), int(antenna2.max().compute())) + 1
 
     validate_spec(spec, ncorr=vis.shape[-1])
@@ -317,6 +328,8 @@ def apply_corruptions(
         ("chan",),
         dtype=vis.dtype,
         t0=t0,
+        freq0=freq0,
+        nant=nant,
         term_params=term_params,
         out_dtype=vis.dtype,
         meta=np.empty((0, 0, vis.shape[-1]), dtype=vis.dtype),
