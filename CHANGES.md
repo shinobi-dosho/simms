@@ -1,5 +1,16 @@
 ### 3.0.1 -> unreleased
 
+- `skysim`: add YAML-driven RIME Jones corruptions via `--corruptions`. Terms are
+  described with arbitrary labels, axes (`time` and/or `frequency`), diagonal or
+  full 2x2 Jones matrices, and sinusoidal amplitudes/periods. Periods accept
+  raw numbers (seconds/Hz) or `astropy`-compatible strings such as `"2min"` and
+  `"2MHz"`. The per-baseline corruption is `V' = J_p V J_q^H`, with terms
+  multiplied in the order listed. Full (non-diagonal) terms require a
+  4-correlation MS. `--gain-period`, `--gain-amplitude` and `--gain-seed` have
+  been removed in favour of this framework.
+- `skysim`: rename `--seed` to `--random-seed`. It now seeds both thermal noise
+  and corruption terms; noise uses an isolated sub-seed so adding corruptions
+  does not change the noise realisation.
 - `skysim`: `--row-chunks` is now an upper bound rather than a fixed chunk size.
   A fixed size tied the task count to the length of the MS, so a short track
   produced fewer chunks than workers and left most of them idle (76608 rows at

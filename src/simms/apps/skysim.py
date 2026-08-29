@@ -18,6 +18,7 @@ from tqdm.dask import TqdmCallback
 from simms import BIN, SCHEMADIR, set_logger
 from simms.skymodel.ascii_skies import ASCIISkymodel
 from simms.skymodel.beams import load_beam_config, resolve_antenna_beams
+from simms.skymodel.corruptions import apply_corruptions, load_corruption_spec, noise_seed
 from simms.skymodel.fits_skies import component_sky_from_fits_dft, predict_fits_channel_block, prepare_fits_sky
 from simms.skymodel.mstools import (
     attach_beam,
@@ -522,7 +523,7 @@ def runit(opts):
                 concatenate=True,
             )
 
-    # Thermal noise, added once for every path. With --seed the draw is
+    # Thermal noise, added once for every path. With --random-seed the draw is
     # reproducible across runs at a given chunking; changing the chunking changes
     # the realisation, as dask keys each block's stream to its position in the grid.
     if vis_noise:
@@ -531,9 +532,21 @@ def runit(opts):
             (msds.UVW.data.chunks[0], chan_chunks, ncorr),
             vis_noise,
             vis_dtype,
-            seed=opts.seed,
+            seed=noise_seed(opts.random_seed),
         )
         simvis = noise if simvis is None else simvis + noise
+
+    if simvis is not None and opts.corruptions:
+        spec = load_corruption_spec(opts.corruptions)
+        simvis = apply_corruptions(
+            simvis,
+            msds.TIME.data,
+            msds.ANTENNA1.data,
+            msds.ANTENNA2.data,
+            freqs,
+            spec,
+            random_seed=opts.random_seed,
+        )
 
     if simvis is None:
         raise RuntimeError("Nothing to simulate: provide a sky model (--ascii-sky/--fits-sky/--wsclean-sky) or --sefd.")
@@ -710,11 +723,15 @@ def skysim(
     field_id: int = Field(0, description="Field ID.", json_schema_extra={"abbreviation": "fi"}),
     spw_id: int = Field(0, description="Spectral Window ID."),
     sefd: float | None = Field(None, description="Add noise using this SEFD value."),
-    seed: int | None = Field(
+    random_seed: int | None = Field(
         None,
-        description="Random seed for the thermal noise. Omit for a non-reproducible run. The "
-        "realisation also depends on the row chunking, which --nworkers feeds into, so "
-        "reproducing a previous run needs the same --seed, --row-chunks and --nworkers.",
+        description="Random seed for thermal noise and corruption terms. Omit for a non-reproducible run. "
+        "The realisation also depends on the row chunking, which --nworkers feeds into, so "
+        "reproducing a previous run needs the same --random-seed, --row-chunks and --nworkers.",
+    ),
+    corruptions: str | None = Field(
+        None,
+        description="YAML file describing RIME Jones corruptions to apply to the predicted visibilities.",
     ),
     ascii_species: Literal["bdsf_gaul", "aegean", "wsclean"] | None = Field(
         None, description="Non-simms sky model type.", json_schema_extra={"abbreviation": "asp"}

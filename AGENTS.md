@@ -71,6 +71,17 @@ Cosine-taper (`beams.py`) tables under `src/simms/skymodel/beam_data/`. The `MKA
 tables are vendored from katbeam (BSD-3-Clause) — keep that attribution in `beam_data/NOTICE`. The
 other tables ship as ordinary bundled package data.
 
+## Corruptions
+
+`skysim` applies RIME Jones corruptions after prediction when `--corruptions` points to a YAML
+spec. The spec lists an ordered `terms` array of arbitrary labels and a `spec` array describing each
+term: `axes` (`time` and/or `frequency`), `diagonal`/`complex` flags, `amplitude`, and `period`.
+Periods are in seconds/Hz or `astropy`-compatible strings (e.g. `"2min"`, `"2MHz"`). The
+per-baseline corruption is `V' = J_p V J_q^H`, with terms multiplied left-to-right in the order
+given. Non-diagonal (full 2x2) terms require a 4-correlation MS. `--random-seed` seeds both thermal
+noise and corruption terms, using isolated sub-seeds so corruptions do not alter the noise
+realisation.
+
 ## Git
 
 - Branch off `main` for changes; open PRs against `main` (repo `shinobi-dosho/simms`).
