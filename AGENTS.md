@@ -77,8 +77,9 @@ other tables ship as ordinary bundled package data.
 spec. The spec lists an ordered `terms` array of arbitrary labels and a `spec` array describing each
 term: `axes` (`time` and/or `frequency`), `type`, `complex`, `amplitude`, and `period`.
 `type` is `scalar` (`g I`), `diagonal` (`diag(g_x, g_y)`, needs >= 2 correlations) or `full`
-(dense 2x2, needs 4). Omitting it follows the MS -- `full` on a 4-correlation MS, `scalar`
-otherwise; an explicit type the MS cannot carry is an error, not a downgrade. The boolean
+(dense 2x2, needs 4). Omitting it gives `diagonal`, falling back to `scalar` only on a
+1-correlation MS; leakage is never implied. An explicit type the MS cannot carry is an
+error, not a downgrade. The boolean
 `diagonal: true/false` is deprecated and maps to `scalar`/`full` (it never meant the `diagonal`
 type).
 Periods are in seconds/Hz or `astropy`-compatible strings (e.g. `"2min"`, `"2MHz"`). The

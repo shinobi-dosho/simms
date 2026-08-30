@@ -46,9 +46,9 @@ class TermSpec:
     ``full``
         a dense 2x2 Jones with leakage. Needs a 4-correlation MS.
 
-    Left unset it follows the MS: ``full`` on a 4-correlation MS, ``scalar``
-    otherwise. An explicit type that the MS cannot carry is an error rather than
-    a silent downgrade.
+    Left unset it is ``diagonal``, falling back to ``scalar`` only on a
+    single-correlation MS. An explicit type that the MS cannot carry is an error
+    rather than a silent downgrade.
 
     ``diagonal`` is the deprecated boolean spelling: ``true`` means ``scalar``
     and ``false`` means ``full`` (note it never meant the ``diagonal`` type).
@@ -129,8 +129,10 @@ def load_corruption_spec(path: str) -> CorruptionSpec:
 def resolve_type(spec: TermSpec, ncorr: int) -> str:
     """Resolve a term's Jones form against the MS correlation count.
 
-    An unset type follows the MS: a 4-correlation MS can carry a full 2x2 Jones,
-    so it gets one; anything else can only carry a scalar gain.
+    An unset type is ``diagonal`` -- independent per-feed gains, the usual
+    starting point for a calibration-style corruption -- falling back to
+    ``scalar`` only on a single-correlation MS, which has no second feed to give
+    its own gain. Leakage (``full``) is never implied; it has to be asked for.
     """
     if spec.type is not None and spec.diagonal is not None:
         raise RuntimeError(
@@ -155,7 +157,7 @@ def resolve_type(spec: TermSpec, ncorr: int) -> str:
         )
         return resolved
 
-    return "full" if ncorr == 4 else "scalar"
+    return "diagonal" if ncorr in TERM_NCORR["diagonal"] else "scalar"
 
 
 def validate_spec(spec: CorruptionSpec, ncorr: int) -> None:

@@ -164,9 +164,10 @@ J_q(t,f)^H`.
 ``full``
     a dense 2x2 Jones with leakage.  Requires a 4-correlation MS.
 
-Leaving ``type`` out follows the MS: a 4-correlation MS gets ``full``,
-anything else ``scalar``.  An explicit type the MS cannot carry is an error
-rather than a silent downgrade.
+Leaving ``type`` out gives ``diagonal``, falling back to ``scalar`` only on a
+single-correlation MS, which has no second feed to give its own gain.  Leakage
+is never implied -- ``full`` has to be asked for.  An explicit type the MS
+cannot carry is an error rather than a silent downgrade.
 
 ``diagonal: true``/``false`` is the deprecated boolean spelling of ``scalar``
 and ``full``; it warns and still works.  Note it never meant the ``diagonal``

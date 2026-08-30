@@ -8,8 +8,8 @@
   multiplied in the order listed. Full (non-diagonal) terms require a
   4-correlation MS. `type` selects the Jones form -- `scalar` (`g I`), `diagonal`
   (`diag(g_x, g_y)`, independent per-feed gains, needs at least 2 correlations)
-  or `full` (dense 2x2, needs 4) -- and omitting it follows the MS, giving
-  `full` on a 4-correlation MS and `scalar` otherwise. The boolean
+  or `full` (dense 2x2, needs 4) -- and omitting it gives `diagonal`, falling
+  back to `scalar` only on a 1-correlation MS. Leakage is never implied. The boolean
   `diagonal: true/false` is deprecated in favour of `type: scalar/full`; it
   warns and still works, and never meant the new `diagonal` form. Corruptions are applied to
   the model before thermal noise is added (`V' = J_p V J_q^H + n`), so `--sefd`

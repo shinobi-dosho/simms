@@ -698,7 +698,7 @@ def test_frequency_term_is_invariant_under_channel_chunking():
     np.testing.assert_allclose(run(nchan), run(4), rtol=1e-13, atol=1e-14)
 
 
-_UNSET_DIAGONAL_YAML = """
+_UNSET_TYPE_YAML = """
 gains:
   terms: [J]
   spec:
@@ -726,10 +726,13 @@ gains:
 """
 
 
-def test_unset_diagonal_is_full_jones_on_four_correlations(gt4):
-    """An omitted 'diagonal' follows the MS: 4 corrs can carry a full 2x2 Jones."""
-    unset = gt4.write_yaml(_UNSET_DIAGONAL_YAML)
-    explicit = gt4.write_yaml(_explicit_diagonal_yaml("false"))
+def test_unset_type_is_diagonal_on_four_correlations(gt4):
+    """An omitted 'type' means diag(g_x, g_y), not a dense Jones.
+
+    Leakage has to be asked for: the default must not mix the polarisations.
+    """
+    unset = gt4.write_yaml(_UNSET_TYPE_YAML)
+    explicit = gt4.write_yaml(_UNSET_TYPE_YAML.replace("      complex:", "      type: diagonal\n      complex:"))
 
     skysim.runit(skysim_opts(gt4.ms, ascii_sky=gt4.sky, column="DATA", corruptions=unset, seed_gains=3))
     from_unset = read_column(gt4.ms, "DATA")
@@ -739,28 +742,22 @@ def test_unset_diagonal_is_full_jones_on_four_correlations(gt4):
 
     np.testing.assert_array_equal(from_unset, from_explicit)
 
-    # And it is genuinely the full-Jones path, not the scalar one: a scalar gain
-    # leaves the (zero) cross-hands zero, a full Jones mixes flux into them.
+    # A dense Jones would put flux into the cross-hands of a Stokes-I sky; a
+    # diagonal one leaves them zero.
     skysim.runit(skysim_opts(gt4.ms, ascii_sky=gt4.sky, column="DATA"))
     clean = read_column(gt4.ms, "DATA")
     assert np.allclose(clean[..., 1], 0.0) and np.allclose(clean[..., 2], 0.0)
-    assert not np.allclose(from_unset[..., 1], 0.0)
+    assert np.allclose(from_unset[..., 1], 0.0) and np.allclose(from_unset[..., 2], 0.0)
+
+    # ...and the two parallel hands must differ, or it is really a scalar term.
+    assert not np.allclose(from_unset[..., 0], from_unset[..., 3])
 
 
-def test_unset_diagonal_is_scalar_on_two_correlations(gt2):
-    """An omitted 'diagonal' falls back to a scalar gain when the MS has 2 corrs.
-
-    This is a no-regression guard, not a test of the tri-state change: 2-corr
-    behaviour is deliberately what it always was, so it passes against the old
-    ``diagonal: bool = True`` default too. It has teeth only because it pins the
-    result to the analytic scalar gain -- a resolution that produced anything
-    other than the scalar term would fail here (or raise).
-    """
-    unset = gt2.write_yaml(_UNSET_DIAGONAL_YAML)
-    explicit = gt2.write_yaml(_explicit_diagonal_yaml("true"))
-
-    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA"))
-    clean = read_column(gt2.ms, "DATA")
+def test_unset_type_is_diagonal_on_two_correlations(gt2):
+    """The default does not depend on the correlation count: 2 corrs get
+    diag(g_x, g_y) too, one feed per parallel hand."""
+    unset = gt2.write_yaml(_UNSET_TYPE_YAML)
+    explicit = gt2.write_yaml(_UNSET_TYPE_YAML.replace("      complex:", "      type: diagonal\n      complex:"))
 
     skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=unset, seed_gains=3))
     from_unset = read_column(gt2.ms, "DATA")
@@ -769,10 +766,17 @@ def test_unset_diagonal_is_scalar_on_two_correlations(gt2):
     from_explicit = read_column(gt2.ms, "DATA")
 
     np.testing.assert_array_equal(from_unset, from_explicit)
+    assert not np.allclose(from_unset[..., 0], from_unset[..., 1])
 
-    time, ant1, ant2 = read_aux(gt2.ms)
-    expected = expected_diagonal_factor(time, ant1, ant2, 120.0, 0.1, 3, label="J").astype(from_unset.dtype)
-    np.testing.assert_allclose(from_unset[:, 0, 0] / clean[:, 0, 0], expected, rtol=1e-6, atol=1e-7)
+
+def test_unset_type_falls_back_to_scalar_on_one_correlation():
+    """A single-correlation MS has no second feed, so the default degrades."""
+    from simms.skymodel.corruptions import resolve_type
+
+    term = TermSpec(label="J", axes=["time"], period=120.0, amplitude=0.1)
+    assert resolve_type(term, ncorr=1) == "scalar"
+    assert resolve_type(term, ncorr=2) == "diagonal"
+    assert resolve_type(term, ncorr=4) == "diagonal"
 
 
 def test_noise_is_added_after_the_gain_chain(gt2):
@@ -1052,7 +1056,7 @@ def test_diagonal_type_mixes_feeds_in_the_cross_hands():
 
 
 def test_scalar_type_matches_deprecated_diagonal_true(gt2):
-    scalar = gt2.write_yaml(_UNSET_DIAGONAL_YAML.replace("      complex:", "      type: scalar\n      complex:"))
+    scalar = gt2.write_yaml(_UNSET_TYPE_YAML.replace("      complex:", "      type: scalar\n      complex:"))
     deprecated = gt2.write_yaml(_explicit_diagonal_yaml("true"))
 
     skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=scalar, seed_gains=3))
@@ -1065,7 +1069,7 @@ def test_scalar_type_matches_deprecated_diagonal_true(gt2):
 
 
 def test_full_type_matches_deprecated_diagonal_false(gt4):
-    full = gt4.write_yaml(_UNSET_DIAGONAL_YAML.replace("      complex:", "      type: full\n      complex:"))
+    full = gt4.write_yaml(_UNSET_TYPE_YAML.replace("      complex:", "      type: full\n      complex:"))
     deprecated = gt4.write_yaml(_explicit_diagonal_yaml("false"))
 
     skysim.runit(skysim_opts(gt4.ms, ascii_sky=gt4.sky, column="DATA", corruptions=full, seed_gains=3))
@@ -1079,14 +1083,14 @@ def test_full_type_matches_deprecated_diagonal_false(gt4):
 
 def test_type_and_deprecated_diagonal_together_is_an_error(gt2):
     yaml_path = gt2.write_yaml(
-        _UNSET_DIAGONAL_YAML.replace("      complex:", "      type: scalar\n      diagonal: true\n      complex:")
+        _UNSET_TYPE_YAML.replace("      complex:", "      type: scalar\n      diagonal: true\n      complex:")
     )
     with pytest.raises(RuntimeError, match="both 'type' and the deprecated 'diagonal'"):
         skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path, seed_gains=1))
 
 
 def test_unknown_type_is_an_error(gt2):
-    yaml_path = gt2.write_yaml(_UNSET_DIAGONAL_YAML.replace("      complex:", "      type: leakage\n      complex:"))
+    yaml_path = gt2.write_yaml(_UNSET_TYPE_YAML.replace("      complex:", "      type: leakage\n      complex:"))
     with pytest.raises(RuntimeError, match="unknown type 'leakage'"):
         skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path, seed_gains=1))
 
