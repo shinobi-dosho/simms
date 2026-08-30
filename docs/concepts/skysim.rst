@@ -186,6 +186,11 @@ The random per-antenna phases (and matrices, for full terms) draw from
 never touch the thermal-noise stream, which is seeded separately by
 ``--seed-noise``.
 
+A spec that would corrupt nothing is rejected rather than run: an empty file,
+one with no top-level ``gains`` block, an empty ``terms`` list, or every listed
+term at ``amplitude: 0``.  A single zero-amplitude term beside a real one is
+the identity and stays valid.
+
 Phases are referenced to the earliest time and lowest frequency in the *MS*,
 and gains are sized from the ``ANTENNA`` table, not from the rows a given run
 happens to select.  Separate ``--field-id`` or ``--spw-id`` runs over one MS

@@ -24,6 +24,14 @@
   peak memory no longer scales with the size of the array: a 64-antenna,
   1024-channel MS needed ~9.8 GiB per block (~39 GiB for full Jones) at the
   default `--row-chunks`, which made `--corruptions` unusable on a real MS.
+- `skysim`: a `--corruptions` spec that would corrupt nothing is now an error
+  rather than a silent no-op: an empty file, one with no top-level `gains` block
+  (a misspelled key used to load as an empty spec), an empty `gains.terms` list,
+  or a spec where every listed term has `amplitude: 0`. A single zero-amplitude
+  term alongside a real one is still the identity and remains valid. A missing
+  `label` or a misspelled term key now raises the same `RuntimeError` as the
+  rest of the loader, naming the file and the term, instead of a bare
+  `TypeError` from the dataclass.
 - `skysim`: deprecate `--seed` in favour of `--seed-noise` (the same value gives
   the same noise realisation; a deprecation warning is emitted). Corruption
   terms draw from their own `--seed-gains`, so adding corruptions cannot change

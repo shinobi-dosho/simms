@@ -136,35 +136,54 @@ gains:
     np.testing.assert_allclose(corrupted[:, 0, 0] / clean[:, 0, 0], expected, rtol=1e-6, atol=1e-7)
 
 
-def test_zero_amplitude_leaves_visibilities_unchanged(gt2):
-    yaml_path = gt2.write_yaml(
+def test_zero_amplitude_term_contributes_nothing(gt2):
+    """A zero-amplitude term is the identity, so adding one changes nothing.
+
+    Expressed against a real term rather than on its own: a spec where every
+    term is zero corrupts nothing and is now rejected as a mistake.
+    """
+    with_zero = gt2.write_yaml(
+        """
+gains:
+  terms: [Z, G]
+  spec:
+    - label: Z
+      type: scalar
+      complex: true
+      axes: [time]
+      period:
+        time: 300.0
+      amplitude: 0.0
+    - label: G
+      type: scalar
+      complex: true
+      axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.1
+"""
+    )
+    without_zero = gt2.write_yaml(
         """
 gains:
   terms: [G]
   spec:
     - label: G
-      diagonal: true
+      type: scalar
       complex: true
       axes: [time]
       period:
         time: 120.0
-      amplitude: 0.0
+      amplitude: 0.1
 """
     )
-    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA"))
-    clean = read_column(gt2.ms, "DATA")
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=with_zero, seed_gains=3))
+    with_zero_data = read_column(gt2.ms, "DATA")
 
-    skysim.runit(
-        skysim_opts(
-            gt2.ms,
-            ascii_sky=gt2.sky,
-            column="DATA",
-            corruptions=yaml_path,
-            seed_gains=3,
-        )
-    )
-    corrupted = read_column(gt2.ms, "DATA")
-    np.testing.assert_allclose(corrupted, clean, rtol=1e-11, atol=1e-13)
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=without_zero, seed_gains=3))
+    without_zero_data = read_column(gt2.ms, "DATA")
+
+    np.testing.assert_array_equal(with_zero_data, without_zero_data)
 
 
 def test_two_diagonal_terms_are_product(gt2):
@@ -447,47 +466,6 @@ gains:
     )
     second = read_column(gt2.ms, "DATA")
     assert not np.allclose(first, second)
-
-
-def test_corruptions_do_not_change_the_noise_realisation(gt2):
-    """--seed-gains does not perturb the --seed-noise RNG stream.
-
-    The amplitude is 0, so the gain is exactly 1 and this passes under either
-    noise/gain ordering -- it pins the seed independence, not the ordering. The
-    ordering is covered by test_noise_is_added_after_the_gain_chain and
-    test_corruptions_leave_the_noise_component_untouched.
-    """
-    sefd = 500.0
-    yaml_path = gt2.write_yaml(
-        """
-gains:
-  terms: [G]
-  spec:
-    - label: G
-      diagonal: true
-      complex: true
-      axes: [time]
-      period:
-        time: 120.0
-      amplitude: 0.0
-"""
-    )
-    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", sefd=sefd, seed_noise=99))
-    noise_only = read_column(gt2.ms, "DATA")
-
-    skysim.runit(
-        skysim_opts(
-            gt2.ms,
-            ascii_sky=gt2.sky,
-            column="DATA",
-            sefd=sefd,
-            seed_noise=99,
-            seed_gains=5,
-            corruptions=yaml_path,
-        )
-    )
-    noise_with_corruptions = read_column(gt2.ms, "DATA")
-    np.testing.assert_allclose(noise_only, noise_with_corruptions, rtol=1e-11, atol=1e-13)
 
 
 def test_deprecated_seed_alias_matches_seed_noise(gt2):
@@ -1154,3 +1132,118 @@ def test_explicit_references_make_gains_selection_independent():
     # Without them the same rows get different gains -- the bug being guarded.
     without_refs = run(rows, chans)
     assert not np.allclose(without_refs, whole[np.ix_(rows, chans)])
+
+
+_REAL_TERM = """
+    - label: G
+      type: scalar
+      complex: true
+      axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.1
+"""
+
+
+def test_spec_with_no_terms_is_an_error(gt2):
+    """A spec listing no terms corrupts nothing; say so rather than run silently."""
+    yaml_path = gt2.write_yaml(f"gains:\n  terms: []\n  spec:{_REAL_TERM}")
+    with pytest.raises(RuntimeError, match="lists no terms"):
+        skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path))
+
+
+def test_spec_without_a_gains_block_is_an_error(gt2):
+    """A misspelled top-level key used to load as an empty spec and do nothing."""
+    yaml_path = gt2.write_yaml(f"corruptions:\n  terms: [G]\n  spec:{_REAL_TERM}")
+    with pytest.raises(RuntimeError, match="no top-level 'gains' block"):
+        skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path))
+
+
+def test_empty_spec_file_is_an_error(gt2):
+    yaml_path = gt2.write_yaml("")
+    with pytest.raises(RuntimeError, match="empty or is not a YAML mapping"):
+        skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path))
+
+
+def test_all_zero_amplitudes_is_an_error(gt2):
+    """One zero term is the identity; a spec of nothing but zeros is a mistake."""
+    yaml_path = gt2.write_yaml(
+        """
+gains:
+  terms: [G, H]
+  spec:
+    - label: G
+      type: scalar
+      axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.0
+    - label: H
+      type: scalar
+      axes: [time]
+      period:
+        time: 300.0
+      amplitude: 0.0
+"""
+    )
+    with pytest.raises(RuntimeError, match="amplitude 0"):
+        skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path))
+
+
+def test_zero_amplitude_is_allowed_beside_a_real_term(gt2):
+    """The all-zero check must not reject a legitimate identity term."""
+    yaml_path = gt2.write_yaml(
+        """
+gains:
+  terms: [Z, G]
+  spec:
+    - label: Z
+      type: scalar
+      axes: [time]
+      period:
+        time: 300.0
+      amplitude: 0.0
+    - label: G
+      type: scalar
+      axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.1
+"""
+    )
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path, seed_gains=1))
+    assert np.all(np.isfinite(read_column(gt2.ms, "DATA")))
+
+
+def test_misspelled_term_key_names_the_term(gt2):
+    """The dataclass raises TypeError; the loader must name the file and term."""
+    yaml_path = gt2.write_yaml(
+        """
+gains:
+  terms: [G]
+  spec:
+    - label: G
+      amplitide: 0.1
+      axes: [time]
+      period:
+        time: 120.0
+"""
+    )
+    with pytest.raises(RuntimeError, match=r"term 'G'.*amplitide"):
+        skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path))
+
+
+def test_term_without_a_label_is_reported_by_position(gt2):
+    yaml_path = gt2.write_yaml(
+        """
+gains:
+  terms: [G]
+  spec:
+    - axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.1
+"""
+    )
+    with pytest.raises(RuntimeError, match=r"term 'entry 0'.*label"):
+        skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path))

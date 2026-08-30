@@ -111,18 +111,44 @@ def _normalise_period(
 
 
 def load_corruption_spec(path: str) -> CorruptionSpec:
-    """Load a corruption specification from a YAML file."""
+    """Load a corruption specification from a YAML file.
+
+    Everything hangs off a top-level ``gains`` block. A file without one used to
+    load as an empty spec, so a misspelled key -- or the wrong file entirely --
+    ran to completion having corrupted nothing.
+    """
     with open(path) as fh:
         data = yaml.safe_load(fh)
 
-    gains = data.get("gains", {}) if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Corruption spec '{path}' is empty or is not a YAML mapping")
+
+    gains = data.get("gains")
+    if gains is None:
+        raise RuntimeError(
+            f"Corruption spec '{path}' has no top-level 'gains' block; found {sorted(data) or 'nothing'}"
+        )
+    if not isinstance(gains, dict):
+        raise RuntimeError(f"Corruption spec '{path}': 'gains' must be a mapping, got {type(gains).__name__}")
+
     raw_terms = gains.get("terms", [])
     if isinstance(raw_terms, str):
         terms = [t.strip() for t in raw_terms.replace(",", " ").split() if t.strip()]
     else:
         terms = [str(t).strip() for t in raw_terms]
 
-    specs = [TermSpec(**item) for item in gains.get("spec", [])]
+    specs = []
+    for index, item in enumerate(gains.get("spec", [])):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"Corruption spec '{path}': entry {index} of 'gains.spec' is not a mapping")
+        try:
+            specs.append(TermSpec(**item))
+        except TypeError as exc:
+            # The dataclass raises TypeError for a missing 'label' or an unknown
+            # key; re-raise as the error type the rest of the loader uses, and
+            # say which entry it was.
+            described = item.get("label", f"entry {index}")
+            raise RuntimeError(f"Corruption spec '{path}', term '{described}': {exc}") from exc
     return CorruptionSpec(terms=terms, spec=specs)
 
 
@@ -166,6 +192,9 @@ def validate_spec(spec: CorruptionSpec, ncorr: int) -> None:
     if len(labels) != len(set(labels)):
         raise RuntimeError(f"Corruption spec contains duplicate labels: {labels}")
 
+    if not spec.terms:
+        raise RuntimeError("Corruption spec lists no terms in 'gains.terms', so it would corrupt nothing")
+
     label_set = set(labels)
     seen_terms = set()
     for term in spec.terms:
@@ -195,6 +224,16 @@ def validate_spec(spec: CorruptionSpec, ncorr: int) -> None:
 
         if s.amplitude < 0:
             raise RuntimeError(f"Corruption term '{s.label}' amplitude must be non-negative")
+
+    # A single zero-amplitude term is legitimate (it is the identity, useful
+    # alongside others); a spec where *every* term is zero corrupts nothing and
+    # is a mistake worth reporting rather than a run that quietly does nothing.
+    label_to_spec = {s_.label: s_ for s_ in spec.spec}
+    if all(label_to_spec[term].amplitude == 0 for term in spec.terms):
+        raise RuntimeError(
+            "Every corruption term has amplitude 0, so the spec would leave the visibilities "
+            "unchanged; give at least one term a non-zero amplitude"
+        )
 
     # Resolve before testing: a falsy non-bool from YAML (`diagonal: 0` parses as
     # int) would slip past an identity check and only fail inside the block
