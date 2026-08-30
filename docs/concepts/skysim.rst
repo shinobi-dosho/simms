@@ -108,8 +108,9 @@ Thermal noise
 
     $ simms skysim --ascii-sky skymodel.txt --column SIMULATED_DATA --sefd 421 visdata.ms
 
-Provide either ``--sefd`` (System Equivalent Flux Density, in Jy) or
-``--tsys-over-eta`` (:math:`T_\mathrm{sys}/\eta`).
+``--sefd`` is the System Equivalent Flux Density, in Jy.  (``telsim`` also
+accepts ``--tsys-over-eta``, :math:`T_\mathrm{sys}/\eta`, and derives an SEFD
+from it when building the MS; ``skysim`` takes the SEFD directly.)
 
 Use ``--seed-noise`` to make the noise realisation reproducible at a given
 chunking. (``--seed`` is the deprecated pre-3.1 name for the same option.)
