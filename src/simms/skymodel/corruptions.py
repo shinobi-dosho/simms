@@ -363,8 +363,11 @@ def _antenna_jones(
         if params["type"] == "scalar":
             jones *= (1.0 + amp * oscillation[..., 0])[:, :, None, None]
         elif params["type"] == "diagonal":
-            # diag(g_x, g_y): scale row i of the accumulated Jones by feed i.
-            jones = jones * (1.0 + amp * oscillation)[:, :, :, None]
+            # Right-multiply, matching the full branch's einsum below, so terms
+            # compose left-to-right in the order listed. Scaling *columns* is
+            # `jones @ diag(g)`; scaling rows would be `diag(g) @ jones`, which
+            # silently reverses a diagonal term that follows a full one.
+            jones = jones * (1.0 + amp * oscillation)[:, :, None, :]
         else:
             matrix = params["matrix"][ant][:, None, :, :]  # (nrow, 1, 2, 2)
             term_jones = np.eye(2) + amp * oscillation[..., 0][:, :, None, None] * matrix

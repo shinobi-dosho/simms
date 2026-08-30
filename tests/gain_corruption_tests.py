@@ -1247,3 +1247,142 @@ gains:
     )
     with pytest.raises(RuntimeError, match=r"term 'entry 0'.*label"):
         skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path))
+
+
+def reference_jones(params, time, freqs, ant, t0, freq0):
+    """Independent per-term 2x2 Jones for one antenna column: (nrow, nchan, 2, 2).
+
+    Assembles the matrix forms directly from the term parameters -- it does not
+    call the module's Jones builder, so the matrix shapes, the feed-to-row/column
+    placement and the composition order are checked rather than restated.
+    """
+    nrow, nchan = time.size, freqs.size
+    osc = np.ones((nrow, nchan, params["nfeed"]), dtype=np.complex128)
+    for axis in params["axes"]:
+        period = params["period"][axis]
+        phases = params["phases"][axis][ant][:, None, :]  # (nrow, 1, nfeed)
+        x, x0 = (time[:, None, None], t0) if axis == "time" else (freqs[None, :, None], freq0)
+        phase = 2.0 * np.pi * ((x - x0) / period + phases)
+        # exp(i phi) rather than cos + i sin: the reference should not restate
+        # the implementation's spelling of the same thing.
+        osc = osc * (np.exp(1j * phase) if params["complex"] else np.cos(phase))
+    amp = params["amplitude"]
+
+    out = np.zeros((nrow, nchan, 2, 2), dtype=np.complex128)
+    if params["type"] == "scalar":
+        g = 1.0 + amp * osc[..., 0]
+        out[..., 0, 0] = g
+        out[..., 1, 1] = g
+    elif params["type"] == "diagonal":
+        out[..., 0, 0] = 1.0 + amp * osc[..., 0]
+        out[..., 1, 1] = 1.0 + amp * osc[..., 1]
+    else:
+        m = params["matrix"][ant][:, None, :, :]
+        out = np.eye(2) + amp * osc[..., 0][:, :, None, None] * m
+    return out
+
+
+def reference_corrupted(spec, vis, time, freqs, ant1, ant2, nant, seed):
+    """V' = J_p V J_q^H with the terms composed left-to-right, by explicit matmul."""
+    from simms.skymodel.corruptions import _build_all_term_params
+
+    params = _build_all_term_params(spec, nant, seed, vis.shape[-1])
+    t0, freq0 = float(time.min()), float(freqs.min())
+
+    def chain(ant):
+        j = np.broadcast_to(np.eye(2), (time.size, freqs.size, 2, 2)).astype(np.complex128)
+        for pr in params:
+            j = j @ reference_jones(pr, time, freqs, ant, t0, freq0)
+        return j
+
+    jp, jq = chain(ant1), chain(ant2)
+    vmat = vis.reshape(vis.shape[0], vis.shape[1], 2, 2)
+    out = jp @ vmat @ np.conj(np.swapaxes(jq, -2, -1))
+    return out.reshape(vis.shape)
+
+
+def _mixed_case(nrow=12, nchan=3, nant=5):
+    rng = np.random.default_rng(3)
+    ant1 = rng.integers(0, nant, nrow)
+    ant2 = (ant1 + 1 + rng.integers(0, nant - 1, nrow)) % nant
+    time = np.arange(nrow, dtype=float) * 45.0
+    freqs = np.linspace(1.420e9, 1.428e9, nchan)
+    vis = (rng.standard_normal((nrow, nchan, 4)) + 1j * rng.standard_normal((nrow, nchan, 4))).astype(np.complex128)
+    return vis, time, freqs, ant1, ant2, nant
+
+
+def _run_spec(spec, vis, time, freqs, ant1, ant2, nant, seed=7):
+    return apply_corruptions(
+        da.from_array(vis, chunks=-1),
+        da.from_array(time, chunks=-1),
+        da.from_array(ant1, chunks=-1),
+        da.from_array(ant2, chunks=-1),
+        freqs,
+        spec,
+        random_seed=seed,
+        nant=nant,
+    ).compute()
+
+
+@pytest.mark.parametrize("order", [["F", "D"], ["D", "F"], ["F", "S"], ["S", "F"], ["F", "G"]])
+def test_full_jones_matches_explicit_matmul_reference(order):
+    """The full-Jones path against an independent J_p V J_q^H.
+
+    Every ordering of a full term with a scalar/diagonal one: the terms must
+    compose left-to-right, so a diagonal term after a full one is a *right*
+    multiplication. Only checking finiteness let an antenna swap, a missing
+    conjugate or a reversed product through.
+    """
+    vis, time, freqs, ant1, ant2, nant = _mixed_case()
+    catalogue = {
+        "F": TermSpec(label="F", type="full", axes=["time"], period=150.0, amplitude=0.2),
+        "D": TermSpec(label="D", type="diagonal", axes=["time"], period=120.0, amplitude=0.3),
+        "S": TermSpec(label="S", type="scalar", axes=["time"], period=90.0, amplitude=0.15),
+        "G": TermSpec(label="G", type="full", axes=["frequency"], period=6e6, amplitude=0.25),
+    }
+    spec = CorruptionSpec(terms=list(order), spec=[catalogue[k] for k in order])
+
+    got = _run_spec(spec, vis, time, freqs, ant1, ant2, nant)
+    want = reference_corrupted(spec, vis, time, freqs, ant1, ant2, nant, 7)
+    np.testing.assert_allclose(got, want, rtol=1e-11, atol=1e-13)
+
+
+def test_full_and_diagonal_do_not_commute_in_the_spec():
+    """Guards the reference itself: if [F, D] and [D, F] agreed, the ordering
+    test above would prove nothing."""
+    vis, time, freqs, ant1, ant2, nant = _mixed_case()
+    F = TermSpec(label="F", type="full", axes=["time"], period=150.0, amplitude=0.2)
+    D = TermSpec(label="D", type="diagonal", axes=["time"], period=120.0, amplitude=0.3)
+    fd = _run_spec(CorruptionSpec(terms=["F", "D"], spec=[F, D]), vis, time, freqs, ant1, ant2, nant)
+    df = _run_spec(CorruptionSpec(terms=["D", "F"], spec=[D, F]), vis, time, freqs, ant1, ant2, nant)
+    assert not np.allclose(fd, df)
+
+
+def test_time_term_is_invariant_under_row_chunking():
+    """Regression twin of the frequency test: the time origin is the whole
+    selection's, so row-chunk boundaries must not restart the sinusoid."""
+    nrow, nchan, ncorr, nant = 24, 2, 2, 4
+    rng = np.random.default_rng(1)
+    ant1 = rng.integers(0, nant, nrow)
+    ant2 = (ant1 + 1) % nant
+    time = np.arange(nrow, dtype=float) * 30.0
+    freqs = np.linspace(1.420e9, 1.424e9, nchan)
+    spec = CorruptionSpec(
+        terms=["G"],
+        spec=[TermSpec(label="G", type="scalar", axes=["time"], period=180.0, amplitude=0.2)],
+    )
+
+    def run(row_chunk):
+        vis = da.from_array(np.ones((nrow, nchan, ncorr), np.complex128), chunks=(row_chunk, nchan, ncorr))
+        return apply_corruptions(
+            vis,
+            da.from_array(time, chunks=row_chunk),
+            da.from_array(ant1, chunks=row_chunk),
+            da.from_array(ant2, chunks=row_chunk),
+            freqs,
+            spec,
+            random_seed=1,
+            nant=nant,
+        ).compute()
+
+    np.testing.assert_allclose(run(nrow), run(7), rtol=1e-13, atol=1e-14)
