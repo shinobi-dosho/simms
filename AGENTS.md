@@ -84,7 +84,9 @@ error, not a downgrade. The boolean
 type).
 Periods are in seconds/Hz or `astropy`-compatible strings (e.g. `"2min"`, `"2MHz"`). The
 per-baseline corruption is `V' = J_p V J_q^H`, with terms multiplied left-to-right in the order
-given. Phase origins come from the whole MS (earliest time, lowest frequency) and the gain array
+given. `diagonal`/`full` terms map correlation index to feed index positionally, so they
+require a standard linear/circular `POLARIZATION.CORR_TYPE` (validated via `_corr_basis`,
+shared with the beam path); `scalar` terms do not. Phase origins come from the whole MS (earliest time, lowest frequency) and the gain array
 from the `ANTENNA` table, not from the field/SPW a run selects, so per-field runs agree.
 Corruptions are applied to the
 model *before* thermal noise is added (`V' = J_p V J_q^H + n`), so the noise is never

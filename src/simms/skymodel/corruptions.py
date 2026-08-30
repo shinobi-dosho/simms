@@ -248,6 +248,21 @@ def validate_spec(spec: CorruptionSpec, ncorr: int) -> None:
             )
 
 
+def needs_feed_basis(spec: CorruptionSpec, ncorr: int) -> bool:
+    """True if any listed term tells the two feeds apart.
+
+    ``scalar`` terms are ``g * I``: the same gain reaches every correlation, so
+    they do not care how ``POLARIZATION.CORR_TYPE`` orders them. ``diagonal``
+    and ``full`` terms map correlation index to feed index positionally, so they
+    only make sense on a standard linear (XX..YY) or circular (RR..LL) ordering.
+
+    Only terms listed in ``gains.terms`` count -- an unused spec entry is never
+    applied and so cannot impose a basis requirement.
+    """
+    label_to_spec = {s.label: s for s in spec.spec}
+    return any(resolve_type(label_to_spec[term], ncorr) != "scalar" for term in spec.terms if term in label_to_spec)
+
+
 def _build_term_params(spec: TermSpec, nant: int, random_seed: int | None, ncorr: int) -> dict:
     """Build deterministic numpy parameters for a single term."""
     term_type = resolve_type(spec, ncorr)

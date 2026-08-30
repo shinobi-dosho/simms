@@ -24,6 +24,11 @@
   peak memory no longer scales with the size of the array: a 64-antenna,
   1024-channel MS needed ~9.8 GiB per block (~39 GiB for full Jones) at the
   default `--row-chunks`, which made `--corruptions` unusable on a real MS.
+- `skysim`: `diagonal` and `full` corruption terms now check
+  `POLARIZATION.CORR_TYPE` and require a standard linear (`XX..YY`) or circular
+  (`RR..LL`) ordering, as the primary-beam path already did; they map
+  correlation index onto feed index by position, so a non-standard ordering
+  silently assigned the wrong feed. `scalar` terms are unaffected.
 - `skysim`: a `--corruptions` spec that would corrupt nothing is now an error
   rather than a silent no-op: an empty file, one with no top-level `gains` block
   (a misspelled key used to load as an empty spec), an empty `gains.terms` list,

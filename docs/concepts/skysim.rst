@@ -186,6 +186,12 @@ The random per-antenna phases (and matrices, for full terms) draw from
 never touch the thermal-noise stream, which is seeded separately by
 ``--seed-noise``.
 
+``diagonal`` and ``full`` terms map correlation index onto feed index by
+position, so they need the MS's ``POLARIZATION.CORR_TYPE`` in a standard linear
+(``XX..YY``) or circular (``RR..LL``) order, and ``skysim`` refuses anything
+else rather than assign the wrong feed.  ``scalar`` terms reach every
+correlation alike and impose no such requirement.
+
 A spec that would corrupt nothing is rejected rather than run: an empty file,
 one with no top-level ``gains`` block, an empty ``terms`` list, or every listed
 term at ``amplitude: 0``.  A single zero-amplitude term beside a real one is

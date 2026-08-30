@@ -18,7 +18,7 @@ from tqdm.dask import TqdmCallback
 from simms import BIN, SCHEMADIR, set_logger
 from simms.skymodel.ascii_skies import ASCIISkymodel
 from simms.skymodel.beams import load_beam_config, resolve_antenna_beams
-from simms.skymodel.corruptions import apply_corruptions, load_corruption_spec, validate_spec
+from simms.skymodel.corruptions import apply_corruptions, load_corruption_spec, needs_feed_basis, validate_spec
 from simms.skymodel.fits_skies import component_sky_from_fits_dft, predict_fits_channel_block, prepare_fits_sky
 from simms.skymodel.mstools import (
     attach_beam,
@@ -51,15 +51,19 @@ def _array_lonlat(positions):
     return loc.lon.to_value(u.rad), loc.lat.to_value(u.rad)
 
 
-def _corr_basis(codes):
-    """'linear' or 'circular' from POLARIZATION.CORR_TYPE codes; raise on anything else."""
+def _corr_basis(codes, what="Primary beam"):
+    """'linear' or 'circular' from POLARIZATION.CORR_TYPE codes; raise on anything else.
+
+    ``what`` names the caller in the error, since more than one path depends on
+    the correlations being in a standard order.
+    """
     codes = list(codes)
     if codes in ([9, 12], [9, 10, 11, 12]):  # XX(9) XY(10) YX(11) YY(12)
         return "linear"
     if codes in ([5, 8], [5, 6, 7, 8]):  # RR(5) RL(6) LR(7) LL(8)
         return "circular"
     raise RuntimeError(
-        f"Primary beam needs standard linear (XX..YY) or circular (RR..LL) correlations; got CORR_TYPE codes {codes}."
+        f"{what} needs standard linear (XX..YY) or circular (RR..LL) correlations; got CORR_TYPE codes {codes}."
     )
 
 
@@ -539,8 +543,15 @@ def runit(opts):
         # spec must fail here rather than let a noise-only run write a clean
         # column that looks like it was corrupted.
         spec = load_corruption_spec(opts.corruptions)
+        validate_spec(spec, ncorr=ncorr)
+        if needs_feed_basis(spec, ncorr):
+            # diagonal/full terms map correlation index to feed index by
+            # position, so they need the correlations in a standard order. A
+            # scalar gain reaches every correlation alike and does not.
+            corr_type = xds_from_table(f"{ms}::POLARIZATION")[0].CORR_TYPE.data[0].compute()
+            _corr_basis(list(np.asarray(corr_type).ravel()), what="Non-scalar RIME corruptions")
+
         if simvis is None:
-            validate_spec(spec, ncorr=ncorr)
             if vis_noise:
                 log.warning(
                     "--corruptions has no effect on a noise-only run: gains apply to the sky signal, "

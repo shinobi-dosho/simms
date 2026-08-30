@@ -24,10 +24,12 @@ from . import InitTest, skysim_opts
 
 
 class _GainTest(InitTest):
-    def __init__(self, ncorr=2):
+    def __init__(self, ncorr=2, correlations=None):
         self.test_files = []
         self.ncorr = ncorr
-        correlations = ["XX", "YY"] if ncorr == 2 else ["XX", "XY", "YX", "YY"]
+        if correlations is None:
+            correlations = ["XX", "YY"] if ncorr == 2 else ["XX", "XY", "YX", "YY"]
+        ncorr = self.ncorr = len(correlations)
         self.ms = self.random_named_directory(suffix=".ms")
         create_ms(
             self.ms,
@@ -1386,3 +1388,61 @@ def test_time_term_is_invariant_under_row_chunking():
         ).compute()
 
     np.testing.assert_allclose(run(nrow), run(7), rtol=1e-13, atol=1e-14)
+
+
+_SCALAR_TERM_YAML = """
+gains:
+  terms: [G]
+  spec:
+    - label: G
+      type: scalar
+      axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.1
+"""
+
+
+def test_feed_terms_reject_a_nonstandard_correlation_order():
+    """diagonal/full terms map correlation index to feed index by position, so a
+    non-standard CORR_TYPE would silently assign the wrong feed. The beam path
+    already refused this; the corruption path used to assume it."""
+    gt = _GainTest(correlations=["XX", "XY"])  # codes [9, 10] -- not XX/YY
+    yaml_path = gt.write_yaml(_DIAGONAL_TYPE_YAML)
+    with pytest.raises(RuntimeError, match="Non-scalar RIME corruptions needs standard"):
+        skysim.runit(skysim_opts(gt.ms, ascii_sky=gt.sky, column="DATA", corruptions=yaml_path, seed_gains=1))
+
+
+def test_scalar_terms_do_not_care_about_the_correlation_order():
+    """g * I reaches every correlation alike, so it imposes no basis requirement."""
+    gt = _GainTest(correlations=["XX", "XY"])
+    yaml_path = gt.write_yaml(_SCALAR_TERM_YAML)
+    skysim.runit(skysim_opts(gt.ms, ascii_sky=gt.sky, column="DATA", corruptions=yaml_path, seed_gains=1))
+    assert np.all(np.isfinite(read_column(gt.ms, "DATA")))
+
+
+def test_circular_correlations_are_accepted_for_feed_terms():
+    """RR/LL is a standard ordering; the two feeds are R and L."""
+    gt = _GainTest(correlations=["RR", "LL"])
+    yaml_path = gt.write_yaml(_DIAGONAL_TYPE_YAML)
+    skysim.runit(
+        skysim_opts(gt.ms, ascii_sky=gt.sky, column="DATA", corruptions=yaml_path, seed_gains=1, pol_basis="circular")
+    )
+    data = read_column(gt.ms, "DATA")
+    assert np.all(np.isfinite(data))
+    assert not np.allclose(data[:, 0, 0], data[:, 0, 1]), "the two feeds should differ"
+
+
+def test_unused_spec_entry_does_not_impose_a_basis_requirement():
+    """needs_feed_basis looks only at listed terms, matching the all-zero check."""
+    from simms.skymodel.corruptions import needs_feed_basis
+
+    spec = CorruptionSpec(
+        terms=["G"],
+        spec=[
+            TermSpec(label="G", type="scalar", axes=["time"], period=120.0, amplitude=0.1),
+            TermSpec(label="D", type="diagonal", axes=["time"], period=120.0, amplitude=0.1),
+        ],
+    )
+    assert not needs_feed_basis(spec, ncorr=2)
+    assert needs_feed_basis(CorruptionSpec(terms=["G", "D"], spec=spec.spec), ncorr=2)
