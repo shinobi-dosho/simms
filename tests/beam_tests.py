@@ -634,6 +634,36 @@ def test_fits_provider_from_cattery_reim_placeholder_no_double_suffix(tmp_path):
         FitsBeamProvider.from_cattery(pattern, pol_basis="linear")
 
 
+def test_from_cattery_honours_cunit(tmp_path):
+    # Same silent-scaling trap on the eight-file read path: rewrite the WCS of a set simms
+    # itself wrote into radians/MHz and the loaded grids must be unchanged.
+    from astropy.io import fits
+
+    beam = CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020")
+    grid = np.linspace(-0.05, 0.05, 21)
+    freqs = np.array([1.3e9, 1.4e9])
+
+    ref_prefix = str(tmp_path / "deg")
+    write_beam_fits_cattery(beam, grid, grid, freqs, ref_prefix, pol_basis="linear")
+    ref = FitsBeamProvider.from_cattery(ref_prefix, pol_basis="linear")
+
+    rad_prefix = str(tmp_path / "rad")
+    paths = write_beam_fits_cattery(beam, grid, grid, freqs, rad_prefix, pol_basis="linear")
+    for path in paths:
+        with fits.open(path, mode="update") as hdul:
+            hdr = hdul[0].header
+            for axis in (1, 2):
+                hdr[f"CRVAL{axis}"] = np.radians(hdr[f"CRVAL{axis}"])
+                hdr[f"CDELT{axis}"] = np.radians(hdr[f"CDELT{axis}"])
+                hdr[f"CUNIT{axis}"] = "rad"
+            hdr["CRVAL3"], hdr["CDELT3"], hdr["CUNIT3"] = hdr["CRVAL3"] / 1e6, hdr["CDELT3"] / 1e6, "MHz"
+    rad = FitsBeamProvider.from_cattery(rad_prefix, pol_basis="linear")
+
+    np.testing.assert_allclose(rad.l_grid, ref.l_grid, atol=1e-12)
+    np.testing.assert_allclose(rad.m_grid, ref.m_grid, atol=1e-12)
+    np.testing.assert_allclose(rad.freqs_hz, ref.freqs_hz, rtol=1e-12)
+
+
 def test_fits_provider_from_cattery_missing_file(tmp_path):
     pattern = str(tmp_path / "nowhere_$(corr)_$(reim).fits")
     with pytest.raises(FileNotFoundError, match="resolved from pattern"):
@@ -801,6 +831,105 @@ def test_fits_provider_handles_descending_grid():
     emm = np.array([0.01, -0.02, 0.0])
     chi = np.array([0.0, 0.2])
     np.testing.assert_allclose(desc.voltage(ell, emm, freqs, chi), asc.voltage(ell, emm, freqs, chi), atol=1e-12)
+
+
+def _write_beam_cube(path, beam, l_grid, m_grid, freqs, **hdr_over):
+    """A 4-plane beam cube whose WCS is in degrees/Hz unless `hdr_over` says otherwise."""
+    from astropy.io import fits
+
+    cube = _jimbeam_cube(beam, l_grid, m_grid, freqs)  # (nl, nm, nfreq, 2)
+    hh = cube[..., 0].transpose(2, 1, 0)
+    vv = cube[..., 1].transpose(2, 1, 0)
+    data = np.stack([hh.real, hh.imag, vv.real, vv.imag], axis=0)
+
+    hdr = fits.Header()
+    hdr["CRPIX1"], hdr["CRVAL1"], hdr["CDELT1"] = 1, np.degrees(l_grid[0]), np.degrees(l_grid[1] - l_grid[0])
+    hdr["CUNIT1"] = "deg"
+    hdr["CRPIX2"], hdr["CRVAL2"], hdr["CDELT2"] = 1, np.degrees(m_grid[0]), np.degrees(m_grid[1] - m_grid[0])
+    hdr["CUNIT2"] = "deg"
+    hdr["CRPIX3"], hdr["CRVAL3"], hdr["CDELT3"] = 1, freqs[0], freqs[1] - freqs[0]
+    hdr["CUNIT3"] = "Hz"
+    hdr["CRPIX4"], hdr["CRVAL4"], hdr["CDELT4"] = 1, 0, 1
+    hdr.update(hdr_over)
+    fits.PrimaryHDU(data=data, header=hdr).writeto(path)
+    return path
+
+
+def _cunit_case(tmp_path, beam, l_grid, m_grid, freqs, **hdr_over):
+    path = tmp_path / f"beam_{len(list(tmp_path.iterdir()))}.fits"
+    return FitsBeamProvider.from_fits(_write_beam_cube(path, beam, l_grid, m_grid, freqs, **hdr_over))
+
+
+def test_from_fits_honours_cunit_on_the_spatial_axes(tmp_path):
+    # An L/M axis written in radians must not be read as degrees: the beam would come out
+    # 180/pi times too wide with nothing in the output to show for it.
+    beam = CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020")
+    l_grid = m_grid = np.linspace(-0.05, 0.05, 41)
+    freqs = np.array([1.3e9, 1.4e9])
+
+    deg = _cunit_case(tmp_path, beam, l_grid, m_grid, freqs)
+    rad = _cunit_case(
+        tmp_path,
+        beam,
+        l_grid,
+        m_grid,
+        freqs,
+        CRVAL1=l_grid[0],
+        CDELT1=l_grid[1] - l_grid[0],
+        CUNIT1="rad",
+        CRVAL2=m_grid[0],
+        CDELT2=m_grid[1] - m_grid[0],
+        CUNIT2="rad",
+    )
+
+    np.testing.assert_allclose(rad.l_grid, deg.l_grid, atol=1e-12)
+    np.testing.assert_allclose(rad.m_grid, deg.m_grid, atol=1e-12)
+    np.testing.assert_allclose(rad.l_grid, l_grid, atol=1e-12)  # and they are the grid we wrote
+
+
+def test_from_fits_honours_cunit_on_the_frequency_axis(tmp_path):
+    beam = CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020")
+    l_grid = m_grid = np.linspace(-0.05, 0.05, 41)
+    freqs = np.array([1.3e9, 1.4e9])
+
+    hz = _cunit_case(tmp_path, beam, l_grid, m_grid, freqs)
+    mhz = _cunit_case(
+        tmp_path, beam, l_grid, m_grid, freqs, CRVAL3=freqs[0] / 1e6, CDELT3=(freqs[1] - freqs[0]) / 1e6, CUNIT3="MHz"
+    )
+
+    np.testing.assert_allclose(mhz.freqs_hz, hz.freqs_hz, rtol=1e-12)
+    np.testing.assert_allclose(mhz.freqs_hz, freqs, rtol=1e-12)
+
+
+def test_from_fits_absent_cunit_still_means_degrees_and_hz(tmp_path):
+    # The FITS default, and what third-party Cattery sets that omit the keyword rely on.
+    beam = CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020")
+    l_grid = m_grid = np.linspace(-0.05, 0.05, 41)
+    freqs = np.array([1.3e9, 1.4e9])
+
+    with_unit = _cunit_case(tmp_path, beam, l_grid, m_grid, freqs)
+    path = _write_beam_cube(tmp_path / "no_cunit.fits", beam, l_grid, m_grid, freqs)
+    from astropy.io import fits
+
+    with fits.open(path, mode="update") as hdul:
+        for key in ("CUNIT1", "CUNIT2", "CUNIT3"):
+            del hdul[0].header[key]
+    without = FitsBeamProvider.from_fits(path)
+
+    np.testing.assert_allclose(without.l_grid, with_unit.l_grid, atol=1e-12)
+    np.testing.assert_allclose(without.freqs_hz, with_unit.freqs_hz, rtol=1e-12)
+
+
+@pytest.mark.parametrize("over", [{"CUNIT1": "nonsense"}, {"CUNIT1": "Hz"}, {"CUNIT3": "deg"}])
+def test_from_fits_rejects_a_cunit_it_cannot_convert(tmp_path, over):
+    # Unparseable, or the wrong quantity entirely. Falling back to the assumed unit here
+    # is what made the original bug silent.
+    beam = CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020")
+    l_grid = m_grid = np.linspace(-0.05, 0.05, 41)
+    freqs = np.array([1.3e9, 1.4e9])
+    path = _write_beam_cube(tmp_path / "bad_cunit.fits", beam, l_grid, m_grid, freqs, **over)
+    with pytest.raises(ValueError, match="CUNIT"):
+        FitsBeamProvider.from_fits(path)
 
 
 def test_fits_provider_from_fits_negative_cdelt(tmp_path):
