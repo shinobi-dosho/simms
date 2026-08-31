@@ -265,7 +265,85 @@ def test_outputs_declare_both_passthrough_paths():
     # `output` covers to-fits/apply/correct. Dropping either makes that mode
     # unwireable in a shinobi Recipe (or in dosho, which transcribes this
     # model) -- invisible here, a build-time AttributeError downstream.
-    assert set(primary_beam.PrimaryBeamOutputs.model_fields) == {"ms", "output"}
+    # `files` carries every written path, which `output` alone cannot for
+    # cattery to-fits (one prefix, eight files).
+    assert set(primary_beam.PrimaryBeamOutputs.model_fields) == {"ms", "output", "files"}
+
+
+# --- the resolved-output contract -------------------------------------------------
+#
+# Each mode defaults its filename when --output is omitted, so the outputs model has to
+# report the name the run *resolved*. Echoing the raw --output back handed a dependent
+# step None in exactly the case where it could not have guessed the name itself.
+
+
+@pytest.mark.parametrize(
+    "mode,over,expected",
+    [
+        ("to-fits", {}, "beam.fits"),
+        ("apply", {"fits": True}, "apparent.fits"),
+        ("correct", {"fits": True}, "corrected.fits"),
+        ("apply", {"ascii": True}, "apparent.txt"),
+        ("correct", {"ascii": True}, "corrected.txt"),
+    ],
+)
+def test_defaulted_output_name_is_reported(fx, monkeypatch, mode, over, expected):
+    monkeypatch.chdir(fx.random_named_directory())
+    opts = _opts(mode, npix=16, nchan=1)
+    if over.get("fits"):
+        opts.ms, opts.fits_sky = fx.ms, _write_image(fx)[0]
+    elif over.get("ascii"):
+        opts.ms, opts.ascii_sky = fx.ms, _write_ascii_sky(fx)
+
+    res = primary_beam.runit(opts)
+
+    assert res.output == expected  # not None, and not the raw --output
+    assert os.path.exists(res.output)
+    assert res.files == [res.output]
+
+
+def test_explicit_output_is_reported_verbatim(fx):
+    out = fx.random_named_file(suffix=".fits")
+    res = primary_beam.runit(_opts("apply", ms=fx.ms, fits_sky=_write_image(fx)[0], output=out))
+    assert res.output == out
+    assert res.files == [out]
+
+
+def test_cattery_reports_the_prefix_and_all_eight_files(fx, monkeypatch):
+    # Cattery writes eight files from one prefix. `output` is the prefix because that is
+    # what from_cattery and DDFacet's --Beam-FITSFile consume -- any single one of the
+    # eight would not round-trip into a later --beam-pattern -- so assert it does.
+    monkeypatch.chdir(fx.random_named_directory())
+    res = primary_beam.runit(_opts("to-fits", fits_format="cattery", npix=16, nchan=1))
+
+    assert res.output == "beam"
+    assert sorted(res.files) == sorted(_cattery_paths("beam", ["xx", "xy", "yx", "yy"]).values())
+    assert all(os.path.exists(f) for f in res.files)
+    assert FitsBeamProvider.from_cattery(res.output) is not None
+
+
+def test_cattery_reports_the_prefix_stripped_of_a_fits_suffix(fx):
+    # to_fits strips a .fits suffix off the prefix before writing; the reported handle
+    # has to be the stripped one, or it names beam.fits_xx_re.fits.
+    prefix = os.path.join(fx.random_named_directory(), "beam")
+    res = primary_beam.runit(_opts("to-fits", fits_format="cattery", npix=16, nchan=1, output=f"{prefix}.fits"))
+    assert res.output == prefix
+    assert all(os.path.exists(f) for f in res.files)
+
+
+def test_tag_ms_reports_the_ms_and_writes_no_files(fx):
+    res = primary_beam.runit(_opts("tag-ms", ms=fx.ms, label="FOO"))
+    assert res.ms == fx.ms
+    assert res.output is None
+    assert res.files == []
+
+
+def _write_ascii_sky(fx):
+    path = fx.random_named_file(suffix=".txt")
+    with open(path, "w") as fh:
+        fh.write("#format: name ra dec stokes_i\n")
+        fh.write("A 1h0m0s -31d0m0s 5.0\n")
+    return path
 
 
 def _write_image(fx, npix=256, off=90):
