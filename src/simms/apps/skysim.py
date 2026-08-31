@@ -89,6 +89,14 @@ class _BeamContext:
                     f"name that selects a primary beam). Create the MS with telsim, or point "
                     f"--telescope-name-column at the column that holds it."
                 )
+        if "MOUNT" not in ant_ds:
+            # Same rule as the telescope name above: whether the beam rotates with
+            # parallactic angle is read, never guessed. MSv2 requires the column.
+            raise RuntimeError(
+                "The ANTENNA table has no MOUNT column, so whether the primary beam rotates "
+                "with parallactic angle cannot be determined. Add the column (MSv2 requires "
+                "it) with the mount of each antenna, e.g. 'ALT-AZ'."
+            )
         type_keys, mount, pos, t0, t1, interval, corr_type = dask.compute(
             ant_ds[typing_col].data,
             ant_ds.MOUNT.data,
@@ -118,7 +126,9 @@ class _BeamContext:
         from simms.skymodel.beams import read_pointing_centre
 
         self.phase_ra0, self.phase_dec0 = ra0, dec0
-        self.ra0, self.dec0 = read_pointing_centre(ms, ra0, dec0, opts.field_id)
+        # POINTING carries no FIELD_ID, so the selected rows' TIME span is what picks this
+        # field's pointing out of a multi-field MS (row 0 is the first field observed).
+        self.ra0, self.dec0 = read_pointing_centre(ms, ra0, dec0, opts.field_id, time_range=(float(t0), float(t1)))
         self.ncorr = ncorr
         self.t_start = float(t0)
         self.duration = float(t1 - t0) + float(interval)

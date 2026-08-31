@@ -19,8 +19,12 @@ The beam is centred on the **antenna pointing centre**, ``POINTING.DIRECTION``
 and can be shifted freely. Conflating the two silently mis-centres the beam. See
 :doc:`ms-conventions` for the full rule.
 
-``POINTING`` is keyed by ``(ANTENNA_ID, TIME)``, so each antenna has its own
-pointing record and the beam centre is well defined per antenna.
+``POINTING`` is keyed by ``(ANTENNA_ID, TIME)`` and carries no ``FIELD_ID``, so
+``--field-id`` cannot index it directly. simms instead picks a ``POINTING`` row
+recorded while the selected rows were being observed, which is what keeps the
+beam on the right target in a multi-field or mosaic MS -- the first row belongs
+to whichever field the MS observed first. One row serves the whole array: a
+single beam centre is assumed for every antenna and the whole track.
 
 When an MS has no usable ``POINTING.DIRECTION``, the beam centre is taken from
 ``FIELD.REFERENCE_DIR``, then ``FIELD.DELAY_DIR``, and only then from the phase

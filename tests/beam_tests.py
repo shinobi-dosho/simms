@@ -1141,3 +1141,172 @@ def test_read_pointing_centre_warns_when_chain_reaches_phase_centre(caplog):
         centre = read_pointing_centre(ms, 1.0, 1.0)
     assert centre == pytest.approx((1.0, 1.0))
     assert any("phase centre as the beam centre" in r.message for r in caplog.records)
+
+
+# --- POINTING row selection by observed time span ---------------------------------
+
+
+def _write_timed_pointing_ms(base_dir, rows):
+    """A minimal MS whose ``POINTING`` table holds ``(time, ra, dec)`` rows, in order."""
+    from casacore.tables import makearrcoldesc, makescacoldesc, maketabdesc, table
+
+    ms = os.path.join(base_dir, "timed.ms")
+    pnt = os.path.join(ms, "POINTING")
+    mt = table(ms, maketabdesc([makearrcoldesc("DUMMY", 0.0)]), nrow=1, ack=False)
+    desc = maketabdesc([makearrcoldesc("DIRECTION", 0.0, ndim=2), makescacoldesc("TIME", 0.0)])
+    pt = table(pnt, desc, nrow=len(rows), ack=False)
+    for row, (t, ra, dec) in enumerate(rows):
+        pt.putcell("DIRECTION", row, np.array([[ra, dec]], dtype=float))
+        pt.putcell("TIME", row, float(t))
+    pt.putcolkeyword("DIRECTION", "MEASINFO", {"type": "direction", "Ref": "J2000"})
+    pt.flush()
+    pt.close()
+    mt.putkeyword("POINTING", f"Table: {pnt}")
+    mt.flush()
+    mt.close()
+    return ms
+
+
+def test_pointing_row_follows_the_selected_time_span():
+    # A two-field mosaic: field 0 at t=100, field 1 at t=200. Selecting the second
+    # field's rows must not return the first field's pointing (which is row 0).
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_timed_pointing_ms(it.random_named_directory(), [(100.0, 0.5, -0.7), (200.0, 0.8, -0.9)])
+    assert read_pointing_centre(ms, 1.0, 1.0, time_range=(190.0, 210.0)) == pytest.approx((0.8, -0.9))
+    assert read_pointing_centre(ms, 1.0, 1.0, time_range=(90.0, 110.0)) == pytest.approx((0.5, -0.7))
+    # No time range: the legacy first row.
+    assert read_pointing_centre(ms, 1.0, 1.0) == pytest.approx((0.5, -0.7))
+
+
+def test_pointing_row_falls_back_to_nearest_when_span_is_between_records():
+    # A POINTING cadence coarser than the field's dwell leaves no row strictly inside
+    # the span; the nearest record still beats row 0.
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_timed_pointing_ms(it.random_named_directory(), [(100.0, 0.5, -0.7), (200.0, 0.8, -0.9)])
+    assert read_pointing_centre(ms, 1.0, 1.0, time_range=(198.0, 199.0)) == pytest.approx((0.8, -0.9))
+
+
+def test_pointing_row_ignores_time_range_without_a_time_column():
+    # The POINTING tables older simms wrote have no TIME column; keep reading row 0.
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_pointing_ms(it.random_named_directory(), 0.5, -0.7, "J2000")
+    assert read_pointing_centre(ms, 1.0, 1.0, time_range=(0.0, 1.0)) == pytest.approx((0.5, -0.7))
+
+
+# --- out-of-band frequencies are clamped, and say so ------------------------------
+
+
+def test_beam_warns_once_outside_the_tabulated_band(caplog):
+    # np.interp clamps, so an L-band table asked for UHF frequencies returns L-band
+    # widths. That is the right value to return and the wrong thing to do silently.
+    beam = CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020")
+    lo = beam.freqs_mhz.min()
+    with caplog.at_level("WARNING", logger="skysim"):
+        beam.voltages(np.array([0.0]), np.array([0.0]), np.array([lo / 2]))
+        beam.voltages(np.array([0.0]), np.array([0.0]), np.array([lo / 3]))
+    warnings = [r for r in caplog.records if "tabulated over" in r.message]
+    assert len(warnings) == 1  # warn-once, not once per channel block
+    assert "MKAT-AA-L-JIM-2020" in warnings[0].message
+
+
+def test_beam_is_quiet_inside_the_band_and_on_its_edges(caplog):
+    beam = CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020")
+    lo, hi = beam.freqs_mhz.min(), beam.freqs_mhz.max()
+    with caplog.at_level("WARNING", logger="skysim"):
+        beam.voltages(np.array([0.0]), np.array([0.0]), np.array([lo, 0.5 * (lo + hi), hi]))
+    assert not [r for r in caplog.records if "tabulated over" in r.message]
+
+
+# --- the power beam is evaluated in bounded slabs ---------------------------------
+
+
+def test_image_power_beam_slabs_without_changing_the_answer(monkeypatch):
+    # The FITS "average" mode is what the a-term path degrades into when its cache will
+    # not fit, so it must not evaluate a whole image in one allocation.
+    from simms.skymodel import beams as beams_mod
+
+    class _Counting(beams_mod.BeamProvider):
+        def __init__(self, inner):
+            self.inner = inner
+            self.sizes = []
+
+        def _eval(self, l_feed, m_feed, freqs):
+            self.sizes.append(l_feed.size)
+            return self.inner._eval(l_feed, m_feed, freqs)
+
+    provider = _Counting(JimBeamProvider(CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020")))
+    npts = 97
+    ell = np.linspace(-0.02, 0.02, npts)
+    emm = np.linspace(0.015, -0.015, npts)
+    freqs = np.array([1.3e9, 1.4e9])
+    chi = np.linspace(0.0, 0.3, 4)
+
+    whole = image_power_beam(provider, True, ell, emm, freqs, chi)
+    assert max(provider.sizes) == npts  # one slab at the default size
+
+    provider.sizes.clear()
+    monkeypatch.setattr(beams_mod, "EVAL_SLAB_PIXELS", 16)
+    slabbed = image_power_beam(provider, True, ell, emm, freqs, chi)
+
+    assert max(provider.sizes) <= 16
+    assert sum(provider.sizes) == npts * freqs.size * chi.size
+    np.testing.assert_allclose(slabbed, whole, rtol=1e-12)
+
+
+def test_image_power_beam_handles_no_points():
+    provider = JimBeamProvider(CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020"))
+    power = image_power_beam(provider, True, np.array([]), np.array([]), np.array([1.4e9]), np.zeros(2))
+    assert power.shape == (0, 1)
+
+
+# --- ANTENNA.MOUNT is matched by name, not by substring ---------------------------
+
+
+@pytest.mark.parametrize(
+    "mount",
+    ["ALT-AZ", "alt-az", "ALTAZ", "AzEl", "AZ-EL", " ALT-AZ ", "ALT-AZ+NASMYTH-R", "ALT-AZ+NASMYTH-L"],
+)
+def test_mount_spellings_that_rotate(mount):
+    # The substring test this replaced answered False for ALTAZ and AZEL, freezing the
+    # beam on the sky with nothing in the log to say so.
+    from simms.skymodel.beams import is_altaz_mount
+
+    assert is_altaz_mount(mount)
+
+
+@pytest.mark.parametrize("mount", ["EQUATORIAL", "equatorial", "X-Y", "ORBITING", "SPACE-HALCA", "BIZARRE", ""])
+def test_mount_spellings_that_do_not_rotate(mount):
+    from simms.skymodel.beams import is_altaz_mount
+
+    assert not is_altaz_mount(mount)
+
+
+def test_unknown_mount_is_reported_not_swallowed(caplog):
+    from simms.skymodel.beams import is_altaz_mount, warn_unknown_mounts
+
+    assert not is_altaz_mount("SOMETHING-ELSE")  # no safe guess, but it must not be silent
+    with caplog.at_level("WARNING", logger="skysim"):
+        warn_unknown_mounts(["ALT-AZ", "SOMETHING-ELSE", "EQUATORIAL", "SOMETHING-ELSE"])
+    messages = [r.message for r in caplog.records if "Unrecognised ANTENNA.MOUNT" in r.message]
+    assert len(messages) == 1  # one message per table, listing each distinct value once
+    assert "SOMETHING-ELSE" in messages[0]
+
+
+def test_known_mounts_are_quiet(caplog):
+    from simms.skymodel.beams import warn_unknown_mounts
+
+    with caplog.at_level("WARNING", logger="skysim"):
+        warn_unknown_mounts(["ALT-AZ+NASMYTH-L", "ALTAZ", "EQUATORIAL", "X-Y"])
+    assert not [r for r in caplog.records if "Unrecognised ANTENNA.MOUNT" in r.message]
+
+
+def test_altaz_spelling_reaches_the_beam_grid(caplog):
+    # End to end through the resolver: an ALTAZ-spelled array must come out rotating.
+    config = {"MKAT-MA": {"jimbeam": "L"}}
+    with caplog.at_level("WARNING", logger="skysim"):
+        _, _, is_altaz = resolve_antenna_beams(["MKAT-MA", "MKAT-MA"], ["ALTAZ", "ALTAZ"], config, "L")
+    assert is_altaz.tolist() == [True]
+    assert not [r for r in caplog.records if "Unrecognised ANTENNA.MOUNT" in r.message]

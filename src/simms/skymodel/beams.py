@@ -131,6 +131,7 @@ class CosineTaperBeam:
         if self.fwhm_deg.shape != (4, self.freqs_mhz.size):
             raise ValueError("fwhm_deg must have shape (4, nfreq)")
         self.name = name
+        self._warned_out_of_band = False
 
     # -- constructors -------------------------------------------------------
 
@@ -168,9 +169,40 @@ class CosineTaperBeam:
 
     # -- evaluation ---------------------------------------------------------
 
+    def _warn_out_of_band(self, freqs_mhz: np.ndarray) -> None:
+        """Warn once if ``freqs_mhz`` reaches outside the tabulated band.
+
+        :func:`numpy.interp` clamps rather than extrapolating, so a frequency past either
+        end silently returns the edge row's squint and FWHM -- an L-band-width beam on UHF
+        data, say, with nothing in the output to show for it. The clamp is the right
+        behaviour (extrapolating a fitted FWHM is worse); the silence is not.
+        """
+        if self._warned_out_of_band:
+            return
+        lo, hi = float(self.freqs_mhz.min()), float(self.freqs_mhz.max())
+        atol = 1e-6 * hi  # a channel sitting on the edge is not extrapolation
+        want_lo, want_hi = float(freqs_mhz.min()), float(freqs_mhz.max())
+        if want_lo < lo - atol or want_hi > hi + atol:
+            self._warned_out_of_band = True
+            log.warning(
+                "Beam model %r is tabulated over %.1f-%.1f MHz but is being evaluated over "
+                "%.1f-%.1f MHz; coefficients outside the table are held at its edge values, so "
+                "the beam width there is the edge width, not the true one. Use a beam table "
+                "covering this band (--beam-band, or a matching CSV).",
+                self.name or "<unnamed>",
+                lo,
+                hi,
+                want_lo,
+                want_hi,
+            )
+
     def _interp(self, freqs_mhz: np.ndarray):
-        """Linearly interpolate squint/FWHM to ``freqs_mhz`` -> two ``(4, nchan)`` arrays."""
+        """Linearly interpolate squint/FWHM to ``freqs_mhz`` -> two ``(4, nchan)`` arrays.
+
+        Clamped outside the tabulated band; :meth:`_warn_out_of_band` says so when it happens.
+        """
         freqs_mhz = np.atleast_1d(np.asarray(freqs_mhz, dtype=np.float64))
+        self._warn_out_of_band(freqs_mhz)
         squint = np.stack([np.interp(freqs_mhz, self.freqs_mhz, s) for s in self.squint_deg])
         fwhm = np.stack([np.interp(freqs_mhz, self.freqs_mhz, f) for f in self.fwhm_deg])
         return squint, fwhm
@@ -594,6 +626,58 @@ def load_beam_config(path) -> dict:
     return load_yaml(path)
 
 
+# ``ANTENNA.MOUNT`` values naming a mount that rotates the beam with parallactic angle.
+# MSv2 spells it "alt-az", but writers in the wild use these variants interchangeably.
+ALTAZ_MOUNTS = frozenset({"ALT-AZ", "ALTAZ", "AZ-EL", "AZEL"})
+
+# Mounts that hold the feed frame still against the sky's rotation. Listed not because
+# anything branches on them, but so an unrecognised value can be told apart from a
+# deliberate one and reported -- the whole failure mode here is silence.
+FIXED_MOUNTS = frozenset({"EQUATORIAL", "X-Y", "XY", "ORBITING", "SPACE-HALCA", "BIZARRE"})
+
+
+def _normalise_mount(mount: str) -> str:
+    """An ``ANTENNA.MOUNT`` value reduced to the mount name alone, upper-cased.
+
+    Trailing focus designations ("ALT-AZ+NASMYTH-R", as ALMA writes) name where the
+    receiver sits, not how the mount moves, so they are dropped before the comparison.
+    """
+    return str(mount).strip().upper().split("+")[0].strip()
+
+
+def is_altaz_mount(mount: str) -> bool:
+    """Whether an ``ANTENNA.MOUNT`` value names a mount that rotates the beam on the sky.
+
+    An alt-az dish carries the sky's parallactic rotation into the feed frame; an
+    equatorial one does not. Single definition, so every path that has to make this call
+    -- the DFT grid, the a-terms, and the standalone ``primary-beam`` tool -- agrees.
+
+    Matched against :data:`ALTAZ_MOUNTS` by name rather than by substring: a substring
+    test quietly answers False for every spelling it does not contain, and False is the
+    answer that produces a beam frozen on the sky with nothing to show for it. Anything
+    unrecognised still lands on False -- there is no safe guess -- but
+    :func:`warn_unknown_mounts` makes that visible at the point the array is resolved.
+    """
+    return _normalise_mount(mount) in ALTAZ_MOUNTS
+
+
+def warn_unknown_mounts(mounts) -> None:
+    """Warn about ``ANTENNA.MOUNT`` values that name neither a known rotating nor fixed mount.
+
+    Such a value is treated as non-rotating, which for an alt-az array spelled some way
+    this does not know about means the beam silently never rotates. Called once where an
+    array is resolved, not per antenna, so a whole table costs one message.
+    """
+    unknown = sorted({str(m) for m in mounts if _normalise_mount(m) not in ALTAZ_MOUNTS | FIXED_MOUNTS})
+    if unknown:
+        log.warning(
+            "Unrecognised ANTENNA.MOUNT value(s) %s; treating those antennas as non-rotating, "
+            "so their beam will not follow the parallactic angle. Known rotating mounts are %s.",
+            unknown,
+            sorted(ALTAZ_MOUNTS),
+        )
+
+
 def resolve_antenna_beams(telescope_names, mount, beam_config, beam_band: str = "L"):
     """Map antennas to beam types and build one provider per type.
 
@@ -619,6 +703,7 @@ def resolve_antenna_beams(telescope_names, mount, beam_config, beam_band: str = 
     """
     telescope_names = [str(t) for t in np.asarray(telescope_names).astype(str)]
     mount = [str(m) for m in np.asarray(mount).astype(str)]
+    warn_unknown_mounts(mount)
     labels = list(dict.fromkeys(telescope_names))  # unique, insertion-ordered
 
     providers = []
@@ -626,7 +711,7 @@ def resolve_antenna_beams(telescope_names, mount, beam_config, beam_band: str = 
     for label in labels:
         providers.append(_build_provider(label, beam_config, beam_band))
         first = telescope_names.index(label)
-        type_is_altaz.append("ALT-AZ" in mount[first].upper())
+        type_is_altaz.append(is_altaz_mount(mount[first]))
 
     index = {label: i for i, label in enumerate(labels)}
     ant_type = np.array([index[t] for t in telescope_names], dtype=np.int64)
@@ -719,6 +804,7 @@ def resolve_cattery_antenna_beams(
 
     antenna_names = [str(a) for a in np.asarray(antenna_names).astype(str)]
     mount = [str(m) for m in np.asarray(mount).astype(str)]
+    warn_unknown_mounts(mount)
 
     exact, regexes, default = {}, [], None
     for matcher, is_regex, stype in cattery_cfg["stationtypes"]:
@@ -752,7 +838,7 @@ def resolve_cattery_antenna_beams(
         pattern = _cattery_substitute(cattery_cfg["pattern"], stype=label)
         providers.append(FitsBeamProvider.from_cattery(pattern, pol_basis=pol_basis, l_axis=l_axis, m_axis=m_axis))
         first = types.index(label)
-        type_is_altaz.append("ALT-AZ" in mount[first].upper())
+        type_is_altaz.append(is_altaz_mount(mount[first]))
 
     index = {label: i for i, label in enumerate(labels)}
     ant_type = np.array([index[t] for t in types], dtype=np.int64)
@@ -900,13 +986,23 @@ def build_beam_grid_jones(
     return grid
 
 
+# Points evaluated per beam-provider call. A provider returns complex128 voltages (32 B
+# per point per feed pair) and the analytic models build several float64 temporaries on
+# top, so evaluating an 8k x 8k image in one call costs GiB. Slabbing bounds that scratch
+# to tens of MiB regardless of how many points are asked for.
+EVAL_SLAB_PIXELS = 1 << 20
+
+
 def image_power_beam(provider, is_altaz, ell, emm, freqs, chi_grid):
     """Parallactic-angle-averaged power beam ``<0.5(|g^X|^2 + |g^V|^2)>`` at each point.
 
     For the FITS-*image* path, which grids one apparent sky for all baselines and times:
     there is no per-baseline beam, so the beam is averaged over the observation's
     parallactic-angle range (a single sample when ``is_altaz`` is False). Loops over
-    frequency and PA to keep the working set at ``O(npts)`` for large images.
+    point slabs, frequency and PA so the scratch a provider allocates stays bounded by
+    :data:`EVAL_SLAB_PIXELS` rather than growing with the image -- this is the path the
+    FITS a-term mode degrades into when its cache will not fit, so it must not need more
+    memory than the mode it is rescuing.
 
     Parameters
     ----------
@@ -930,14 +1026,18 @@ def image_power_beam(provider, is_altaz, ell, emm, freqs, chi_grid):
     emm = np.asarray(emm, dtype=np.float64)
     freqs = np.atleast_1d(np.asarray(freqs, dtype=np.float64))
     chis = chi_grid if is_altaz else np.zeros(1)
-    power = np.empty((ell.size, freqs.size))
-    for k in range(freqs.size):
-        fk = freqs[k : k + 1]
-        acc = np.zeros(ell.size)
-        for chi in chis:
-            g = provider.voltage(ell, emm, fk, np.array([chi]))  # (1, npts, 1, 2)
-            acc += 0.5 * (np.abs(g[0, :, 0, 0]) ** 2 + np.abs(g[0, :, 0, 1]) ** 2)
-        power[:, k] = acc / chis.size
+    npts = ell.size
+    power = np.empty((npts, freqs.size))
+    for start in range(0, npts, EVAL_SLAB_PIXELS):
+        sl = slice(start, min(start + EVAL_SLAB_PIXELS, npts))
+        l_slab, m_slab = ell[sl], emm[sl]
+        for k in range(freqs.size):
+            fk = freqs[k : k + 1]
+            acc = np.zeros(l_slab.size)
+            for chi in chis:
+                g = provider.voltage(l_slab, m_slab, fk, np.array([chi]))  # (1, nslab, 1, 2)
+                acc += 0.5 * (np.abs(g[0, :, 0, 0]) ** 2 + np.abs(g[0, :, 0, 1]) ** 2)
+            power[sl, k] = acc / chis.size
     return power
 
 
@@ -1030,7 +1130,50 @@ def _read_direction(ms, subtable, column, row):
     return float(radec[0]), float(radec[1])
 
 
-def read_pointing_centre(ms, fallback_ra0, fallback_dec0, field_id=0):
+def _pointing_row_for_times(ms, time_range):
+    """Index of a ``POINTING`` row recorded while ``time_range`` was being observed.
+
+    ``POINTING`` is keyed by ``(ANTENNA_ID, TIME)`` and carries no ``FIELD_ID``, so the
+    only handle on which field a pointing belongs to is *when* it was recorded. Row 0 is
+    whichever field the MS observed first, which is the wrong beam centre for every other
+    field of a mosaic; ``time_range`` is the ``TIME`` span of the rows the run actually
+    selected, so a row inside it points where those rows were looking.
+
+    Falls back to the row nearest the span's midpoint when nothing lies strictly inside
+    (a ``POINTING`` cadence coarser than the field's dwell), and to row 0 when there is no
+    usable ``TIME`` column at all -- both strictly better than, or the same as, the
+    legacy unconditional row 0.
+    """
+    if time_range is None:
+        return 0
+    from daskms import xds_from_table
+
+    t0, t1 = (float(t) for t in time_range)
+    try:
+        ds = xds_from_table(f"{ms}::POINTING")[0]
+        if "TIME" not in ds:
+            raise ValueError("no TIME column")
+        times = np.asarray(ds.TIME.data.compute(), dtype=np.float64)
+    except Exception as exc:
+        log.debug("No usable POINTING.TIME (%s); reading the beam centre from row 0.", exc)
+        return 0
+    if times.size == 0:
+        return 0
+    within = np.nonzero((times >= t0) & (times <= t1))[0]
+    if within.size:
+        return int(within[0])
+    nearest = int(np.argmin(np.abs(times - 0.5 * (t0 + t1))))
+    log.debug(
+        "No POINTING row inside the selected time span [%.3f, %.3f]; using row %d at TIME %.3f.",
+        t0,
+        t1,
+        nearest,
+        times[nearest],
+    )
+    return nearest
+
+
+def read_pointing_centre(ms, fallback_ra0, fallback_dec0, field_id=0, time_range=None):
     """Antenna pointing centre (radians), tried in order of how faithfully it records the pointing.
 
     This is where the dishes point, and hence where the primary beam is centred -- distinct
@@ -1045,6 +1188,12 @@ def read_pointing_centre(ms, fallback_ra0, fallback_dec0, field_id=0):
     straight to the phase centre centres the beam on the wrong place. Each candidate is
     validated rather than blindly preferred -- an absent column or a non-finite value is
     skipped -- since some writers leave ``REFERENCE_DIR`` unpopulated.
+
+    ``POINTING`` has no ``FIELD_ID``, so ``field_id`` cannot select its row directly; pass
+    ``time_range`` (the ``TIME`` span of the rows the run selected) and the row is chosen
+    from that instead -- see :func:`_pointing_row_for_times`. Without it the first row is
+    read, which is the pointing of whichever field the MS observed first. The ``FIELD``
+    fallbacks are indexed by ``field_id`` directly.
 
     The direction is interpreted as a fixed sky position, which requires an equatorial measure
     frame. ``J2000``/``ICRS`` (and an absent keyword, as older simms MSs may have) take the
@@ -1062,7 +1211,7 @@ def read_pointing_centre(ms, fallback_ra0, fallback_dec0, field_id=0):
             f"a J2000/ICRS POINTING table or a target-tracking MS."
         )
     _warn_nonstandard_frame(frame, "POINTING.DIRECTION")
-    centre = _read_direction(ms, "POINTING", "DIRECTION", 0)
+    centre = _read_direction(ms, "POINTING", "DIRECTION", _pointing_row_for_times(ms, time_range))
     if centre is not None:
         return centre
 
@@ -1108,13 +1257,16 @@ def resolve_beam(spec, band: str = "L") -> BeamProvider:
     return _build_jimbeam(spec, band)
 
 
-def averaged_power_beam(provider, ell, emm, freqs, chi_grid):
+def averaged_power_beam(provider, is_altaz, ell, emm, freqs, chi_grid):
     """Frequency- and parallactic-angle-averaged Stokes-I power beam ``A(l, m)``, shape ``(npts,)``.
 
     Averages :func:`image_power_beam` (already PA-averaged) over frequency. Used for the
     image-/component-domain apply/correct, which is a direct multiply/divide by one map.
+    ``is_altaz`` must come from the array's ``ANTENNA.MOUNT``: averaging a beam that never
+    rotates over the PA track smears an asymmetric or squinted pattern that in truth held
+    still (see :func:`image_power_beam`).
     """
-    return image_power_beam(provider, True, ell, emm, freqs, chi_grid).mean(axis=1)
+    return image_power_beam(provider, is_altaz, ell, emm, freqs, chi_grid).mean(axis=1)
 
 
 def write_beam_fits(beam: CosineTaperBeam, l_grid, m_grid, freqs_hz, path):
