@@ -109,6 +109,14 @@ def _angular_separation(ra1, dec1, ra2, dec2):
 
 
 def to_fits(opts):
+    """Write the beam as FITS and return ``(handle, files)``.
+
+    ``files`` lists every file written. ``handle`` is what a dependent step chains onto:
+    the single cube for ``--fits-format simms``, and the bare *prefix* for ``cattery``,
+    which writes eight files -- the prefix is what both :meth:`FitsBeamProvider.from_cattery`
+    and DDFacet's ``--Beam-FITSFile`` accept, so it round-trips into a later
+    ``--beam-pattern``, while an individual one of the eight would not.
+    """
     from astropy.coordinates import Angle
 
     from simms.skymodel.beams import JimBeamProvider, resolve_beam, write_beam_fits, write_beam_fits_cattery
@@ -151,6 +159,7 @@ def to_fits(opts):
             opts.pol_basis,
             ", ".join(paths),
         )
+        return prefix, list(paths)
     else:
         if opts.beam_l_axis != "-X" or opts.beam_m_axis != "Y":
             log.warning(
@@ -159,6 +168,7 @@ def to_fits(opts):
         output = opts.output or "beam.fits"
         write_beam_fits(beam, grid, grid, freqs, output)
         log.info("Wrote beam FITS cube %s (%d x %d pixels, %d channels)", output, npix, npix, freqs.size)
+        return output, [output]
 
 
 # --------------------------------------------------------------------- tag-ms
@@ -213,7 +223,10 @@ def tag_ms(opts):
 
 
 def apply_correct_image(opts, invert):
-    """Multiply (apply) or divide (correct) a FITS image by the averaged power beam."""
+    """Multiply (apply) or divide (correct) a FITS image by the averaged power beam.
+
+    Returns the path actually written, which is the defaulted name when ``--output`` was omitted.
+    """
     from astropy.io import fits
     from astropy.wcs import WCS
 
@@ -261,10 +274,14 @@ def apply_correct_image(opts, invert):
     output = opts.output or ("corrected.fits" if invert else "apparent.fits")
     fits.PrimaryHDU(data=result.astype(out_dtype, copy=False), header=header).writeto(output, overwrite=True)
     log.info("%s primary beam -> %s", "Corrected" if invert else "Applied", output)
+    return output
 
 
 def apply_correct_ascii(opts, invert):
-    """Scale ASCII component fluxes by the averaged power beam (apply) or its inverse (correct)."""
+    """Scale ASCII component fluxes by the averaged power beam (apply) or its inverse (correct).
+
+    Returns the path actually written, which is the defaulted name when ``--output`` was omitted.
+    """
     from simms.skymodel.ascii_skies import ASCIISkymodel, ASCIISource
     from simms.utilities import radec2lm
 
@@ -313,6 +330,7 @@ def apply_correct_ascii(opts, invert):
         len(sky.sources) - len(dropped),
         output,
     )
+    return output
 
 
 def provider_from(opts):

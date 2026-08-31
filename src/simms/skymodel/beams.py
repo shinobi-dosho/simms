@@ -373,6 +373,39 @@ def _cattery_substitute(
     return pattern
 
 
+def _beam_axis(hdr, fits_axis, npix, unit, path=""):
+    """World values along a linear FITS beam axis, converted to ``unit``.
+
+    ``CUNIT`` is honoured rather than assumed: an ``L``/``M`` axis written in radians, or a
+    ``FREQ`` axis in MHz, would otherwise load scaled by 180/pi or 1e-6 with nothing in the
+    output to show for it -- the beam simply comes out the wrong size.
+
+    An absent ``CUNIT`` means the axis is already in ``unit``. That is the FITS default and
+    what :func:`write_beam_fits`/:func:`write_beam_fits_cattery` emit, so simms' own cubes
+    and third-party Cattery sets that omit the keyword both keep working. A ``CUNIT`` that
+    is present but unparseable, or that measures the wrong quantity, is an error: guessing
+    is how the silent-scaling bug happens in the first place.
+    """
+    from astropy import units as u
+
+    crpix = hdr[f"CRPIX{fits_axis}"]
+    crval = hdr[f"CRVAL{fits_axis}"]
+    cdelt = hdr[f"CDELT{fits_axis}"]
+    values = (np.arange(npix) - (crpix - 1)) * cdelt + crval
+
+    cunit = str(hdr.get(f"CUNIT{fits_axis}", "")).strip()
+    if not cunit:
+        return values
+    try:
+        scale = u.Unit(cunit).to(unit)
+    except (ValueError, TypeError, u.UnitsError) as exc:
+        where = f" of {path!r}" if path else ""
+        raise ValueError(
+            f"CUNIT{fits_axis}={cunit!r} on axis {fits_axis}{where} is not convertible to {unit!r}."
+        ) from exc
+    return values * scale
+
+
 class FitsBeamProvider(BeamProvider):
     """Per-feed voltage beam interpolated from a gridded FITS cube (measured/eidos beams).
 
@@ -466,7 +499,8 @@ class FitsBeamProvider(BeamProvider):
         **4 planes** ``[HH, VV] x (real, imag)`` for a diagonal beam, or **8 planes**
         ``[HH, HV, VH, VV] x (real, imag)`` for a full 2x2 Jones (leakage). A linear WCS
         gives the ``L``/``M`` axes in degrees (SIN direction cosines scaled to degrees,
-        ``l_deg = 180/pi * l``) and the ``FREQ`` axis in Hz.
+        ``l_deg = 180/pi * l``) and the ``FREQ`` axis in Hz -- or in any other units the
+        axes' ``CUNIT`` keywords declare, which :func:`_beam_axis` converts.
         """
         from astropy.io import fits
 
@@ -477,16 +511,10 @@ class FitsBeamProvider(BeamProvider):
             raise ValueError("FITS beam cube must have shape (4 or 8, nfreq, nm, nl): feed voltages real/imag.")
         _nplane, nfreq, nm, nl = data.shape
 
-        def _axis(fits_axis, n):
-            crpix = hdr[f"CRPIX{fits_axis}"]
-            crval = hdr[f"CRVAL{fits_axis}"]
-            cdelt = hdr[f"CDELT{fits_axis}"]
-            return (np.arange(n) - (crpix - 1)) * cdelt + crval
-
         # FITS axis 1 <-> last numpy axis (nl), axis 2 <-> nm, axis 3 <-> nfreq.
-        l_grid = np.radians(_axis(1, nl))  # degrees -> direction cosine (small-angle)
-        m_grid = np.radians(_axis(2, nm))
-        freqs_hz = _axis(3, nfreq)
+        l_grid = np.radians(_beam_axis(hdr, 1, nl, "deg", path))  # degrees -> direction cosine (small-angle)
+        m_grid = np.radians(_beam_axis(hdr, 2, nm, "deg", path))
+        freqs_hz = _beam_axis(hdr, 3, nfreq, "Hz", path)
 
         # Even planes are real parts, odd planes imaginary: (nk, nfreq, nm, nl), nk in {2, 4}.
         complex_planes = data[0::2] + 1j * data[1::2]
@@ -540,12 +568,6 @@ class FitsBeamProvider(BeamProvider):
         labels = ["xx", "xy", "yx", "yy"] if pol_basis == "linear" else ["rr", "rl", "lr", "ll"]
         sign_l, sign_m = _axis_sign(l_axis), _axis_sign(m_axis)
 
-        def _axis(hdr, fits_axis, n):
-            crpix = hdr[f"CRPIX{fits_axis}"]
-            crval = hdr[f"CRVAL{fits_axis}"]
-            cdelt = hdr[f"CDELT{fits_axis}"]
-            return (np.arange(n) - (crpix - 1)) * cdelt + crval
-
         l_grid = m_grid = freqs_hz = None
         planes = []
         for corr in labels:
@@ -564,9 +586,9 @@ class FitsBeamProvider(BeamProvider):
                         f"Cattery beam file {path!r} must be a (nfreq, nm, nl) cube, got shape {data.shape}."
                     )
                 nf, nm, nl = data.shape
-                this_l = sign_l * np.radians(_axis(hdr, 1, nl))
-                this_m = sign_m * np.radians(_axis(hdr, 2, nm))
-                this_freqs = _axis(hdr, 3, nf)
+                this_l = sign_l * np.radians(_beam_axis(hdr, 1, nl, "deg", path))
+                this_m = sign_m * np.radians(_beam_axis(hdr, 2, nm, "deg", path))
+                this_freqs = _beam_axis(hdr, 3, nf, "Hz", path)
                 if l_grid is None:
                     l_grid, m_grid, freqs_hz = this_l, this_m, this_freqs
                 elif not (

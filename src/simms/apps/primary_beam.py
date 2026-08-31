@@ -14,10 +14,18 @@ class PrimaryBeamOutputs(BaseModel):
     """Passthrough paths of the primary-beam operation, so it can be wired into a
     shinobi Recipe or dosho: `to-fits`/`apply`/`correct` write `output` (beam FITS
     or beamed sky model), while `tag-ms` mutates `ms` in place and echoes it back --
-    the only handle a dependent step has to chain onto the tagged MS."""
+    the only handle a dependent step has to chain onto the tagged MS.
+
+    `output` is the path the run *resolved*, not the `--output` it was given: the modes
+    default the filename when `--output` is omitted, so echoing the raw option back would
+    hand a dependent step `None` in exactly that case. For `--fits-format cattery`, which
+    writes eight files, `output` is the bare prefix -- what `from_cattery` and DDFacet's
+    `--Beam-FITSFile` consume, so it round-trips into a later `--beam-pattern`.
+    `files` lists every file written (empty for `tag-ms`, which writes none)."""
 
     ms: str | None = None
     output: str | None = None
+    files: list[str] = []
 
 
 def _require(opts, field):
@@ -25,7 +33,8 @@ def _require(opts, field):
         raise RuntimeError(f"--{field.replace('_', '-')} is required for mode {opts.mode!r}.")
 
 
-def runit(opts):
+def runit(opts) -> PrimaryBeamOutputs:
+    """Run one primary-beam mode and report the paths it actually wrote."""
     set_logger(BIN.primary_beam, opts.log_level)
     from simms.skymodel import pb_ops
 
@@ -36,20 +45,22 @@ def runit(opts):
     mode = opts.mode
     if mode == "to-fits":
         _require(opts, "beam_pattern")
-        pb_ops.to_fits(opts)
+        output, files = pb_ops.to_fits(opts)
+        return PrimaryBeamOutputs(ms=opts.ms, output=output, files=files)
     elif mode == "tag-ms":
         _require(opts, "ms")
         pb_ops.tag_ms(opts)
+        # tag-ms edits ANTENNA in place and writes no new file, so the echoed MS is the handle.
+        return PrimaryBeamOutputs(ms=opts.ms, output=None, files=[])
     elif mode in ("apply", "correct"):
         _require(opts, "ms")
         _require(opts, "beam_pattern")
         if sum(bool(x) for x in (opts.fits_sky, opts.ascii_sky)) != 1:
             raise RuntimeError("apply/correct needs exactly one of --fits-sky or --ascii-sky.")
         invert = mode == "correct"
-        if opts.fits_sky:
-            pb_ops.apply_correct_image(opts, invert)
-        else:
-            pb_ops.apply_correct_ascii(opts, invert)
+        run = pb_ops.apply_correct_image if opts.fits_sky else pb_ops.apply_correct_ascii
+        output = run(opts, invert)
+        return PrimaryBeamOutputs(ms=opts.ms, output=output, files=[output])
     else:
         raise RuntimeError(f"Unknown primary-beam mode {mode!r}.")
 
@@ -164,5 +175,4 @@ def primary_beam(
     log_level: str = Field("INFO", description="Logging verbosity."),
 ) -> PrimaryBeamOutputs:
     opts = SimpleNamespace(**locals())
-    runit(opts)
-    return PrimaryBeamOutputs(ms=ms, output=output)
+    return runit(opts)
