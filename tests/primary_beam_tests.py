@@ -480,3 +480,18 @@ def test_averaged_beam_warns_on_mixed_mounts(fx, caplog):
         obs = pb_ops._observation(fx.ms, 0, 0)
     assert obs["is_altaz"]  # follows the first antenna
     assert any("mixes rotating and non-rotating mounts" in r.message for r in caplog.records)
+
+
+def test_missing_mount_column_fails_clearly(fx):
+    # MOUNT decides whether the beam rotates. Absent, there is nothing to infer it from --
+    # assuming either way is silently wrong -- so say what is missing instead of letting
+    # an AttributeError out of daskms.
+    pytest.importorskip("casacore")
+    from casacore.tables import table
+
+    from simms.skymodel import pb_ops
+
+    with table(f"{fx.ms}::ANTENNA", readonly=False, ack=False) as tab:
+        tab.removecols("MOUNT")
+    with pytest.raises(RuntimeError, match="MOUNT"):
+        pb_ops._observation(fx.ms, 0, 0)

@@ -310,3 +310,15 @@ def test_configurable_telescope_name_column(e2e):
     bad = _opts(ms, e2e.sky, primary_beam=e2e.beams, column="BEAM2")  # default TELESCOPE_NAME, absent
     with pytest.raises(RuntimeError, match="TELESCOPE_NAME"):
         skysim.runit(bad)
+
+
+def test_missing_mount_column_fails_clearly(e2e):
+    # Same rule as the telescope-name column: beam metadata is read, never inferred.
+    pytest.importorskip("casacore")
+    from casacore.tables import table
+
+    with table(f"{e2e.ms}::ANTENNA", readonly=False, ack=False) as tab:
+        tab.removecols("MOUNT")
+    opts = _opts(e2e.ms, e2e.sky, primary_beam=e2e.beams, column="BEAM")
+    with pytest.raises(RuntimeError, match="MOUNT"):
+        skysim.runit(opts)

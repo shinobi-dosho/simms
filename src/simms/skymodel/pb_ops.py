@@ -35,6 +35,15 @@ def _observation(ms, field_id=0, spw_id=0):
     spw = xds_from_table(f"{ms}::SPECTRAL_WINDOW")[0]
     field = xds_from_table(f"{ms}::FIELD")[0]
     msds = xds_from_ms(ms, group_cols=["DATA_DESC_ID"], taql_where=f"FIELD_ID=={int(field_id)}")[int(spw_id)]
+    if "MOUNT" not in ant:
+        # Whether the beam rotates with parallactic angle is metadata, not something to
+        # guess from: assuming alt-az smears a fixed beam, assuming fixed freezes a
+        # rotating one, and both are silent. MOUNT is a required MSv2 ANTENNA column.
+        raise RuntimeError(
+            f"The ANTENNA table of {ms!r} has no MOUNT column, so whether the primary beam "
+            f"rotates with parallactic angle cannot be determined. Add the column (MSv2 "
+            f"requires it) with the mount of each antenna, e.g. 'ALT-AZ'."
+        )
     pos, mount, t0, t1, interval, chan_freq, phase_dir = dask.compute(
         ant.POSITION.data,
         ant.MOUNT.data,

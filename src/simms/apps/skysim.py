@@ -89,6 +89,14 @@ class _BeamContext:
                     f"name that selects a primary beam). Create the MS with telsim, or point "
                     f"--telescope-name-column at the column that holds it."
                 )
+        if "MOUNT" not in ant_ds:
+            # Same rule as the telescope name above: whether the beam rotates with
+            # parallactic angle is read, never guessed. MSv2 requires the column.
+            raise RuntimeError(
+                "The ANTENNA table has no MOUNT column, so whether the primary beam rotates "
+                "with parallactic angle cannot be determined. Add the column (MSv2 requires "
+                "it) with the mount of each antenna, e.g. 'ALT-AZ'."
+            )
         type_keys, mount, pos, t0, t1, interval, corr_type = dask.compute(
             ant_ds[typing_col].data,
             ant_ds.MOUNT.data,
