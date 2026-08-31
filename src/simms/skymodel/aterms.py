@@ -121,15 +121,10 @@ import numpy as np
 from ducc0.wgridder import dirty2vis
 
 from simms import BIN
-from simms.skymodel.beams import corr_feed_maps, pa_sample_grid, reproject_lm
+from simms.skymodel.beams import EVAL_SLAB_PIXELS, corr_feed_maps, pa_sample_grid, reproject_lm
 from simms.skymodel.fits_spectrum import SpectralKind, evaluate_scale
 
 log = logging.getLogger(BIN.skysim)
-
-# Pixels evaluated per beam-provider call when filling a voltage map. Bounds the
-# coordinate scratch arrays (a FITS-beam interpolation builds an (n, 3) point
-# array) to ~tens of MiB regardless of image size.
-EVAL_SLAB_PIXELS = 1 << 20
 
 # Probe grid side for frequency-knot selection: the beam is compared against its
 # linear-in-frequency interpolation on a probe_side x probe_side grid spanning

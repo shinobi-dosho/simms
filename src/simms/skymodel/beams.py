@@ -942,13 +942,23 @@ def build_beam_grid_jones(
     return grid
 
 
+# Points evaluated per beam-provider call. A provider returns complex128 voltages (32 B
+# per point per feed pair) and the analytic models build several float64 temporaries on
+# top, so evaluating an 8k x 8k image in one call costs GiB. Slabbing bounds that scratch
+# to tens of MiB regardless of how many points are asked for.
+EVAL_SLAB_PIXELS = 1 << 20
+
+
 def image_power_beam(provider, is_altaz, ell, emm, freqs, chi_grid):
     """Parallactic-angle-averaged power beam ``<0.5(|g^X|^2 + |g^V|^2)>`` at each point.
 
     For the FITS-*image* path, which grids one apparent sky for all baselines and times:
     there is no per-baseline beam, so the beam is averaged over the observation's
     parallactic-angle range (a single sample when ``is_altaz`` is False). Loops over
-    frequency and PA to keep the working set at ``O(npts)`` for large images.
+    point slabs, frequency and PA so the scratch a provider allocates stays bounded by
+    :data:`EVAL_SLAB_PIXELS` rather than growing with the image -- this is the path the
+    FITS a-term mode degrades into when its cache will not fit, so it must not need more
+    memory than the mode it is rescuing.
 
     Parameters
     ----------
@@ -972,14 +982,18 @@ def image_power_beam(provider, is_altaz, ell, emm, freqs, chi_grid):
     emm = np.asarray(emm, dtype=np.float64)
     freqs = np.atleast_1d(np.asarray(freqs, dtype=np.float64))
     chis = chi_grid if is_altaz else np.zeros(1)
-    power = np.empty((ell.size, freqs.size))
-    for k in range(freqs.size):
-        fk = freqs[k : k + 1]
-        acc = np.zeros(ell.size)
-        for chi in chis:
-            g = provider.voltage(ell, emm, fk, np.array([chi]))  # (1, npts, 1, 2)
-            acc += 0.5 * (np.abs(g[0, :, 0, 0]) ** 2 + np.abs(g[0, :, 0, 1]) ** 2)
-        power[:, k] = acc / chis.size
+    npts = ell.size
+    power = np.empty((npts, freqs.size))
+    for start in range(0, npts, EVAL_SLAB_PIXELS):
+        sl = slice(start, min(start + EVAL_SLAB_PIXELS, npts))
+        l_slab, m_slab = ell[sl], emm[sl]
+        for k in range(freqs.size):
+            fk = freqs[k : k + 1]
+            acc = np.zeros(l_slab.size)
+            for chi in chis:
+                g = provider.voltage(l_slab, m_slab, fk, np.array([chi]))  # (1, nslab, 1, 2)
+                acc += 0.5 * (np.abs(g[0, :, 0, 0]) ** 2 + np.abs(g[0, :, 0, 1]) ** 2)
+            power[sl, k] = acc / chis.size
     return power
 
 

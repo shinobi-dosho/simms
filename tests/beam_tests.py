@@ -1218,3 +1218,45 @@ def test_beam_is_quiet_inside_the_band_and_on_its_edges(caplog):
     with caplog.at_level("WARNING", logger="skysim"):
         beam.voltages(np.array([0.0]), np.array([0.0]), np.array([lo, 0.5 * (lo + hi), hi]))
     assert not [r for r in caplog.records if "tabulated over" in r.message]
+
+
+# --- the power beam is evaluated in bounded slabs ---------------------------------
+
+
+def test_image_power_beam_slabs_without_changing_the_answer(monkeypatch):
+    # The FITS "average" mode is what the a-term path degrades into when its cache will
+    # not fit, so it must not evaluate a whole image in one allocation.
+    from simms.skymodel import beams as beams_mod
+
+    class _Counting(beams_mod.BeamProvider):
+        def __init__(self, inner):
+            self.inner = inner
+            self.sizes = []
+
+        def _eval(self, l_feed, m_feed, freqs):
+            self.sizes.append(l_feed.size)
+            return self.inner._eval(l_feed, m_feed, freqs)
+
+    provider = _Counting(JimBeamProvider(CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020")))
+    npts = 97
+    ell = np.linspace(-0.02, 0.02, npts)
+    emm = np.linspace(0.015, -0.015, npts)
+    freqs = np.array([1.3e9, 1.4e9])
+    chi = np.linspace(0.0, 0.3, 4)
+
+    whole = image_power_beam(provider, True, ell, emm, freqs, chi)
+    assert max(provider.sizes) == npts  # one slab at the default size
+
+    provider.sizes.clear()
+    monkeypatch.setattr(beams_mod, "EVAL_SLAB_PIXELS", 16)
+    slabbed = image_power_beam(provider, True, ell, emm, freqs, chi)
+
+    assert max(provider.sizes) <= 16
+    assert sum(provider.sizes) == npts * freqs.size * chi.size
+    np.testing.assert_allclose(slabbed, whole, rtol=1e-12)
+
+
+def test_image_power_beam_handles_no_points():
+    provider = JimBeamProvider(CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020"))
+    power = image_power_beam(provider, True, np.array([]), np.array([]), np.array([1.4e9]), np.zeros(2))
+    assert power.shape == (0, 1)
