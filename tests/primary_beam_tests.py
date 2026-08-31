@@ -429,3 +429,54 @@ def test_apply_then_correct_ascii_custom_schema(fx):
     rec_flux = _read_ascii_flux(recovered, delimiter=",")
     assert rec_flux["A"] == pytest.approx(5.0, rel=1e-3)
     assert rec_flux["B"] == pytest.approx(3.0, rel=1e-3)
+
+
+def _set_mount(ms, value):
+    """Overwrite every ANTENNA.MOUNT entry (the layouts simms ships are all ALT-AZ)."""
+    from casacore.tables import table
+
+    with table(f"{ms}::ANTENNA", readonly=False, ack=False) as tab:
+        tab.putcol("MOUNT", [value] * tab.nrows())
+
+
+def test_averaged_beam_honours_the_antenna_mount(fx):
+    # An equatorial mount does not carry parallactic rotation into the feed frame, so the
+    # averaged beam must be the chi=0 beam and not a smear of the squinted pattern over
+    # the PA track. apply/correct used to average unconditionally.
+    pytest.importorskip("casacore")
+    from simms.skymodel import pb_ops
+    from simms.skymodel.beams import image_power_beam, resolve_beam
+
+    provider = resolve_beam("MKAT-EA-L-JIM-2026", "L")
+    ell = np.array([0.0, 0.010, 0.018])
+    emm = np.array([0.0, 0.012, -0.015])
+
+    obs_altaz = pb_ops._observation(fx.ms, 0, 0)
+    assert obs_altaz["is_altaz"]  # the skamid layout is ALT-AZ
+    got_altaz = pb_ops._averaged_beam(provider, ell, emm, obs_altaz["ra0"], obs_altaz["dec0"], obs_altaz, 1.0)
+
+    _set_mount(fx.ms, "EQUATORIAL")
+    obs_eq = pb_ops._observation(fx.ms, 0, 0)
+    assert not obs_eq["is_altaz"]
+    got_eq = pb_ops._averaged_beam(provider, ell, emm, obs_eq["ra0"], obs_eq["dec0"], obs_eq, 1.0)
+
+    want_eq = image_power_beam(provider, False, ell, emm, obs_eq["freqs"], np.zeros(1)).mean(axis=1)
+    np.testing.assert_allclose(got_eq, want_eq, rtol=1e-12)
+    # Off-axis, the two answers genuinely disagree -- the mount is load-bearing.
+    assert not np.allclose(got_eq[1:], got_altaz[1:])
+
+
+def test_averaged_beam_warns_on_mixed_mounts(fx, caplog):
+    pytest.importorskip("casacore")
+    from casacore.tables import table
+
+    from simms.skymodel import pb_ops
+
+    with table(f"{fx.ms}::ANTENNA", readonly=False, ack=False) as tab:
+        mounts = ["ALT-AZ"] * tab.nrows()
+        mounts[-1] = "EQUATORIAL"
+        tab.putcol("MOUNT", mounts)
+    with caplog.at_level(logging.WARNING, logger="primary-beam"):
+        obs = pb_ops._observation(fx.ms, 0, 0)
+    assert obs["is_altaz"]  # follows the first antenna
+    assert any("mixes rotating and non-rotating mounts" in r.message for r in caplog.records)

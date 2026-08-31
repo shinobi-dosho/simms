@@ -594,6 +594,16 @@ def load_beam_config(path) -> dict:
     return load_yaml(path)
 
 
+def is_altaz_mount(mount: str) -> bool:
+    """Whether an ``ANTENNA.MOUNT`` value names a mount that rotates the beam on the sky.
+
+    An alt-az dish carries the sky's parallactic rotation into the feed frame; an
+    equatorial one does not. Single definition, so every path that has to make this call
+    -- the DFT grid, the a-terms, and the standalone ``primary-beam`` tool -- agrees.
+    """
+    return "ALT-AZ" in str(mount).upper()
+
+
 def resolve_antenna_beams(telescope_names, mount, beam_config, beam_band: str = "L"):
     """Map antennas to beam types and build one provider per type.
 
@@ -626,7 +636,7 @@ def resolve_antenna_beams(telescope_names, mount, beam_config, beam_band: str = 
     for label in labels:
         providers.append(_build_provider(label, beam_config, beam_band))
         first = telescope_names.index(label)
-        type_is_altaz.append("ALT-AZ" in mount[first].upper())
+        type_is_altaz.append(is_altaz_mount(mount[first]))
 
     index = {label: i for i, label in enumerate(labels)}
     ant_type = np.array([index[t] for t in telescope_names], dtype=np.int64)
@@ -752,7 +762,7 @@ def resolve_cattery_antenna_beams(
         pattern = _cattery_substitute(cattery_cfg["pattern"], stype=label)
         providers.append(FitsBeamProvider.from_cattery(pattern, pol_basis=pol_basis, l_axis=l_axis, m_axis=m_axis))
         first = types.index(label)
-        type_is_altaz.append("ALT-AZ" in mount[first].upper())
+        type_is_altaz.append(is_altaz_mount(mount[first]))
 
     index = {label: i for i, label in enumerate(labels)}
     ant_type = np.array([index[t] for t in types], dtype=np.int64)
@@ -1157,13 +1167,16 @@ def resolve_beam(spec, band: str = "L") -> BeamProvider:
     return _build_jimbeam(spec, band)
 
 
-def averaged_power_beam(provider, ell, emm, freqs, chi_grid):
+def averaged_power_beam(provider, is_altaz, ell, emm, freqs, chi_grid):
     """Frequency- and parallactic-angle-averaged Stokes-I power beam ``A(l, m)``, shape ``(npts,)``.
 
     Averages :func:`image_power_beam` (already PA-averaged) over frequency. Used for the
     image-/component-domain apply/correct, which is a direct multiply/divide by one map.
+    ``is_altaz`` must come from the array's ``ANTENNA.MOUNT``: averaging a beam that never
+    rotates over the PA track smears an asymmetric or squinted pattern that in truth held
+    still (see :func:`image_power_beam`).
     """
-    return image_power_beam(provider, True, ell, emm, freqs, chi_grid).mean(axis=1)
+    return image_power_beam(provider, is_altaz, ell, emm, freqs, chi_grid).mean(axis=1)
 
 
 def write_beam_fits(beam: CosineTaperBeam, l_grid, m_grid, freqs_hz, path):

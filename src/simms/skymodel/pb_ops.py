@@ -29,14 +29,15 @@ def _observation(ms, field_id=0, spw_id=0):
     import dask
     from daskms import xds_from_ms, xds_from_table
 
-    from simms.skymodel.beams import array_lonlat, read_pointing_centre
+    from simms.skymodel.beams import array_lonlat, is_altaz_mount, read_pointing_centre
 
     ant = xds_from_table(f"{ms}::ANTENNA")[0]
     spw = xds_from_table(f"{ms}::SPECTRAL_WINDOW")[0]
     field = xds_from_table(f"{ms}::FIELD")[0]
     msds = xds_from_ms(ms, group_cols=["DATA_DESC_ID"], taql_where=f"FIELD_ID=={int(field_id)}")[int(spw_id)]
-    pos, t0, t1, interval, chan_freq, phase_dir = dask.compute(
+    pos, mount, t0, t1, interval, chan_freq, phase_dir = dask.compute(
         ant.POSITION.data,
+        ant.MOUNT.data,
         msds.TIME.data.min(),
         msds.TIME.data.max(),
         msds.INTERVAL.data[0],
@@ -44,6 +45,18 @@ def _observation(ms, field_id=0, spw_id=0):
         field.PHASE_DIR.data[int(field_id)],
     )
     lon, lat = array_lonlat(pos)
+    # One representative beam is applied to the whole array here, so one mount decides
+    # whether it rotates. Take the first antenna's, as resolve_antenna_beams does per type,
+    # and say so when the array is actually mixed rather than deciding silently.
+    mounts = [str(m) for m in np.asarray(mount).astype(str)]
+    is_altaz = is_altaz_mount(mounts[0]) if mounts else True
+    if len({is_altaz_mount(m) for m in mounts}) > 1:
+        log.warning(
+            "ANTENNA.MOUNT mixes rotating and non-rotating mounts; treating the array as "
+            "%s after the first antenna (%r).",
+            "ALT-AZ" if is_altaz else "non-rotating",
+            mounts[0],
+        )
     # Beam centre is the antenna pointing centre, not the phase centre. POINTING carries no
     # FIELD_ID, so the selected rows' TIME span is what picks this field's pointing.
     ra0, dec0 = read_pointing_centre(
@@ -57,6 +70,7 @@ def _observation(ms, field_id=0, spw_id=0):
         "freqs": np.asarray(chan_freq, dtype=np.float64),
         "ra0": ra0,
         "dec0": dec0,
+        "is_altaz": is_altaz,
     }
 
 
@@ -65,7 +79,7 @@ def _averaged_beam(provider, ell, emm, ra0, dec0, obs, pa_step):
     from simms.skymodel.beams import averaged_power_beam, pa_sample_grid
 
     _, chi_grid = pa_sample_grid(obs["t_start"], obs["duration"], ra0, dec0, obs["lon"], obs["lat"], pa_step)
-    return averaged_power_beam(provider, ell, emm, obs["freqs"], chi_grid)
+    return averaged_power_beam(provider, obs["is_altaz"], ell, emm, obs["freqs"], chi_grid)
 
 
 def _angular_separation(ra1, dec1, ra2, dec2):
