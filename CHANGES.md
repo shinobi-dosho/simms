@@ -1,5 +1,56 @@
 ### 3.0.1 -> unreleased
 
+- `skysim`: add YAML-driven RIME Jones corruptions via `--corruptions`. Terms are
+  described with arbitrary labels, axes (`time` and/or `frequency`), diagonal or
+  full 2x2 Jones matrices, and sinusoidal amplitudes/periods. Periods accept
+  raw numbers (seconds/Hz) or `astropy`-compatible strings such as `"2min"` and
+  `"2MHz"`. The per-baseline corruption is `V' = J_p V J_q^H`, with terms
+  multiplied in the order listed. Full (non-diagonal) terms require a
+  4-correlation MS. `type` selects the Jones form -- `scalar` (`g I`), `diagonal`
+  (`diag(g_x, g_y)`, independent per-feed gains, needs at least 2 correlations)
+  or `full` (dense 2x2, needs 4) -- and omitting it gives `diagonal`, falling
+  back to `scalar` only on a 1-correlation MS. Leakage is never implied. The boolean
+  `diagonal: true/false` is deprecated in favour of `type: scalar/full`; it
+  warns and still works, and never meant the new `diagonal` form. Corruptions are applied to
+  the model before thermal noise is added (`V' = J_p V J_q^H + n`), so `--sefd`
+  noise is not gain-modulated. Phase references and the gain array size are taken
+  once over the whole selection rather than per dask block, so a corruption is
+  invariant under row and channel chunking; note the references are per field
+  and per SPW. `skysim` therefore passes MS-wide references -- the earliest time,
+  the lowest frequency across all SPWs, and the `ANTENNA` table's row count -- so
+  separate `--field-id`/`--spw-id` runs over one MS give the same antenna the
+  same gain. Gains are evaluated per row rather than as
+  an `(nant, nrow, nchan)` cube that was then indexed down to two slices, so
+  peak memory no longer scales with the size of the array: a 64-antenna,
+  1024-channel MS needed ~9.8 GiB per block (~39 GiB for full Jones) at the
+  default `--row-chunks`, which made `--corruptions` unusable on a real MS.
+- `skysim`: the corruption time/frequency phase references now span every
+  `SPECTRAL_WINDOW` dataset, not just the first, so an MS whose SPWs differ in
+  channel count no longer references only part of its bandwidth. The deprecated
+  `diagonal:` spelling now warns once per term when the spec is loaded rather
+  than on every internal type resolution.
+- `skysim`: a corruption `spec` entry that `gains.terms` does not list is no
+  longer required to fit the MS, so one file can hold a library of terms and
+  `terms` select among them; an unused `full` entry no longer aborts a
+  scalar-only run on a 2-correlation MS. Structural validity (axes, period,
+  amplitude, type declaration) is still required of every entry, listed or not.
+- `skysim`: `diagonal` and `full` corruption terms now check
+  `POLARIZATION.CORR_TYPE` and require a standard linear (`XX..YY`) or circular
+  (`RR..LL`) ordering, as the primary-beam path already did; they map
+  correlation index onto feed index by position, so a non-standard ordering
+  silently assigned the wrong feed. `scalar` terms are unaffected.
+- `skysim`: a `--corruptions` spec that would corrupt nothing is now an error
+  rather than a silent no-op: an empty file, one with no top-level `gains` block
+  (a misspelled key used to load as an empty spec), an empty `gains.terms` list,
+  or a spec where every listed term has `amplitude: 0`. A single zero-amplitude
+  term alongside a real one is still the identity and remains valid. A missing
+  `label` or a misspelled term key now raises the same `RuntimeError` as the
+  rest of the loader, naming the file and the term, instead of a bare
+  `TypeError` from the dataclass.
+- `skysim`: deprecate `--seed` in favour of `--seed-noise` (the same value gives
+  the same noise realisation; a deprecation warning is emitted). Corruption
+  terms draw from their own `--seed-gains`, so adding corruptions cannot change
+  the noise realisation.
 - `skysim`: `--row-chunks` is now an upper bound rather than a fixed chunk size.
   A fixed size tied the task count to the length of the MS, so a short track
   produced fewer chunks than workers and left most of them idle (76608 rows at

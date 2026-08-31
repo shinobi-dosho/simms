@@ -108,8 +108,123 @@ Thermal noise
 
     $ simms skysim --ascii-sky skymodel.txt --column SIMULATED_DATA --sefd 421 visdata.ms
 
-Provide either ``--sefd`` (System Equivalent Flux Density, in Jy) or
-``--tsys-over-eta`` (:math:`T_\mathrm{sys}/\eta`).
+``--sefd`` is the System Equivalent Flux Density, in Jy.  (``telsim`` also
+accepts ``--tsys-over-eta``, :math:`T_\mathrm{sys}/\eta`, and derives an SEFD
+from it when building the MS; ``skysim`` takes the SEFD directly.)
+
+Use ``--seed-noise`` to make the noise realisation reproducible at a given
+chunking. (``--seed`` is the deprecated pre-3.1 name for the same option.)
+
+Corruptions
+-----------
+
+``skysim`` can apply RIME Jones corruptions to the predicted visibilities from
+a YAML specification:
+
+.. code-block:: console
+
+    $ simms skysim --ascii-sky skymodel.txt --column DATA \
+        --corruptions corruptions.yaml --seed-gains 42 visdata.ms
+
+The file describes an ordered list of terms and a specification for each one:
+
+.. code-block:: yaml
+
+    gains:
+      terms: [G, B]
+      spec:
+        - label: G
+          type: scalar
+          complex: true
+          axes: [time]
+          period:
+            time: "2min"
+          amplitude: 0.1
+        - label: B
+          type: scalar
+          complex: true
+          axes: [frequency]
+          period:
+            frequency: "8MHz"
+          amplitude: 0.05
+
+Term labels are arbitrary strings. ``terms`` gives the multiplication order;
+the per-baseline corruption is :math:`V'_{pq} = J_p(t,f) \, V_{pq}(t,f) \,
+J_q(t,f)^H`.
+
+``type`` selects the Jones form:
+
+``scalar``
+    :math:`g I` -- one gain per antenna, both polarisations identical.
+``diagonal``
+    :math:`\mathrm{diag}(g_x, g_y)` -- independent per-feed gains with no
+    leakage.  Needs at least 2 correlations; on a 4-correlation MS the
+    cross-hands mix feeds, so XY sees :math:`g_x` on antenna p and
+    :math:`g_y` on antenna q.
+``full``
+    a dense 2x2 Jones with leakage.  Requires a 4-correlation MS.
+
+Leaving ``type`` out gives ``diagonal``, falling back to ``scalar`` only on a
+single-correlation MS, which has no second feed to give its own gain.  Leakage
+is never implied -- ``full`` has to be asked for.  An explicit type the MS
+cannot carry is an error rather than a silent downgrade.
+
+``diagonal: true``/``false`` is the deprecated boolean spelling of ``scalar``
+and ``full``; it warns and still works.  Note it never meant the ``diagonal``
+type -- that form was previously unreachable.
+
+``complex: true`` uses a complex sinusoid, ``false`` a real cosine.
+
+``axes`` selects which dimensions vary (``time`` and/or ``frequency``).  ``period``
+is a mapping from axis name to value; values can be raw numbers (seconds for
+``time``, Hz for ``frequency``) or ``astropy`` strings such as ``"2min"`` or
+``"2MHz"``.  A scalar ``period`` is accepted as shorthand when a term has a
+single axis.
+
+.. note::
+
+   A bare ``8.0e6`` is a *string* in YAML, not a float -- YAML wants an explicit
+   exponent sign (``8.0e+6``).  A period that parses as a unitless string is
+   rejected with "not convertible"; write ``8000000``, ``8.0e+6`` or ``"8MHz"``.
+
+The random per-antenna phases (and matrices, for full terms) draw from
+``--seed-gains``; omitting it gives a deterministic per-label draw. Corruptions
+never touch the thermal-noise stream, which is seeded separately by
+``--seed-noise``.
+
+``diagonal`` and ``full`` terms map correlation index onto feed index by
+position, so they need the MS's ``POLARIZATION.CORR_TYPE`` in a standard linear
+(``XX..YY``) or circular (``RR..LL``) order, and ``skysim`` refuses anything
+else rather than assign the wrong feed.  ``scalar`` terms reach every
+correlation alike and impose no such requirement.
+
+``terms`` is normally a list, but a plain string is accepted as shorthand and
+split on commas and whitespace, so ``terms: "G, B"`` and ``terms: [G, B]`` mean
+the same thing.
+
+``terms`` selects from ``spec``, so one file can hold a library of terms and
+enable a subset.  Every entry is checked for structural validity -- axes,
+period, amplitude, and the type declaration -- whether it is listed or not, so a
+typo in a term you have not enabled yet still fails now.  Whether a term's Jones
+form fits *this* MS is checked only for the terms you list, so an unused
+``full`` entry does not veto a scalar-only run on a 2-correlation MS.
+
+A spec that would corrupt nothing is rejected rather than run: an empty file,
+one with no top-level ``gains`` block, an empty ``terms`` list, or every listed
+term at ``amplitude: 0``.  A single zero-amplitude term beside a real one is
+the identity and stays valid.
+
+Phases are referenced to the earliest time and lowest frequency in the *MS*,
+and gains are sized from the ``ANTENNA`` table, not from the rows a given run
+happens to select.  Separate ``--field-id`` or ``--spw-id`` runs over one MS
+therefore give the same antenna the same gain, and the result does not depend
+on dask chunk boundaries.
+
+Gains corrupt the sky signal only.  Receiver noise enters the signal chain
+after the antenna gains, so a noisy run computes :math:`V'_{pq} = J_p V_{pq}
+J_q^H + n_{pq}`: ``--sefd`` noise is added after the corruptions and is not
+gain-modulated.  A noise-only run (``--sefd`` with no sky model) therefore has
+nothing for ``--corruptions`` to act on, and warns.
 
 Chunking large MSs
 -------------------

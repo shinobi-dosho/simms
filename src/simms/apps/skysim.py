@@ -18,6 +18,7 @@ from tqdm.dask import TqdmCallback
 from simms import BIN, SCHEMADIR, set_logger
 from simms.skymodel.ascii_skies import ASCIISkymodel
 from simms.skymodel.beams import load_beam_config, resolve_antenna_beams
+from simms.skymodel.corruptions import apply_corruptions, load_corruption_spec, needs_feed_basis, validate_spec
 from simms.skymodel.fits_skies import component_sky_from_fits_dft, predict_fits_channel_block, prepare_fits_sky
 from simms.skymodel.mstools import (
     attach_beam,
@@ -50,15 +51,19 @@ def _array_lonlat(positions):
     return loc.lon.to_value(u.rad), loc.lat.to_value(u.rad)
 
 
-def _corr_basis(codes):
-    """'linear' or 'circular' from POLARIZATION.CORR_TYPE codes; raise on anything else."""
+def _corr_basis(codes, what="Primary beam"):
+    """'linear' or 'circular' from POLARIZATION.CORR_TYPE codes; raise on anything else.
+
+    ``what`` names the caller in the error, since more than one path depends on
+    the correlations being in a standard order.
+    """
     codes = list(codes)
     if codes in ([9, 12], [9, 10, 11, 12]):  # XX(9) XY(10) YX(11) YY(12)
         return "linear"
     if codes in ([5, 8], [5, 6, 7, 8]):  # RR(5) RL(6) LR(7) LL(8)
         return "circular"
     raise RuntimeError(
-        f"Primary beam needs standard linear (XX..YY) or circular (RR..LL) correlations; got CORR_TYPE codes {codes}."
+        f"{what} needs standard linear (XX..YY) or circular (RR..LL) correlations; got CORR_TYPE codes {codes}."
     )
 
 
@@ -231,6 +236,14 @@ class _BeamContext:
 def runit(opts):
     # Set logger here, so subsequent modeules get it via logging.getLogger(<name>)
     set_logger(BIN.skysim, opts.log_level)
+
+    # --seed only ever seeded the thermal noise, so it maps onto --seed-noise.
+    seed_noise = opts.seed_noise
+    if opts.seed is not None:
+        log.warning("--seed is deprecated; use --seed-noise (the realisation for a given value is unchanged).")
+        if seed_noise is None:
+            seed_noise = opts.seed
+
     ms = opts.ms
     ascii_sky = opts.ascii_sky
     fs = opts.fits_sky
@@ -522,7 +535,57 @@ def runit(opts):
                 concatenate=True,
             )
 
-    # Thermal noise, added once for every path. With --seed the draw is
+    # Corruptions go on the model, before the noise. Receiver noise enters the
+    # signal chain after the antenna gains, so a noisy RIME is
+    # V' = J_p V J_q^H + n -- corrupting the sum would gain-modulate the noise.
+    if opts.corruptions:
+        # Loaded and validated even when there is nothing to corrupt: a malformed
+        # spec must fail here rather than let a noise-only run write a clean
+        # column that looks like it was corrupted.
+        spec = load_corruption_spec(opts.corruptions)
+        validate_spec(spec, ncorr=ncorr)
+        if needs_feed_basis(spec, ncorr):
+            # diagonal/full terms map correlation index to feed index by
+            # position, so they need the correlations in a standard order. A
+            # scalar gain reaches every correlation alike and does not.
+            corr_type = xds_from_table(f"{ms}::POLARIZATION")[0].CORR_TYPE.data[0].compute()
+            _corr_basis(list(np.asarray(corr_type).ravel()), what="Non-scalar RIME corruptions")
+
+        if simvis is None:
+            if vis_noise:
+                log.warning(
+                    "--corruptions has no effect on a noise-only run: gains apply to the sky signal, "
+                    "and thermal noise is added after the gain chain."
+                )
+        else:
+            # Phase origins and array size come from the MS, not from this
+            # field/SPW selection: skysim runs one field and one SPW at a time,
+            # so selection-derived references would give the same antenna a
+            # different gain in each run over the same MS.
+            ant_ds = xds_from_table(f"{ms}::ANTENNA")[0]
+            ms_nant = ant_ds.sizes["row"]
+            # Every SPECTRAL_WINDOW dataset, not just the first: daskms splits
+            # the subtable into one dataset per distinct channel count, so an MS
+            # whose SPWs differ in width would otherwise reference only some of
+            # its bandwidth.
+            spw_dss = xds_from_table(f"{ms}::SPECTRAL_WINDOW")
+            ms_freq0 = float(min(dask.compute(*[sds.CHAN_FREQ.data.min() for sds in spw_dss])))
+            ms_t0 = float(xds_from_ms(ms, columns=["TIME"], group_cols=[])[0].TIME.data.min().compute())
+
+            simvis = apply_corruptions(
+                simvis,
+                msds.TIME.data,
+                msds.ANTENNA1.data,
+                msds.ANTENNA2.data,
+                freqs,
+                spec,
+                random_seed=opts.seed_gains,
+                nant=ms_nant,
+                time_ref=ms_t0,
+                freq_ref=ms_freq0,
+            )
+
+    # Thermal noise, added once for every path. With --seed-noise the draw is
     # reproducible across runs at a given chunking; changing the chunking changes
     # the realisation, as dask keys each block's stream to its position in the grid.
     if vis_noise:
@@ -531,7 +594,7 @@ def runit(opts):
             (msds.UVW.data.chunks[0], chan_chunks, ncorr),
             vis_noise,
             vis_dtype,
-            seed=opts.seed,
+            seed=seed_noise,
         )
         simvis = noise if simvis is None else simvis + noise
 
@@ -710,11 +773,25 @@ def skysim(
     field_id: int = Field(0, description="Field ID.", json_schema_extra={"abbreviation": "fi"}),
     spw_id: int = Field(0, description="Spectral Window ID."),
     sefd: float | None = Field(None, description="Add noise using this SEFD value."),
-    seed: int | None = Field(
+    seed_noise: int | None = Field(
         None,
         description="Random seed for the thermal noise. Omit for a non-reproducible run. The "
         "realisation also depends on the row chunking, which --nworkers feeds into, so "
-        "reproducing a previous run needs the same --seed, --row-chunks and --nworkers.",
+        "reproducing a previous run needs the same --seed-noise, --row-chunks and --nworkers. "
+        "This is the renamed --seed; the same value gives the same noise.",
+    ),
+    seed_gains: int | None = Field(
+        None,
+        description="Random seed for the corruption terms' random phases/matrices. Omit for a "
+        "deterministic per-label draw; the thermal noise stream is unaffected either way.",
+    ),
+    seed: int | None = Field(
+        None,
+        description="Deprecated alias for --seed-noise; --seed-noise wins if both are given.",
+    ),
+    corruptions: str | None = Field(
+        None,
+        description="YAML file describing RIME Jones corruptions to apply to the predicted visibilities.",
     ),
     ascii_species: Literal["bdsf_gaul", "aegean", "wsclean"] | None = Field(
         None, description="Non-simms sky model type.", json_schema_extra={"abbreviation": "asp"}
