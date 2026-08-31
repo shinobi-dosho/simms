@@ -1194,3 +1194,27 @@ def test_pointing_row_ignores_time_range_without_a_time_column():
     it = InitTest()
     ms = _write_pointing_ms(it.random_named_directory(), 0.5, -0.7, "J2000")
     assert read_pointing_centre(ms, 1.0, 1.0, time_range=(0.0, 1.0)) == pytest.approx((0.5, -0.7))
+
+
+# --- out-of-band frequencies are clamped, and say so ------------------------------
+
+
+def test_beam_warns_once_outside_the_tabulated_band(caplog):
+    # np.interp clamps, so an L-band table asked for UHF frequencies returns L-band
+    # widths. That is the right value to return and the wrong thing to do silently.
+    beam = CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020")
+    lo = beam.freqs_mhz.min()
+    with caplog.at_level("WARNING", logger="skysim"):
+        beam.voltages(np.array([0.0]), np.array([0.0]), np.array([lo / 2]))
+        beam.voltages(np.array([0.0]), np.array([0.0]), np.array([lo / 3]))
+    warnings = [r for r in caplog.records if "tabulated over" in r.message]
+    assert len(warnings) == 1  # warn-once, not once per channel block
+    assert "MKAT-AA-L-JIM-2020" in warnings[0].message
+
+
+def test_beam_is_quiet_inside_the_band_and_on_its_edges(caplog):
+    beam = CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020")
+    lo, hi = beam.freqs_mhz.min(), beam.freqs_mhz.max()
+    with caplog.at_level("WARNING", logger="skysim"):
+        beam.voltages(np.array([0.0]), np.array([0.0]), np.array([lo, 0.5 * (lo + hi), hi]))
+    assert not [r for r in caplog.records if "tabulated over" in r.message]

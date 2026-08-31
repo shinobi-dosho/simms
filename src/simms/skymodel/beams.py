@@ -131,6 +131,7 @@ class CosineTaperBeam:
         if self.fwhm_deg.shape != (4, self.freqs_mhz.size):
             raise ValueError("fwhm_deg must have shape (4, nfreq)")
         self.name = name
+        self._warned_out_of_band = False
 
     # -- constructors -------------------------------------------------------
 
@@ -168,9 +169,40 @@ class CosineTaperBeam:
 
     # -- evaluation ---------------------------------------------------------
 
+    def _warn_out_of_band(self, freqs_mhz: np.ndarray) -> None:
+        """Warn once if ``freqs_mhz`` reaches outside the tabulated band.
+
+        :func:`numpy.interp` clamps rather than extrapolating, so a frequency past either
+        end silently returns the edge row's squint and FWHM -- an L-band-width beam on UHF
+        data, say, with nothing in the output to show for it. The clamp is the right
+        behaviour (extrapolating a fitted FWHM is worse); the silence is not.
+        """
+        if self._warned_out_of_band:
+            return
+        lo, hi = float(self.freqs_mhz.min()), float(self.freqs_mhz.max())
+        atol = 1e-6 * hi  # a channel sitting on the edge is not extrapolation
+        want_lo, want_hi = float(freqs_mhz.min()), float(freqs_mhz.max())
+        if want_lo < lo - atol or want_hi > hi + atol:
+            self._warned_out_of_band = True
+            log.warning(
+                "Beam model %r is tabulated over %.1f-%.1f MHz but is being evaluated over "
+                "%.1f-%.1f MHz; coefficients outside the table are held at its edge values, so "
+                "the beam width there is the edge width, not the true one. Use a beam table "
+                "covering this band (--beam-band, or a matching CSV).",
+                self.name or "<unnamed>",
+                lo,
+                hi,
+                want_lo,
+                want_hi,
+            )
+
     def _interp(self, freqs_mhz: np.ndarray):
-        """Linearly interpolate squint/FWHM to ``freqs_mhz`` -> two ``(4, nchan)`` arrays."""
+        """Linearly interpolate squint/FWHM to ``freqs_mhz`` -> two ``(4, nchan)`` arrays.
+
+        Clamped outside the tabulated band; :meth:`_warn_out_of_band` says so when it happens.
+        """
         freqs_mhz = np.atleast_1d(np.asarray(freqs_mhz, dtype=np.float64))
+        self._warn_out_of_band(freqs_mhz)
         squint = np.stack([np.interp(freqs_mhz, self.freqs_mhz, s) for s in self.squint_deg])
         fwhm = np.stack([np.interp(freqs_mhz, self.freqs_mhz, f) for f in self.fwhm_deg])
         return squint, fwhm
