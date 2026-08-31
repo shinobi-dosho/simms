@@ -1141,3 +1141,56 @@ def test_read_pointing_centre_warns_when_chain_reaches_phase_centre(caplog):
         centre = read_pointing_centre(ms, 1.0, 1.0)
     assert centre == pytest.approx((1.0, 1.0))
     assert any("phase centre as the beam centre" in r.message for r in caplog.records)
+
+
+# --- POINTING row selection by observed time span ---------------------------------
+
+
+def _write_timed_pointing_ms(base_dir, rows):
+    """A minimal MS whose ``POINTING`` table holds ``(time, ra, dec)`` rows, in order."""
+    from casacore.tables import makearrcoldesc, makescacoldesc, maketabdesc, table
+
+    ms = os.path.join(base_dir, "timed.ms")
+    pnt = os.path.join(ms, "POINTING")
+    mt = table(ms, maketabdesc([makearrcoldesc("DUMMY", 0.0)]), nrow=1, ack=False)
+    desc = maketabdesc([makearrcoldesc("DIRECTION", 0.0, ndim=2), makescacoldesc("TIME", 0.0)])
+    pt = table(pnt, desc, nrow=len(rows), ack=False)
+    for row, (t, ra, dec) in enumerate(rows):
+        pt.putcell("DIRECTION", row, np.array([[ra, dec]], dtype=float))
+        pt.putcell("TIME", row, float(t))
+    pt.putcolkeyword("DIRECTION", "MEASINFO", {"type": "direction", "Ref": "J2000"})
+    pt.flush()
+    pt.close()
+    mt.putkeyword("POINTING", f"Table: {pnt}")
+    mt.flush()
+    mt.close()
+    return ms
+
+
+def test_pointing_row_follows_the_selected_time_span():
+    # A two-field mosaic: field 0 at t=100, field 1 at t=200. Selecting the second
+    # field's rows must not return the first field's pointing (which is row 0).
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_timed_pointing_ms(it.random_named_directory(), [(100.0, 0.5, -0.7), (200.0, 0.8, -0.9)])
+    assert read_pointing_centre(ms, 1.0, 1.0, time_range=(190.0, 210.0)) == pytest.approx((0.8, -0.9))
+    assert read_pointing_centre(ms, 1.0, 1.0, time_range=(90.0, 110.0)) == pytest.approx((0.5, -0.7))
+    # No time range: the legacy first row.
+    assert read_pointing_centre(ms, 1.0, 1.0) == pytest.approx((0.5, -0.7))
+
+
+def test_pointing_row_falls_back_to_nearest_when_span_is_between_records():
+    # A POINTING cadence coarser than the field's dwell leaves no row strictly inside
+    # the span; the nearest record still beats row 0.
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_timed_pointing_ms(it.random_named_directory(), [(100.0, 0.5, -0.7), (200.0, 0.8, -0.9)])
+    assert read_pointing_centre(ms, 1.0, 1.0, time_range=(198.0, 199.0)) == pytest.approx((0.8, -0.9))
+
+
+def test_pointing_row_ignores_time_range_without_a_time_column():
+    # The POINTING tables older simms wrote have no TIME column; keep reading row 0.
+    pytest.importorskip("casacore")
+    it = InitTest()
+    ms = _write_pointing_ms(it.random_named_directory(), 0.5, -0.7, "J2000")
+    assert read_pointing_centre(ms, 1.0, 1.0, time_range=(0.0, 1.0)) == pytest.approx((0.5, -0.7))

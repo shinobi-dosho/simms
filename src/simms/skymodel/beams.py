@@ -1030,7 +1030,50 @@ def _read_direction(ms, subtable, column, row):
     return float(radec[0]), float(radec[1])
 
 
-def read_pointing_centre(ms, fallback_ra0, fallback_dec0, field_id=0):
+def _pointing_row_for_times(ms, time_range):
+    """Index of a ``POINTING`` row recorded while ``time_range`` was being observed.
+
+    ``POINTING`` is keyed by ``(ANTENNA_ID, TIME)`` and carries no ``FIELD_ID``, so the
+    only handle on which field a pointing belongs to is *when* it was recorded. Row 0 is
+    whichever field the MS observed first, which is the wrong beam centre for every other
+    field of a mosaic; ``time_range`` is the ``TIME`` span of the rows the run actually
+    selected, so a row inside it points where those rows were looking.
+
+    Falls back to the row nearest the span's midpoint when nothing lies strictly inside
+    (a ``POINTING`` cadence coarser than the field's dwell), and to row 0 when there is no
+    usable ``TIME`` column at all -- both strictly better than, or the same as, the
+    legacy unconditional row 0.
+    """
+    if time_range is None:
+        return 0
+    from daskms import xds_from_table
+
+    t0, t1 = (float(t) for t in time_range)
+    try:
+        ds = xds_from_table(f"{ms}::POINTING")[0]
+        if "TIME" not in ds:
+            raise ValueError("no TIME column")
+        times = np.asarray(ds.TIME.data.compute(), dtype=np.float64)
+    except Exception as exc:
+        log.debug("No usable POINTING.TIME (%s); reading the beam centre from row 0.", exc)
+        return 0
+    if times.size == 0:
+        return 0
+    within = np.nonzero((times >= t0) & (times <= t1))[0]
+    if within.size:
+        return int(within[0])
+    nearest = int(np.argmin(np.abs(times - 0.5 * (t0 + t1))))
+    log.debug(
+        "No POINTING row inside the selected time span [%.3f, %.3f]; using row %d at TIME %.3f.",
+        t0,
+        t1,
+        nearest,
+        times[nearest],
+    )
+    return nearest
+
+
+def read_pointing_centre(ms, fallback_ra0, fallback_dec0, field_id=0, time_range=None):
     """Antenna pointing centre (radians), tried in order of how faithfully it records the pointing.
 
     This is where the dishes point, and hence where the primary beam is centred -- distinct
@@ -1045,6 +1088,12 @@ def read_pointing_centre(ms, fallback_ra0, fallback_dec0, field_id=0):
     straight to the phase centre centres the beam on the wrong place. Each candidate is
     validated rather than blindly preferred -- an absent column or a non-finite value is
     skipped -- since some writers leave ``REFERENCE_DIR`` unpopulated.
+
+    ``POINTING`` has no ``FIELD_ID``, so ``field_id`` cannot select its row directly; pass
+    ``time_range`` (the ``TIME`` span of the rows the run selected) and the row is chosen
+    from that instead -- see :func:`_pointing_row_for_times`. Without it the first row is
+    read, which is the pointing of whichever field the MS observed first. The ``FIELD``
+    fallbacks are indexed by ``field_id`` directly.
 
     The direction is interpreted as a fixed sky position, which requires an equatorial measure
     frame. ``J2000``/``ICRS`` (and an absent keyword, as older simms MSs may have) take the
@@ -1062,7 +1111,7 @@ def read_pointing_centre(ms, fallback_ra0, fallback_dec0, field_id=0):
             f"a J2000/ICRS POINTING table or a target-tracking MS."
         )
     _warn_nonstandard_frame(frame, "POINTING.DIRECTION")
-    centre = _read_direction(ms, "POINTING", "DIRECTION", 0)
+    centre = _read_direction(ms, "POINTING", "DIRECTION", _pointing_row_for_times(ms, time_range))
     if centre is not None:
         return centre
 

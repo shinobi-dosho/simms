@@ -44,8 +44,11 @@ def _observation(ms, field_id=0, spw_id=0):
         field.PHASE_DIR.data[int(field_id)],
     )
     lon, lat = array_lonlat(pos)
-    # Beam centre is the antenna pointing centre, not the phase centre.
-    ra0, dec0 = read_pointing_centre(ms, phase_dir[0][0], phase_dir[0][1], int(field_id))
+    # Beam centre is the antenna pointing centre, not the phase centre. POINTING carries no
+    # FIELD_ID, so the selected rows' TIME span is what picks this field's pointing.
+    ra0, dec0 = read_pointing_centre(
+        ms, phase_dir[0][0], phase_dir[0][1], int(field_id), time_range=(float(t0), float(t1))
+    )
     return {
         "t_start": float(t0),
         "duration": float(t1 - t0) + float(interval),
