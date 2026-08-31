@@ -626,14 +626,56 @@ def load_beam_config(path) -> dict:
     return load_yaml(path)
 
 
+# ``ANTENNA.MOUNT`` values naming a mount that rotates the beam with parallactic angle.
+# MSv2 spells it "alt-az", but writers in the wild use these variants interchangeably.
+ALTAZ_MOUNTS = frozenset({"ALT-AZ", "ALTAZ", "AZ-EL", "AZEL"})
+
+# Mounts that hold the feed frame still against the sky's rotation. Listed not because
+# anything branches on them, but so an unrecognised value can be told apart from a
+# deliberate one and reported -- the whole failure mode here is silence.
+FIXED_MOUNTS = frozenset({"EQUATORIAL", "X-Y", "XY", "ORBITING", "SPACE-HALCA", "BIZARRE"})
+
+
+def _normalise_mount(mount: str) -> str:
+    """An ``ANTENNA.MOUNT`` value reduced to the mount name alone, upper-cased.
+
+    Trailing focus designations ("ALT-AZ+NASMYTH-R", as ALMA writes) name where the
+    receiver sits, not how the mount moves, so they are dropped before the comparison.
+    """
+    return str(mount).strip().upper().split("+")[0].strip()
+
+
 def is_altaz_mount(mount: str) -> bool:
     """Whether an ``ANTENNA.MOUNT`` value names a mount that rotates the beam on the sky.
 
     An alt-az dish carries the sky's parallactic rotation into the feed frame; an
     equatorial one does not. Single definition, so every path that has to make this call
     -- the DFT grid, the a-terms, and the standalone ``primary-beam`` tool -- agrees.
+
+    Matched against :data:`ALTAZ_MOUNTS` by name rather than by substring: a substring
+    test quietly answers False for every spelling it does not contain, and False is the
+    answer that produces a beam frozen on the sky with nothing to show for it. Anything
+    unrecognised still lands on False -- there is no safe guess -- but
+    :func:`warn_unknown_mounts` makes that visible at the point the array is resolved.
     """
-    return "ALT-AZ" in str(mount).upper()
+    return _normalise_mount(mount) in ALTAZ_MOUNTS
+
+
+def warn_unknown_mounts(mounts) -> None:
+    """Warn about ``ANTENNA.MOUNT`` values that name neither a known rotating nor fixed mount.
+
+    Such a value is treated as non-rotating, which for an alt-az array spelled some way
+    this does not know about means the beam silently never rotates. Called once where an
+    array is resolved, not per antenna, so a whole table costs one message.
+    """
+    unknown = sorted({str(m) for m in mounts if _normalise_mount(m) not in ALTAZ_MOUNTS | FIXED_MOUNTS})
+    if unknown:
+        log.warning(
+            "Unrecognised ANTENNA.MOUNT value(s) %s; treating those antennas as non-rotating, "
+            "so their beam will not follow the parallactic angle. Known rotating mounts are %s.",
+            unknown,
+            sorted(ALTAZ_MOUNTS),
+        )
 
 
 def resolve_antenna_beams(telescope_names, mount, beam_config, beam_band: str = "L"):
@@ -661,6 +703,7 @@ def resolve_antenna_beams(telescope_names, mount, beam_config, beam_band: str = 
     """
     telescope_names = [str(t) for t in np.asarray(telescope_names).astype(str)]
     mount = [str(m) for m in np.asarray(mount).astype(str)]
+    warn_unknown_mounts(mount)
     labels = list(dict.fromkeys(telescope_names))  # unique, insertion-ordered
 
     providers = []
@@ -761,6 +804,7 @@ def resolve_cattery_antenna_beams(
 
     antenna_names = [str(a) for a in np.asarray(antenna_names).astype(str)]
     mount = [str(m) for m in np.asarray(mount).astype(str)]
+    warn_unknown_mounts(mount)
 
     exact, regexes, default = {}, [], None
     for matcher, is_regex, stype in cattery_cfg["stationtypes"]:

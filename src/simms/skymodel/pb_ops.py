@@ -29,7 +29,7 @@ def _observation(ms, field_id=0, spw_id=0):
     import dask
     from daskms import xds_from_ms, xds_from_table
 
-    from simms.skymodel.beams import array_lonlat, is_altaz_mount, read_pointing_centre
+    from simms.skymodel.beams import array_lonlat, is_altaz_mount, read_pointing_centre, warn_unknown_mounts
 
     ant = xds_from_table(f"{ms}::ANTENNA")[0]
     spw = xds_from_table(f"{ms}::SPECTRAL_WINDOW")[0]
@@ -49,6 +49,7 @@ def _observation(ms, field_id=0, spw_id=0):
     # whether it rotates. Take the first antenna's, as resolve_antenna_beams does per type,
     # and say so when the array is actually mixed rather than deciding silently.
     mounts = [str(m) for m in np.asarray(mount).astype(str)]
+    warn_unknown_mounts(mounts)
     is_altaz = is_altaz_mount(mounts[0]) if mounts else True
     if len({is_altaz_mount(m) for m in mounts}) > 1:
         log.warning(

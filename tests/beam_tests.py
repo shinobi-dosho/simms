@@ -1260,3 +1260,53 @@ def test_image_power_beam_handles_no_points():
     provider = JimBeamProvider(CosineTaperBeam.from_builtin("MKAT-AA-L-JIM-2020"))
     power = image_power_beam(provider, True, np.array([]), np.array([]), np.array([1.4e9]), np.zeros(2))
     assert power.shape == (0, 1)
+
+
+# --- ANTENNA.MOUNT is matched by name, not by substring ---------------------------
+
+
+@pytest.mark.parametrize(
+    "mount",
+    ["ALT-AZ", "alt-az", "ALTAZ", "AzEl", "AZ-EL", " ALT-AZ ", "ALT-AZ+NASMYTH-R", "ALT-AZ+NASMYTH-L"],
+)
+def test_mount_spellings_that_rotate(mount):
+    # The substring test this replaced answered False for ALTAZ and AZEL, freezing the
+    # beam on the sky with nothing in the log to say so.
+    from simms.skymodel.beams import is_altaz_mount
+
+    assert is_altaz_mount(mount)
+
+
+@pytest.mark.parametrize("mount", ["EQUATORIAL", "equatorial", "X-Y", "ORBITING", "SPACE-HALCA", "BIZARRE", ""])
+def test_mount_spellings_that_do_not_rotate(mount):
+    from simms.skymodel.beams import is_altaz_mount
+
+    assert not is_altaz_mount(mount)
+
+
+def test_unknown_mount_is_reported_not_swallowed(caplog):
+    from simms.skymodel.beams import is_altaz_mount, warn_unknown_mounts
+
+    assert not is_altaz_mount("SOMETHING-ELSE")  # no safe guess, but it must not be silent
+    with caplog.at_level("WARNING", logger="skysim"):
+        warn_unknown_mounts(["ALT-AZ", "SOMETHING-ELSE", "EQUATORIAL", "SOMETHING-ELSE"])
+    messages = [r.message for r in caplog.records if "Unrecognised ANTENNA.MOUNT" in r.message]
+    assert len(messages) == 1  # one message per table, listing each distinct value once
+    assert "SOMETHING-ELSE" in messages[0]
+
+
+def test_known_mounts_are_quiet(caplog):
+    from simms.skymodel.beams import warn_unknown_mounts
+
+    with caplog.at_level("WARNING", logger="skysim"):
+        warn_unknown_mounts(["ALT-AZ+NASMYTH-L", "ALTAZ", "EQUATORIAL", "X-Y"])
+    assert not [r for r in caplog.records if "Unrecognised ANTENNA.MOUNT" in r.message]
+
+
+def test_altaz_spelling_reaches_the_beam_grid(caplog):
+    # End to end through the resolver: an ALTAZ-spelled array must come out rotating.
+    config = {"MKAT-MA": {"jimbeam": "L"}}
+    with caplog.at_level("WARNING", logger="skysim"):
+        _, _, is_altaz = resolve_antenna_beams(["MKAT-MA", "MKAT-MA"], ["ALTAZ", "ALTAZ"], config, "L")
+    assert is_altaz.tolist() == [True]
+    assert not [r for r in caplog.records if "Unrecognised ANTENNA.MOUNT" in r.message]
