@@ -82,7 +82,9 @@ term: `axes` (`time` and/or `frequency`), `type`, `complex`, `amplitude`, and `p
 error, not a downgrade. The boolean
 `diagonal: true/false` is deprecated and maps to `scalar`/`full` (it never meant the `diagonal`
 type).
-Periods are in seconds/Hz or `astropy`-compatible strings (e.g. `"2min"`, `"2MHz"`). The
+Periods are in seconds/Hz or `astropy`-compatible strings (e.g. `"2min"`, `"2MHz"`); note a
+bare `8.0e6` is a YAML *string*, not a float. `terms` accepts a list or a comma/space-separated
+string. The
 per-baseline corruption is `V' = J_p V J_q^H`, with terms multiplied left-to-right in the order
 given. Validation is split: every `spec` entry must be structurally valid (axes, period,
 amplitude, type declaration), but only entries listed in `terms` must fit the MS -- so `spec`

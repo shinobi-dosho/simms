@@ -181,6 +181,12 @@ is a mapping from axis name to value; values can be raw numbers (seconds for
 ``"2MHz"``.  A scalar ``period`` is accepted as shorthand when a term has a
 single axis.
 
+.. note::
+
+   A bare ``8.0e6`` is a *string* in YAML, not a float -- YAML wants an explicit
+   exponent sign (``8.0e+6``).  A period that parses as a unitless string is
+   rejected with "not convertible"; write ``8000000``, ``8.0e+6`` or ``"8MHz"``.
+
 The random per-antenna phases (and matrices, for full terms) draw from
 ``--seed-gains``; omitting it gives a deterministic per-label draw. Corruptions
 never touch the thermal-noise stream, which is seeded separately by
@@ -191,6 +197,10 @@ position, so they need the MS's ``POLARIZATION.CORR_TYPE`` in a standard linear
 (``XX..YY``) or circular (``RR..LL``) order, and ``skysim`` refuses anything
 else rather than assign the wrong feed.  ``scalar`` terms reach every
 correlation alike and impose no such requirement.
+
+``terms`` is normally a list, but a plain string is accepted as shorthand and
+split on commas and whitespace, so ``terms: "G, B"`` and ``terms: [G, B]`` mean
+the same thing.
 
 ``terms`` selects from ``spec``, so one file can hold a library of terms and
 enable a subset.  Every entry is checked for structural validity -- axes,

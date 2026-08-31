@@ -24,6 +24,11 @@
   peak memory no longer scales with the size of the array: a 64-antenna,
   1024-channel MS needed ~9.8 GiB per block (~39 GiB for full Jones) at the
   default `--row-chunks`, which made `--corruptions` unusable on a real MS.
+- `skysim`: the corruption time/frequency phase references now span every
+  `SPECTRAL_WINDOW` dataset, not just the first, so an MS whose SPWs differ in
+  channel count no longer references only part of its bandwidth. The deprecated
+  `diagonal:` spelling now warns once per term when the spec is loaded rather
+  than on every internal type resolution.
 - `skysim`: a corruption `spec` entry that `gains.terms` does not list is no
   longer required to fit the MS, so one file can hold a library of terms and
   `terms` select among them; an unused `full` entry no longer aborts a

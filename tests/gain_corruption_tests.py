@@ -1518,3 +1518,122 @@ gains:
     )
     skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path, seed_gains=1))
     assert np.all(np.isfinite(read_column(gt2.ms, "DATA")))
+
+
+def test_real_cosine_term_matches_reference(gt2):
+    """`complex: false` uses a real cosine, not a complex exponential."""
+    period, amplitude, seed = 120.0, 0.1, 7
+    yaml_path = gt2.write_yaml(
+        f"""
+gains:
+  terms: [G]
+  spec:
+    - label: G
+      type: scalar
+      complex: false
+      axes: [time]
+      period:
+        time: {period}
+      amplitude: {amplitude}
+"""
+    )
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA"))
+    clean = read_column(gt2.ms, "DATA")
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path, seed_gains=seed))
+    corrupted = read_column(gt2.ms, "DATA")
+
+    from simms.skymodel.corruptions import _stable_label_hash
+
+    time, ant1, ant2 = read_aux(gt2.ms)
+    nant = read_nant(gt2.ms)
+    phases = np.random.default_rng(seed + _stable_label_hash("G")).random((nant, 1))[:, 0]
+    t0 = float(time.min())
+
+    def gain(ant):
+        return 1.0 + amplitude * np.cos(2.0 * np.pi * ((time - t0) / period + phases[ant]))
+
+    # A real gain: the baseline factor g_p * conj(g_q) is real, so a corrupted
+    # visibility keeps the clean one's phase exactly.
+    expected = (gain(ant1) * gain(ant2)).astype(corrupted.dtype)
+    np.testing.assert_allclose(corrupted[:, 0, 0] / clean[:, 0, 0], expected, rtol=1e-6, atol=1e-7)
+    assert np.allclose(np.angle(corrupted[:, 0, 0]), np.angle(clean[:, 0, 0]), atol=1e-6)
+
+
+def test_real_full_term_draws_a_real_matrix():
+    """`complex: false` on a full term takes the real matrix branch."""
+    from simms.skymodel.corruptions import _build_all_term_params
+
+    spec = CorruptionSpec(
+        terms=["F"],
+        spec=[TermSpec(label="F", type="full", complex=False, axes=["time"], period=150.0, amplitude=0.2)],
+    )
+    params = _build_all_term_params(spec, nant=4, random_seed=2, ncorr=4)
+    matrix = params[0]["matrix"]
+    assert np.allclose(matrix.imag, 0.0), "complex: false must not draw a complex matrix"
+    assert np.any(matrix.real < 0), "the real draw spans [-1, 1), not [0, 1)"
+
+    vis, time, freqs, ant1, ant2, nant = _mixed_case()
+    got = _run_spec(spec, vis, time, freqs, ant1, ant2, nant, seed=2)
+    want = reference_corrupted(spec, vis, time, freqs, ant1, ant2, nant, 2)
+    np.testing.assert_allclose(got, want, rtol=1e-11, atol=1e-13)
+
+
+def test_terms_accepts_a_comma_separated_string(gt2):
+    """Documented shorthand: `terms: "G, B"` is the same as `terms: [G, B]`."""
+    body = """
+  spec:
+    - label: G
+      type: scalar
+      axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.1
+    - label: B
+      type: scalar
+      axes: [frequency]
+      period:
+        frequency: 8000000.0
+      amplitude: 0.05
+"""
+    as_string = gt2.write_yaml(f'gains:\n  terms: "G, B"{body}')
+    as_list = gt2.write_yaml(f"gains:\n  terms: [G, B]{body}")
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=as_string, seed_gains=5))
+    from_string = read_column(gt2.ms, "DATA")
+
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=as_list, seed_gains=5))
+    from_list = read_column(gt2.ms, "DATA")
+
+    np.testing.assert_array_equal(from_string, from_list)
+
+
+def test_deprecated_diagonal_warns_once_per_term(gt2):
+    """resolve_type is called per term by both validate_spec and the param
+    builder, so warning there repeated it on every run."""
+    yaml_path = gt2.write_yaml(_explicit_diagonal_yaml("true"))
+
+    messages = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    handler = _Capture(level=logging.WARNING)
+    skysim.log.addHandler(handler)
+    try:
+        skysim.runit(
+            skysim_opts(
+                gt2.ms,
+                ascii_sky=gt2.sky,
+                column="DATA",
+                corruptions=yaml_path,
+                seed_gains=1,
+                log_level="WARNING",
+            )
+        )
+    finally:
+        skysim.log.removeHandler(handler)
+
+    deprecations = [m for m in messages if "is deprecated; use 'type:" in m]
+    assert len(deprecations) == 1, deprecations

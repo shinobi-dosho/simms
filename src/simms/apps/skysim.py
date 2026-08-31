@@ -564,8 +564,12 @@ def runit(opts):
             # different gain in each run over the same MS.
             ant_ds = xds_from_table(f"{ms}::ANTENNA")[0]
             ms_nant = ant_ds.sizes["row"]
-            all_freqs = xds_from_table(f"{ms}::SPECTRAL_WINDOW")[0].CHAN_FREQ.data
-            ms_freq0 = float(all_freqs.min().compute())
+            # Every SPECTRAL_WINDOW dataset, not just the first: daskms splits
+            # the subtable into one dataset per distinct channel count, so an MS
+            # whose SPWs differ in width would otherwise reference only some of
+            # its bandwidth.
+            spw_dss = xds_from_table(f"{ms}::SPECTRAL_WINDOW")
+            ms_freq0 = float(min(dask.compute(*[sds.CHAN_FREQ.data.min() for sds in spw_dss])))
             ms_t0 = float(xds_from_ms(ms, columns=["TIME"], group_cols=[])[0].TIME.data.min().compute())
 
             simvis = apply_corruptions(

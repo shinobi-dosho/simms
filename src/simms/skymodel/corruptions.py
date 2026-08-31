@@ -116,6 +116,10 @@ def load_corruption_spec(path: str) -> CorruptionSpec:
     Everything hangs off a top-level ``gains`` block. A file without one used to
     load as an empty spec, so a misspelled key -- or the wrong file entirely --
     ran to completion having corrupted nothing.
+
+    ``gains.terms`` is normally a YAML list, but a plain string is accepted as
+    shorthand and split on commas and whitespace, so ``terms: "G, B"`` and
+    ``terms: [G, B]`` are the same thing.
     """
     with open(path) as fh:
         data = yaml.safe_load(fh)
@@ -149,6 +153,17 @@ def load_corruption_spec(path: str) -> CorruptionSpec:
             # say which entry it was.
             described = item.get("label", f"entry {index}")
             raise RuntimeError(f"Corruption spec '{path}', term '{described}': {exc}") from exc
+
+    for term in specs:
+        if term.diagonal is not None:
+            log.warning(
+                "Corruption term '%s': 'diagonal: %s' is deprecated; use 'type: %s'. Note the new "
+                "'diagonal' type is diag(g_x, g_y), which the boolean never meant.",
+                term.label,
+                str(bool(term.diagonal)).lower(),
+                "scalar" if term.diagonal else "full",
+            )
+
     return CorruptionSpec(terms=terms, spec=specs)
 
 
@@ -173,15 +188,10 @@ def resolve_type(spec: TermSpec, ncorr: int) -> str:
         return spec.type
 
     if spec.diagonal is not None:
-        resolved = "scalar" if spec.diagonal else "full"
-        log.warning(
-            "Corruption term '%s': 'diagonal: %s' is deprecated; use 'type: %s'. Note the new "
-            "'diagonal' type is diag(g_x, g_y), which the boolean never meant.",
-            spec.label,
-            str(bool(spec.diagonal)).lower(),
-            resolved,
-        )
-        return resolved
+        # The deprecation is warned about once, in load_corruption_spec: this is
+        # called per term by both validate_spec and _build_term_params, so
+        # warning here repeats it for every term on every run.
+        return "scalar" if spec.diagonal else "full"
 
     return "diagonal" if ncorr in TERM_NCORR["diagonal"] else "scalar"
 
