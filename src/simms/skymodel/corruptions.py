@@ -187,7 +187,22 @@ def resolve_type(spec: TermSpec, ncorr: int) -> str:
 
 
 def validate_spec(spec: CorruptionSpec, ncorr: int) -> None:
-    """Raise RuntimeError if the specification is inconsistent with the MS."""
+    """Raise RuntimeError if the specification is unusable.
+
+    Two rules, deliberately different in reach:
+
+    *Structural* validity -- axes, period, amplitude sign, and the type
+    declaration itself -- is required of every entry in ``gains.spec``, listed
+    in ``gains.terms`` or not, so a typo in a term you have not enabled yet
+    still fails now rather than the day you enable it.
+
+    *MS compatibility* -- whether the term's Jones form fits this MS's
+    correlation count -- applies only to the terms actually listed in
+    ``gains.terms``. One ``spec`` block can then hold a library of terms and
+    ``terms`` select among them, without an unused ``full`` entry vetoing a
+    scalar-only run on a 2-correlation MS. :func:`needs_feed_basis` and the
+    all-zero-amplitude check below draw the same line.
+    """
     labels = [s.label for s in spec.spec]
     if len(labels) != len(set(labels)):
         raise RuntimeError(f"Corruption spec contains duplicate labels: {labels}")
@@ -235,15 +250,22 @@ def validate_spec(spec: CorruptionSpec, ncorr: int) -> None:
             "unchanged; give at least one term a non-zero amplitude"
         )
 
+    # Structural validity is checked for every entry, listed or not -- resolving
+    # the type raises on a type/diagonal conflict or an unknown type, and a typo
+    # in a term you have not enabled yet is worth catching now.
+    resolved = {s_.label: resolve_type(s_, ncorr) for s_ in spec.spec}
+
+    # Compatibility with *this* MS applies only to the terms this run actually
+    # multiplies in, so an unused entry cannot veto a run that never touches it.
     # Resolve before testing: a falsy non-bool from YAML (`diagonal: 0` parses as
     # int) would slip past an identity check and only fail inside the block
     # function, losing the clear up-front error.
-    for s_ in spec.spec:
-        term_type = resolve_type(s_, ncorr)
+    for term in spec.terms:
+        term_type = resolved[term]
         allowed = TERM_NCORR[term_type]
         if ncorr not in allowed:
             raise RuntimeError(
-                f"Corruption term '{s_.label}' is type '{term_type}', which needs "
+                f"Corruption term '{term}' is type '{term_type}', which needs "
                 f"{' or '.join(str(n) for n in allowed)} correlations; this MS has {ncorr}"
             )
 

@@ -1446,3 +1446,75 @@ def test_unused_spec_entry_does_not_impose_a_basis_requirement():
     )
     assert not needs_feed_basis(spec, ncorr=2)
     assert needs_feed_basis(CorruptionSpec(terms=["G", "D"], spec=spec.spec), ncorr=2)
+
+
+def _library_spec(**unused_overrides):
+    """A spec block holding two terms where 'terms' selects only the scalar one.
+
+    Keyword arguments override the *unlisted* term's fields.
+    """
+    unused = {"axes": ["time"], "period": 120.0, "amplitude": 0.1}
+    unused.update(unused_overrides)
+    return CorruptionSpec(
+        terms=["G"],
+        spec=[
+            TermSpec(label="G", type="scalar", axes=["time"], period=120.0, amplitude=0.1),
+            TermSpec(label="D", **unused),
+        ],
+    )
+
+
+def test_unused_entry_may_be_incompatible_with_the_ms():
+    """An entry not listed in 'terms' is never applied, so its Jones form need
+    not fit this MS: one spec block can be a library that 'terms' selects from."""
+    validate_spec(_library_spec(type="full"), ncorr=2)
+
+
+def test_listed_entry_must_be_compatible_with_the_ms():
+    """The same term, once listed, is checked."""
+    spec = _library_spec(type="full")
+    with pytest.raises(RuntimeError, match="term 'D' is type 'full', which needs 4 correlations"):
+        validate_spec(CorruptionSpec(terms=["G", "D"], spec=spec.spec), ncorr=2)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"amplitude": -1.0}, "amplitude must be non-negative"),
+        ({"axes": []}, "has no axes"),
+        ({"axes": ["elevation"]}, "unknown axis"),
+        ({"period": -5.0}, "must be positive"),
+        ({"type": "scalar", "diagonal": True}, "both 'type' and the deprecated"),
+        ({"type": "leakage"}, "unknown type"),
+    ],
+)
+def test_unused_entry_is_still_structurally_validated(kwargs, match):
+    """Structural mistakes fail now, listed or not -- only MS compatibility waits
+    until a term is actually used."""
+    with pytest.raises(RuntimeError, match=match):
+        validate_spec(_library_spec(**kwargs), ncorr=2)
+
+
+def test_library_spec_runs_end_to_end(gt2):
+    """The whole point: a 2-corr run with an unused full term in the file."""
+    yaml_path = gt2.write_yaml(
+        """
+gains:
+  terms: [G]
+  spec:
+    - label: G
+      type: scalar
+      axes: [time]
+      period:
+        time: 120.0
+      amplitude: 0.1
+    - label: D
+      type: full
+      axes: [time]
+      period:
+        time: 300.0
+      amplitude: 0.2
+"""
+    )
+    skysim.runit(skysim_opts(gt2.ms, ascii_sky=gt2.sky, column="DATA", corruptions=yaml_path, seed_gains=1))
+    assert np.all(np.isfinite(read_column(gt2.ms, "DATA")))

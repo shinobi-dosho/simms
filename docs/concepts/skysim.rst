@@ -192,6 +192,13 @@ position, so they need the MS's ``POLARIZATION.CORR_TYPE`` in a standard linear
 else rather than assign the wrong feed.  ``scalar`` terms reach every
 correlation alike and impose no such requirement.
 
+``terms`` selects from ``spec``, so one file can hold a library of terms and
+enable a subset.  Every entry is checked for structural validity -- axes,
+period, amplitude, and the type declaration -- whether it is listed or not, so a
+typo in a term you have not enabled yet still fails now.  Whether a term's Jones
+form fits *this* MS is checked only for the terms you list, so an unused
+``full`` entry does not veto a scalar-only run on a 2-correlation MS.
+
 A spec that would corrupt nothing is rejected rather than run: an empty file,
 one with no top-level ``gains`` block, an empty ``terms`` list, or every listed
 term at ``amplitude: 0``.  A single zero-amplitude term beside a real one is
