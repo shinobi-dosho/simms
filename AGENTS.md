@@ -45,7 +45,13 @@ pinned release tag (`git diff v0.1.0b3..origin/main`), never against a local che
 - Test files must be named `*_tests.py` (pytest is configured with `python_files = ["*_tests.py"]`);
   a `foo_test.py` or `test_foo.py` will not be collected.
 - Temp MSs/files/dirs go through `tests.InitTest` (`random_named_file` / `random_named_directory`),
-  which registers them for cleanup — don't hand-roll `tempfile`.
+  which registers them for cleanup — don't hand-roll `tempfile`. They are created under pytest's
+  own basetemp, never inside the repo: cleanup is `__del__`, which does not run on a SIGKILL or a
+  crash, so a hard-killed run must not be able to dirty the working tree. `tests/conftest.py`
+  wires that up once per session.
+- When a writer expands one name into several files (`write_beam_fits_cattery` turns a prefix
+  into eight), the derived names never pass through the helpers — hand them to
+  `InitTest.register(...)` or they leak.
 - Heavy or optional dependencies are opt-in dependency groups and guarded with
   `pytest.importorskip`, so the default `tests` run stays light. Example: the CASA round-trip
   test needs the `casa` group — `uv run --group tests --group casa python -m pytest tests/casa_roundtrip_tests.py`.

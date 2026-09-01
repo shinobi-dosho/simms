@@ -6,6 +6,23 @@ from types import SimpleNamespace
 
 TESTDIR = os.path.abspath(os.path.dirname(__file__))
 
+# Where InitTest puts its temp MSs/files. conftest points this at pytest's own basetemp
+# (``tmp_path_factory``) for the whole session, so a run that is hard-killed -- SIGKILL, an
+# OOM, a crash in casacore -- cannot leave fixtures behind in the working tree: pytest keeps
+# the last few basetemps and purges the rest. The fallback keeps InitTest usable outside a
+# pytest session; it is never the repo.
+_BASEDIR: str | None = None
+
+
+def set_basedir(path) -> None:
+    """Point the temp-file helpers at ``path`` (called once per session from conftest)."""
+    global _BASEDIR
+    _BASEDIR = str(path)
+
+
+def _basedir() -> str:
+    return _BASEDIR or tempfile.gettempdir()
+
 
 def skysim_opts(ms, ascii_sky=None, column="DATA", **overrides):
     """Baseline ``skysim.runit`` opts for tests; override any field via keyword.
@@ -93,7 +110,7 @@ class InitTest:
         # Only a uniquely-named path is wanted, not an open handle: the caller writes the
         # file itself (or hands the name to code that creates a directory there). The handle
         # is closed on the next line, so SIM115's context manager would not help.
-        file_obj = tempfile.NamedTemporaryFile(suffix=suffix, dir=TESTDIR, delete=False)  # noqa: SIM115
+        file_obj = tempfile.NamedTemporaryFile(suffix=suffix, dir=_basedir(), delete=False)  # noqa: SIM115
         name = file_obj.name
         file_obj.close()
 
@@ -104,10 +121,22 @@ class InitTest:
         if not hasattr(self, "test_files"):
             self.test_files = []
 
-        name = tempfile.mkdtemp(suffix=suffix, dir=TESTDIR)
+        name = tempfile.mkdtemp(suffix=suffix, dir=_basedir())
 
         self.test_files.append(name)
         return name
+
+    def register(self, *paths):
+        """Track paths this instance did not create, so they are cleaned up with the rest.
+
+        Some writers expand one name into several files -- ``write_beam_fits_cattery`` turns a
+        prefix into eight -- so the derived names never pass through ``random_named_file``.
+        Returns its argument (the single path, or the tuple) to keep call sites in one line.
+        """
+        if not hasattr(self, "test_files"):
+            self.test_files = []
+        self.test_files.extend(str(p) for p in paths)
+        return paths[0] if len(paths) == 1 else paths
 
     def __del__(self):
         for path in getattr(self, "test_files", []):

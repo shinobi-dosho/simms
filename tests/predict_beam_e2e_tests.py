@@ -253,7 +253,7 @@ def test_primary_beam_accepts_cattery_json(e2e):
     for prefix in (meerkat_prefix, ska_prefix):
         for corr in ("xx", "xy", "yx", "yy"):
             for reim in ("re", "im"):
-                e2e.test_files.append(f"{prefix}_{corr}_{reim}.fits")
+                e2e.register(f"{prefix}_{corr}_{reim}.fits")
 
     # define-stationtypes maps antenna NAME (here the skamid fixture's M060.. / SKA00.. split,
     # via a regex) to a $(stype) value; patterns substitutes it straight into the file prefix,
