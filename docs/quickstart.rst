@@ -59,5 +59,7 @@ Where to next
 * :doc:`concepts/telsim` -- telescope layouts, time/frequency grid, pointing.
 * :doc:`concepts/skysim` -- sky model schemas, FITS models, noise, column
   add/subtract, chunking.
+* :doc:`concepts/beams` -- primary beams, a-terms, and the standalone
+  ``primary-beam`` tool.
 * :doc:`concepts/ms-conventions` -- how simms reads/writes MS metadata.
 * :doc:`cli` -- full option reference.
