@@ -8,7 +8,11 @@ import numpy as np
 import pytest
 
 from simms.constants import C
-from simms.skymodel.kernels import RENORM_INTERVAL, is_uniform_grid, predict_vis
+from simms.skymodel.kernels import NO_SMEAR_UVW, RENORM_INTERVAL, is_uniform_grid, predict_vis
+
+# The three trailing kernel arguments that switch time/bandwidth smearing off; the
+# smeared kernel is covered in smearing_tests.py.
+NO_SMEAR = (False, 0.0, NO_SMEAR_UVW)
 
 RNG = np.random.default_rng(42)
 
@@ -55,7 +59,7 @@ def make_inputs(nrow=6, nchan=8, nsrc=3, nspec=4, ntime=1, gauss=False, uniform=
 def run_kernel(inputs, uniform):
     uvw, freqs, lmn, gauss_shape, is_gauss, bmat, lightcurve, time_index = inputs
     vis = np.zeros((uvw.shape[0], freqs.size, bmat.shape[1]), dtype=np.complex128)
-    predict_vis(uvw, freqs, uniform, lmn, gauss_shape, is_gauss, bmat, lightcurve, time_index, vis)
+    predict_vis(uvw, freqs, uniform, lmn, gauss_shape, is_gauss, bmat, lightcurve, time_index, vis, *NO_SMEAR)
     return vis
 
 
@@ -99,9 +103,9 @@ def test_predict_vis_accumulates_into_buffer():
     inputs = make_inputs()
     uvw, freqs, lmn, gauss_shape, is_gauss, bmat, lightcurve, time_index = inputs
     vis = np.zeros((uvw.shape[0], freqs.size, bmat.shape[1]), dtype=np.complex128)
-    predict_vis(uvw, freqs, True, lmn, gauss_shape, is_gauss, bmat, lightcurve, time_index, vis)
+    predict_vis(uvw, freqs, True, lmn, gauss_shape, is_gauss, bmat, lightcurve, time_index, vis, *NO_SMEAR)
     once = vis.copy()
-    predict_vis(uvw, freqs, True, lmn, gauss_shape, is_gauss, bmat, lightcurve, time_index, vis)
+    predict_vis(uvw, freqs, True, lmn, gauss_shape, is_gauss, bmat, lightcurve, time_index, vis, *NO_SMEAR)
     np.testing.assert_allclose(vis, 2 * once, rtol=1e-12)
 
 

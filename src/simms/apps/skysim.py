@@ -22,6 +22,7 @@ from simms.skymodel.corruptions import apply_corruptions, load_corruption_spec, 
 from simms.skymodel.fits_skies import component_sky_from_fits_dft, predict_fits_channel_block, prepare_fits_sky
 from simms.skymodel.mstools import (
     attach_beam,
+    attach_smearing,
     auto_row_chunks,
     noise_visibilities,
     predict_channel_block,
@@ -29,6 +30,7 @@ from simms.skymodel.mstools import (
     to_full_corr,
     vis_noise_from_sefd_and_ms,
 )
+from simms.skymodel.smearing import Smearing
 from simms.skymodel.wsclean_skies import prepare_wsclean_sky
 
 log = logging.getLogger(BIN.skysim)
@@ -39,6 +41,21 @@ def _beam_row_args(msds, beam_ctx):
     if beam_ctx:
         return (msds.ANTENNA1.data, ("row",), msds.ANTENNA2.data, ("row",))
     return (None, None, None, None)
+
+
+def _exposure_row_args(msds, smearing):
+    """The ``(EXPOSURE, idx)`` blockwise args, or a ``None`` slot when not smearing.
+
+    ``EXPOSURE`` is the time actually integrated over, which is what smears; MSv2
+    requires it, but an MS written without it falls back to ``INTERVAL`` (the same
+    thing whenever there is no dead time between dumps).
+    """
+    if smearing is None:
+        return (None, None)
+    if hasattr(msds, "EXPOSURE"):
+        return (msds.EXPOSURE.data, ("row",))
+    log.warning("The MS has no EXPOSURE column; time smearing uses INTERVAL instead.")
+    return (msds.INTERVAL.data, ("row",))
 
 
 def _array_lonlat(positions):
@@ -288,15 +305,23 @@ def runit(opts):
     spw_ds = xds_from_table(f"{ms}::SPECTRAL_WINDOW")[0]
     field_ds = xds_from_table(f"{ms}::FIELD")[0]
 
-    radec0, freqs, dfreq = dask.compute(
+    radec0, freqs, chan_width = dask.compute(
         field_ds.PHASE_DIR.data[opts.field_id],
         spw_ds.CHAN_FREQ.data[opts.spw_id],
-        spw_ds.CHAN_WIDTH.data[opts.spw_id][0],
+        spw_ds.CHAN_WIDTH.data[opts.spw_id],
     )
+    dfreq = chan_width[0]
     ra0, dec0 = radec0[0][0], radec0[0][1]
     ncorr = msds.DATA.data.shape[-1]
     vis_dtype = msds.DATA.data.dtype
     linear_basis = opts.pol_basis == "linear"
+
+    # Time/bandwidth smearing. Real visibilities are averaged over a channel and an
+    # integration, so a monochromatic instantaneous model over-predicts every source
+    # off the phase centre -- silently over-subtracting under --mode subtract. The
+    # decorrelation is a real sinc factor on the phasor, so only the per-visibility
+    # (DFT/component) kernels can carry it; the gridder backends warn below.
+    smearing = Smearing.from_ms(chan_width, dec0) if opts.smearing == "analytic" else None
 
     # Primary beam (sky models only, not noise-only runs). When enabled, the model must
     # carry every correlation so the per-feed voltage can be applied (nspec == ncorr).
@@ -360,6 +385,7 @@ def runit(opts):
         )
         if beam_ctx:
             prepared = beam_ctx.attach(prepared)
+        prepared = attach_smearing(prepared, smearing)
 
         # A blockwise index of None passes the argument through untouched, so a
         # model without transients (and no beam) must be handed a literal None, not
@@ -367,6 +393,7 @@ def runit(opts):
         need_time = skymodel.has_transient or bool(beam_ctx)
         time_args = (msds.TIME.data, ("row",)) if need_time else (None, None)
         ant_args = _beam_row_args(msds, beam_ctx)
+        exposure_args = _exposure_row_args(msds, smearing)
 
         simvis = da.blockwise(
             predict_channel_block,
@@ -379,6 +406,7 @@ def runit(opts):
             ("chan",),
             *time_args,
             *ant_args,
+            *exposure_args,
             out_dtype=vis_dtype,
             new_axes={"corr": ncorr},
             dtype=vis_dtype,
@@ -391,9 +419,11 @@ def runit(opts):
         prepared = prepare_wsclean_sky(wsclean_sky, freqs, ra0, dec0, ncorr=ncorr)
         if beam_ctx:
             prepared = beam_ctx.attach(prepared)
+        prepared = attach_smearing(prepared, smearing)
 
         time_args = (msds.TIME.data, ("row",)) if beam_ctx else (None, None)
         ant_args = _beam_row_args(msds, beam_ctx)
+        exposure_args = _exposure_row_args(msds, smearing)
 
         simvis = da.blockwise(
             predict_channel_block,
@@ -406,6 +436,7 @@ def runit(opts):
             ("chan",),
             *time_args,
             *ant_args,
+            *exposure_args,
             out_dtype=vis_dtype,
             new_axes={"corr": ncorr},
             dtype=vis_dtype,
@@ -503,6 +534,24 @@ def runit(opts):
             else:
                 prepared = beam_ctx.attach_aterm(prepared, opts.aterm_freq_tol)
 
+        # Only the per-visibility DFT kernels can carry a smearing factor. The
+        # gridder backends transform whole images, so a run that lands on one is
+        # told that its model is unsmeared rather than quietly being handed one.
+        if smearing is not None:
+            if use_component_path or (prepared.backend == "dft" and prepared.aterm is None):
+                prepared = attach_smearing(prepared, smearing)
+            else:
+                log.warning(
+                    "Time/bandwidth smearing is not applied on the %r FITS backend%s: the "
+                    "model is predicted monochromatic and instantaneous, so sources far from "
+                    "the phase centre are over-predicted on long baselines. Use "
+                    "--predict-backend dft (or an --ascii-sky/--wsclean-sky model) for a "
+                    "smeared prediction, or --smearing none to silence this.",
+                    prepared.backend,
+                    " with a-term beams" if prepared.aterm is not None else "",
+                )
+                smearing = None
+
         epsilon = 1e-7 if opts.fft_precision == "double" else 1e-6
 
         if use_component_path:
@@ -518,6 +567,7 @@ def runit(opts):
                 msds.TIME.data,
                 ("row",),
                 *_beam_row_args(msds, beam_ctx),
+                *_exposure_row_args(msds, smearing),
                 out_dtype=vis_dtype,
                 new_axes={"corr": ncorr},
                 dtype=vis_dtype,
@@ -537,6 +587,7 @@ def runit(opts):
                 ("chan",),
                 *time_args,
                 *_beam_row_args(msds, beam_ctx if aterm_on else None),
+                *_exposure_row_args(msds, smearing),
                 out_dtype=vis_dtype,
                 epsilon=epsilon,
                 do_wgridding=opts.do_wstacking,
@@ -779,6 +830,15 @@ def skysim(
         "ignored for YAML beam configs, which specify their own axis convention. "
         "Matches DDFacet's --Beam-FITSMAxis.",
         json_schema_extra={"abbreviation": "bma"},
+    ),
+    smearing: Literal["analytic", "none"] = Field(
+        "analytic",
+        description="Time and bandwidth smearing of the predicted model. 'analytic' applies the "
+        "sinc decorrelation implied by the MS's own CHAN_WIDTH and EXPOSURE, so the model matches "
+        "averaged data instead of over-predicting sources far from the phase centre on long "
+        "baselines; 'none' predicts a monochromatic, instantaneous model. Only the per-visibility "
+        "(ASCII, WSClean and FITS --predict-backend dft) paths can carry it; the FITS gridder "
+        "backends warn and predict unsmeared.",
     ),
     field_id: int = Field(0, description="Field ID.", json_schema_extra={"abbreviation": "fi"}),
     spw_id: int = Field(0, description="Spectral Window ID."),

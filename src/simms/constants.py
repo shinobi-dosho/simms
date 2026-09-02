@@ -15,3 +15,6 @@ FWHM_TO_GAUSS_SCALE = np.pi / (2 * np.sqrt(np.log(2)))
 earth_emaj = 6378137.0  # [m]
 # Earth's first numerical eccentricity
 esq = 0.00669437999014
+# Earth's sidereal rotation rate [rad/s]. Sets how fast the uvw of a tracking
+# baseline turn, and hence the fringe rate that time smearing integrates over.
+OMEGA_EARTH = 7.292115e-5
