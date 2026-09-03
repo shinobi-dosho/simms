@@ -48,7 +48,8 @@ from simms.skymodel.fits_spectrum import (
     read_spi_maps,
 )
 from simms.skymodel.kernels import is_uniform_grid, predict_vis
-from simms.skymodel.mstools import add_noise, stack_unpolarised_vis
+from simms.skymodel.mstools import add_noise, smear_kernel_args, stack_unpolarised_vis
+from simms.skymodel.smearing import Smearing
 from simms.utilities import is_range_in_range, radec2lm
 
 log = logging.getLogger(__name__)
@@ -143,6 +144,10 @@ class PreparedFitsSky:
     # to place the block's channels on its frequency-knot grid.
     aterm: object | None = None
     chan_ids: np.ndarray | None = None
+
+    # DFT backend only: time/bandwidth smearing (see simms.skymodel.smearing). The
+    # gridder backends integrate whole images and cannot carry a per-visibility factor.
+    smearing: Smearing | None = None
 
     @property
     def nspec(self) -> int:
@@ -927,6 +932,7 @@ def component_sky_from_fits_dft(prepared: PreparedFitsSky):
         uniform_freqs=prepared.uniform_freqs,
         ncorr=prepared.ncorr,
         polarisation=prepared.polarisation,
+        smearing=prepared.smearing,
     )
 
 
@@ -1017,6 +1023,9 @@ def _perchan_visibilities(prepared, uvw, epsilon, wgridding, nthreads):
                 np.ones((ncomp, 1)),
                 np.zeros(nrow, dtype=np.int64),
                 chan_vis,
+                # The gridder serves the dense channels of a perchan model, so
+                # smearing is refused for the backend as a whole (see skysim).
+                *smear_kernel_args(None, uvw, None),
             )
             if nspec != ncorr:
                 chan_vis = stack_unpolarised_vis(chan_vis[..., 0], ncorr)
@@ -1042,6 +1051,7 @@ def predict_fits_channel_block(
     times: np.ndarray = None,
     antenna1: np.ndarray = None,
     antenna2: np.ndarray = None,
+    exposure: np.ndarray = None,
     out_dtype: np.dtype = None,
     epsilon: float = 1e-7,
     do_wgridding: bool = True,
@@ -1054,6 +1064,7 @@ def predict_fits_channel_block(
         times=times,
         antenna1=antenna1,
         antenna2=antenna2,
+        exposure=exposure,
         out_dtype=out_dtype,
         epsilon=epsilon,
         do_wgridding=do_wgridding,
@@ -1067,6 +1078,7 @@ def predict_fits_block(
     times: np.ndarray = None,
     antenna1: np.ndarray = None,
     antenna2: np.ndarray = None,
+    exposure: np.ndarray = None,
     noise_vis: float | None = None,
     out_dtype: np.dtype = None,
     epsilon: float = 1e-7,
@@ -1086,6 +1098,10 @@ def predict_fits_block(
     times, antenna1, antenna2 : numpy.ndarray, optional
         Per-row timestamp and antenna indices. Required when the model carries
         an a-term (``prepared.aterm``); ignored otherwise.
+    exposure : numpy.ndarray, optional
+        Integration time per row (the MS ``EXPOSURE`` column, seconds). Required
+        when the model carries a :class:`~simms.skymodel.smearing.Smearing`,
+        which only the DFT backend supports.
     noise_vis : float, optional
         RMS noise per visibility (Jy).
     out_dtype : numpy.dtype, optional
@@ -1130,6 +1146,7 @@ def predict_fits_block(
                 np.ones((ncomp, 1)),
                 np.zeros(nrow, dtype=np.int64),
                 vis,
+                *smear_kernel_args(prepared.smearing, uvw, exposure),
             )
         if prepared.nspec != ncorr:
             vis = stack_unpolarised_vis(vis[..., 0], ncorr)

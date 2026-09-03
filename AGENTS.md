@@ -77,6 +77,21 @@ Cosine-taper (`beams.py`) tables under `src/simms/skymodel/beam_data/`. The `MKA
 tables are vendored from katbeam (BSD-3-Clause) — keep that attribution in `beam_data/NOTICE`. The
 other tables ship as ordinary bundled package data.
 
+## Smearing
+
+`skysim` predicts *smeared* visibilities by default (`--smearing analytic`; `none` restores
+the monochromatic, instantaneous DFT). Each average -- over `SPECTRAL_WINDOW.CHAN_WIDTH` and
+over the row's `EXPOSURE` -- is over a top-hat, so each contributes a real `sinc` factor on
+the phasor (`simms.skymodel.smearing`). The bandwidth term does not depend on frequency and
+is hoisted per row and source; the time term is the fringe rate of a baseline turning with
+the Earth at the **phase-centre** declination (`FIELD.PHASE_DIR`, not the pointing centre --
+`l/m` are relative to the phase centre) and is evaluated per channel. Both are exactly 1 at
+the phase centre, and `sinc` is even, so an overall `uvw` sign convention cannot flip them.
+Only the per-visibility kernels carry it: ASCII, WSClean, and FITS on the `dft` backend
+(including the component bridge). The gridder and a-term backends warn and predict unsmeared
+rather than pretend. A smeared `PreparedSky` needs the per-row `EXPOSURE` passed alongside
+the `UVW`, so blockwise gains an extra row argument.
+
 ## Corruptions
 
 `skysim` applies RIME Jones corruptions after prediction when `--corruptions` points to a YAML

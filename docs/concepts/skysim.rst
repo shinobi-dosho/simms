@@ -101,6 +101,56 @@ the simulation with an existing column, which defaults to ``--column`` itself:
 ``--column``; it must already exist. Every mode still needs something to
 simulate -- a sky model, ``--sefd``, or both.
 
+Time and bandwidth smearing
+---------------------------
+
+The correlator averages each visibility over a channel of width ``CHAN_WIDTH``
+and over an integration of length ``EXPOSURE``.  Both averages reduce the
+amplitude of a source away from the phase centre, by more the longer the
+baseline -- the familiar time and bandwidth smearing.  ``skysim`` reproduces
+that, so a predicted model matches averaged data instead of over-predicting it:
+
+.. code-block:: console
+
+    # the default: decorrelation from the MS's own CHAN_WIDTH and EXPOSURE
+    $ simms skysim --ascii-sky skymodel.txt --smearing analytic visdata.ms
+
+    # a monochromatic, instantaneous prediction (the pre-3.1 behaviour)
+    $ simms skysim --ascii-sky skymodel.txt --smearing none visdata.ms
+
+The residual phase of a source is :math:`\phi = 2\pi\nu(ul + vm + w(n-1))/c`,
+and both averages are over a top-hat, so each contributes a real factor
+:math:`\mathrm{sinc}(x) = \sin x / x` evaluated at half the phase swing across
+the average:
+
+.. math::
+
+    x_\nu = \tfrac{1}{2}\,\Delta\nu\,\frac{\partial\phi}{\partial\nu},
+    \qquad
+    x_t = \tfrac{1}{2}\,\Delta t\,\frac{\partial\phi}{\partial t}
+
+The frequency derivative is fixed, so the bandwidth factor costs one
+:math:`\mathrm{sinc}` per row and source; the time derivative is the fringe
+rate of a baseline turning with the Earth at the phase-centre declination, and
+is evaluated per channel.  Both factors are exactly 1 at the phase centre.
+This is the standard first-order treatment: the average is taken about the
+channel and dump centres, so only the amplitude changes, and it holds while the
+fringe rate is constant across one integration.
+
+Why it matters most for ``--mode subtract``: real data *are* smeared, so
+differencing an unsmeared model against them leaves a residual that grows with
+baseline length and with offset from the phase centre -- exactly the regime
+(a bright source at or beyond the edge of the imaged field, in an MS averaged
+for continuum self-calibration) that makes one want ``subtract`` in the first
+place.
+
+Only the per-visibility kernels can carry the factor, so it applies to
+``--ascii-sky``, ``--wsclean-sky`` and a ``--fits-sky`` predicted with
+``--predict-backend dft`` (including the component bridge a FITS model with few
+bright pixels takes when a primary beam is attached).  The FITS gridder and
+a-term backends transform whole images and cannot; a run that lands on one
+warns and predicts unsmeared.
+
 Thermal noise
 -------------
 

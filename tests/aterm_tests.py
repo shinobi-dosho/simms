@@ -534,19 +534,24 @@ def test_e2e_fits_aterm_matches_ascii_dft_path(e2e_ms):
     holder, ms = e2e_ms
     img, ascii_sky, beams = _e2e_sky(holder)
 
-    skysim.runit(skysim_opts(ms, ascii_sky=ascii_sky, primary_beam=beams, column="ASCIIBEAM"))
+    # Smearing off throughout: the gridded a-term path cannot carry a per-visibility
+    # decorrelation factor, so leaving the default on would compare a smeared
+    # component prediction against an unsmeared gridded one. Smearing is covered on
+    # its own in smearing_tests.py.
+    opts = dict(primary_beam=beams, smearing="none")
+    skysim.runit(skysim_opts(ms, ascii_sky=ascii_sky, column="ASCIIBEAM", **opts))
     skysim.runit(
         skysim_opts(
             ms,
             fits_sky=img,
-            primary_beam=beams,
             column="FITSATERM",
             predict_backend="fft",
             aterm_freq_tol=0.0,
+            **opts,
         )
     )
     # Few bright pixels + a beam: the auto/dft backend takes the exact component bridge.
-    skysim.runit(skysim_opts(ms, fits_sky=img, primary_beam=beams, column="FITSBRIDGE", predict_backend="dft"))
+    skysim.runit(skysim_opts(ms, fits_sky=img, column="FITSBRIDGE", predict_backend="dft", **opts))
 
     ds = xds_from_ms(ms)[0]
     ref = ds.ASCIIBEAM.data.compute()

@@ -8,7 +8,14 @@ from daskms import xds_from_ms, xds_from_table
 
 from simms.constants import FWHM_TO_GAUSS_SCALE
 from simms.skymodel.ascii_skies import ASCIISkymodel
-from simms.skymodel.kernels import is_uniform_grid, predict_vis, predict_vis_beam, predict_vis_jones
+from simms.skymodel.kernels import (
+    NO_SMEAR_UVW,
+    is_uniform_grid,
+    predict_vis,
+    predict_vis_beam,
+    predict_vis_jones,
+)
+from simms.skymodel.smearing import Smearing
 from simms.utilities import radec2lm
 
 DEFAULT_ROW_CHUNK_CAP = 10000
@@ -252,6 +259,8 @@ class PreparedSky:
     tgrid: np.ndarray | None = None  # (n_pa,) PA-grid sample times (MS seconds)
     corr_feed_p: np.ndarray | None = None
     corr_feed_q: np.ndarray | None = None
+    # Time/bandwidth smearing, applied when set (see attach_smearing).
+    smearing: Smearing | None = None
 
     @property
     def nspec(self) -> int:
@@ -461,6 +470,35 @@ def attach_beam(
     )
 
 
+def attach_smearing(prepared, smearing: Smearing | None):
+    """Return a copy of ``prepared`` whose prediction is time/bandwidth smeared.
+
+    Works for any prepared sky the DFT kernels consume -- :class:`PreparedSky` and
+    the DFT-backend :class:`~simms.skymodel.fits_skies.PreparedFitsSky` alike.
+    Predicting a smeared model then needs the per-row ``EXPOSURE`` alongside the
+    ``UVW``; see :func:`predict_block`. ``None`` is a no-op, so callers can pass
+    the option through unconditionally.
+    """
+    return prepared if smearing is None else replace(prepared, smearing=smearing)
+
+
+def smear_kernel_args(smearing: Smearing | None, uvw: np.ndarray, exposure) -> tuple:
+    """The ``(smear, bw_half, smear_uvw)`` trailing arguments of the DFT kernels.
+
+    Raises
+    ------
+    ValueError
+        If ``smearing`` is set but no per-row ``exposure`` was supplied.
+    """
+    if smearing is None:
+        return False, 0.0, NO_SMEAR_UVW
+    if exposure is None:
+        raise ValueError(
+            "time/bandwidth smearing needs the per-row integration time; pass the MS EXPOSURE column as 'exposure'."
+        )
+    return True, smearing.bw_half, smearing.row_uvw(uvw, exposure)
+
+
 def predict_channel_block(
     prepared: PreparedSky,
     uvw: np.ndarray,
@@ -468,6 +506,7 @@ def predict_channel_block(
     times: np.ndarray = None,
     antenna1: np.ndarray = None,
     antenna2: np.ndarray = None,
+    exposure: np.ndarray = None,
     out_dtype: np.dtype = None,
 ) -> np.ndarray:
     """Predict one (row, channel) block, restricting the model to ``chan_ids``."""
@@ -477,6 +516,7 @@ def predict_channel_block(
         times=times,
         antenna1=antenna1,
         antenna2=antenna2,
+        exposure=exposure,
         out_dtype=out_dtype,
     )
 
@@ -487,6 +527,7 @@ def predict_block(
     times: np.ndarray = None,
     antenna1: np.ndarray = None,
     antenna2: np.ndarray = None,
+    exposure: np.ndarray = None,
     noise_vis: float | None = None,
     out_dtype: np.dtype = None,
     seed=None,
@@ -502,6 +543,9 @@ def predict_block(
         UVW coordinates of shape (nrows, 3), in metres.
     times : numpy.ndarray, optional
         Time stamp per row. Required if the model contains transient sources.
+    exposure : numpy.ndarray, optional
+        Integration time per row (the MS ``EXPOSURE`` column, seconds). Required
+        if ``prepared`` carries a :class:`~simms.skymodel.smearing.Smearing`.
     noise_vis : float, optional
         RMS noise per visibility (Jy). If provided, noise is added.
     seed : optional
@@ -530,6 +574,8 @@ def predict_block(
         if times is None:
             raise ValueError("parameter 'times' must be provided for skymodels with transient sources")
         time_index = np.searchsorted(prepared.unique_times, times).astype(np.int64)
+
+    smear_args = smear_kernel_args(prepared.smearing, uvw, exposure)
 
     vis = np.zeros((nrow, prepared.freqs.size, nspec), dtype=prepared.bmat.dtype)
     if prepared.beam_enabled:
@@ -566,9 +612,9 @@ def predict_block(
             pa_wt,
         )
         if prepared.beam_full_jones:
-            predict_vis_jones(*common)
+            predict_vis_jones(*common, *smear_args)
         else:
-            predict_vis_beam(*common, prepared.corr_feed_p, prepared.corr_feed_q)
+            predict_vis_beam(*common, prepared.corr_feed_p, prepared.corr_feed_q, *smear_args)
     else:
         predict_vis(
             uvw,
@@ -581,6 +627,7 @@ def predict_block(
             prepared.lightcurve,
             time_index,
             vis,
+            *smear_args,
         )
 
     if nspec != ncorr:

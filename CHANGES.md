@@ -1,5 +1,33 @@
 ### 3.0.1 -> unreleased
 
+- `skysim`: predicted visibilities now carry time and bandwidth smearing, via
+  the new `--smearing` option (`analytic`, the default, or `none` for the
+  previous monochromatic, instantaneous prediction). The correlator averages
+  each visibility over `CHAN_WIDTH` and over `EXPOSURE`, so an unsmeared model
+  over-predicts every source away from the phase centre, by more the longer the
+  baseline. That was a modelling choice for a simulation from scratch but a
+  silent correctness bug for `--mode subtract` against real averaged data,
+  where it left a residual growing with baseline length and with offset from
+  the phase centre. Each average is over a top-hat, so each contributes a real
+  `sinc` factor on the phasor: the bandwidth term is frequency-independent and
+  costs one `sinc` per row and source, the time term follows the fringe rate of
+  a baseline turning with the Earth at the phase-centre declination and is
+  evaluated per channel. Both are exactly 1 at the phase centre. Worked
+  example, MeerKAT L-band (1.28 GHz, 7.7 km baselines) averaged to 128 channels
+  and 8 s dumps: a source 51' off axis decorrelates to ~0.11 of its coherent
+  amplitude on the longest baselines, so the old model over-predicted it
+  ninefold there. Only the
+  per-visibility kernels can apply it, so it covers `--ascii-sky`,
+  `--wsclean-sky` and `--fits-sky` with `--predict-backend dft` (including the
+  component bridge used for a FITS model with few bright pixels and a primary
+  beam); the FITS gridder and a-term backends transform whole images, and a run
+  that lands on one warns and predicts unsmeared rather than silently claiming
+  to have smeared. On a uniform channel grid the time factor's sine rides a
+  second phasor recurrence, the way the phase itself already does, and the
+  unsmeared loop is kept separate from the smeared one: `--smearing none` runs
+  the kernel it always ran, and `analytic` costs ~1.2-1.4x on a 300-source,
+  256-channel, 4000-row predict.
+
 - `skysim`: add YAML-driven RIME Jones corruptions via `--corruptions`. Terms are
   described with arbitrary labels, axes (`time` and/or `frequency`), diagonal or
   full 2x2 Jones matrices, and sinusoidal amplitudes/periods. Periods accept

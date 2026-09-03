@@ -58,6 +58,7 @@ def skysim_opts(ms, ascii_sky=None, column="DATA", **overrides):
         "telescope_name_column": "TELESCOPE_NAME",
         "input_column": None,
         "mode": "sim",
+        "smearing": "analytic",
         "column": column,
         "seed": None,
         "seed_noise": None,
