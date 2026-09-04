@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Literal
+from typing import Annotated
 
 import shinobi
 from dask import config as dask_config
 from pydantic import BaseModel, Field
+from shinobi.steps.schema import ParamMeta
 
 from simms import BIN, set_logger
 
@@ -69,37 +70,39 @@ def runit(opts) -> PrimaryBeamOutputs:
     name=BIN.primary_beam, info="Primary-beam utilities (build/tag/apply/correct); no visibility simulation."
 )
 def primary_beam(
-    mode: Literal["to-fits", "tag-ms", "apply", "correct"] = Field(..., description="Operation to perform."),
+    mode: Annotated[str, ParamMeta(choices=["to-fits", "tag-ms", "apply", "correct"])] = Field(
+        ..., description="Operation to perform."
+    ),
     beam_pattern: str | None = Field(
         None,
         description="Beam model: a cosine-taper CSV path, a built-in name, a band shorthand (L/UHF), or a FITS cube.",
         json_schema_extra={"abbreviation": "bp"},
     ),
-    beam_band: Literal["UHF", "L"] = Field(
+    beam_band: Annotated[str, ParamMeta(choices=["UHF", "L"])] = Field(
         "L", description="Default band for a built-in beam when beam-pattern omits one."
     ),
     beam_pa_step: float = Field(
         1.0, description="Parallactic-angle sampling step (degrees) for the time-averaged beam."
     ),
-    fits_format: Literal["simms", "cattery"] = Field(
+    fits_format: Annotated[str, ParamMeta(choices=["simms", "cattery"])] = Field(
         "simms",
         description="to-fits output layout: simms's own single-file 4-plane HH/VV cube, or "
         "the Cattery/DDFacet 8-file per-Jones-element schema (--Beam-Model FITS).",
         json_schema_extra={"abbreviation": "ff"},
     ),
-    pol_basis: Literal["linear", "circular"] = Field(
+    pol_basis: Annotated[str, ParamMeta(choices=["linear", "circular"])] = Field(
         "linear",
         description="Correlation basis for the cattery fits-format output (xx/xy/yx/yy vs "
         "rr/rl/lr/ll); must match the target MS's feed basis.",
         json_schema_extra={"abbreviation": "pol"},
     ),
-    beam_l_axis: Literal["-X", "X"] = Field(
+    beam_l_axis: Annotated[str, ParamMeta(choices=["-X", "X"])] = Field(
         "-X",
         description="Sign convention for the cattery fits-format L axis, matching DDFacet's "
         "--Beam-FITSLAxis (pass the same value to both).",
         json_schema_extra={"abbreviation": "bla"},
     ),
-    beam_m_axis: Literal["Y", "-Y"] = Field(
+    beam_m_axis: Annotated[str, ParamMeta(choices=["Y", "-Y"])] = Field(
         "Y",
         description="Sign convention for the cattery fits-format M axis, matching DDFacet's "
         "--Beam-FITSMAxis (pass the same value to both).",

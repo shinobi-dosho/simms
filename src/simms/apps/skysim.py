@@ -5,7 +5,7 @@ import logging
 import os.path
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Literal
+from typing import Annotated
 
 import dask
 import dask.array as da
@@ -14,6 +14,7 @@ import shinobi
 from dask import config as dask_config
 from daskms import xds_from_ms, xds_from_table, xds_to_table
 from pydantic import BaseModel, Field
+from shinobi.steps.schema import ParamMeta
 from tqdm.dask import TqdmCallback
 
 from simms import BIN, SCHEMADIR, set_logger
@@ -44,6 +45,14 @@ def _beam_row_args(msds, beam_ctx):
     return (None, None, None, None)
 
 
+def _exposure_data(msds):
+    """The per-row integration time as a dask array: ``EXPOSURE`` or ``INTERVAL`` as fallback."""
+    if hasattr(msds, "EXPOSURE"):
+        return msds.EXPOSURE.data
+    log.warning("The MS has no EXPOSURE column; time smearing uses INTERVAL instead.")
+    return msds.INTERVAL.data
+
+
 def _exposure_row_args(msds, smearing):
     """The ``(EXPOSURE, idx)`` blockwise args, or a ``None`` slot when not smearing.
 
@@ -56,14 +65,11 @@ def _exposure_row_args(msds, smearing):
     """
     if smearing is None:
         return (None, None)
-    if hasattr(msds, "EXPOSURE"):
-        return (msds.EXPOSURE.data, ("row",))
-    log.warning("The MS has no EXPOSURE column; time smearing uses INTERVAL instead.")
-    return (msds.INTERVAL.data, ("row",))
+    return (_exposure_data(msds), ("row",))
 
 
 def _midpoint_bias(swing: float, n: int) -> float:
-    """One-sided over-estimate of the midpoint average: ``1/sinc(swing/(2n)) - 1``."""
+    """One-sided over-estimate of the midpoint average: ``1 / (sin(x)/x) - 1`` with ``x = swing/(2n)``."""
     half = swing / (2.0 * max(n, 1))
     return float(1.0 / np.sinc(half / np.pi) - 1.0)
 
@@ -80,10 +86,9 @@ def _attach_subsample(opts, msds, prepared, freqs, chan_width, dec0):
     come out (1, 1) -- then sub-sampling is the unsmeared prediction and nothing
     needs the ``EXPOSURE`` column).
     """
-    exp_col = msds.EXPOSURE.data if hasattr(msds, "EXPOSURE") else msds.INTERVAL.data
     uvw_max, exposure_max = dask.compute(
         da.sqrt((msds.UVW.data**2).sum(axis=1)).max(),
-        exp_col.max(),
+        _exposure_data(msds).max(),
     )
     # Largest ||(l, m, n - 1)|| the image reaches: its corners, on a rectangular grid.
     ii = np.array([0.0, 0.0, prepared.npix_l - 1.0, prepared.npix_l - 1.0])
@@ -830,7 +835,7 @@ def skysim(
         description="WSClean component list (point and Gaussian components, Stokes I).",
         json_schema_extra={"abbreviation": "ws"},
     ),
-    fits_sky_interp: Literal["nearest", "linear", "cubic"] = Field(
+    fits_sky_interp: Annotated[str, ParamMeta(choices=["nearest", "linear", "cubic"])] = Field(
         "linear",
         description="Interpolation method when the MS and FITS frequency grids do not match and the cube is kept.",
         json_schema_extra={"abbreviation": "fsi"},
@@ -840,13 +845,15 @@ def skysim(
         description="Simulate all available Stokes parameters. If false, only Stokes I.",
         json_schema_extra={"abbreviation": "pol"},
     ),
-    pol_basis: Literal["linear", "circular"] = Field("linear", description="Polarization basis for the simulation."),
+    pol_basis: Annotated[str, ParamMeta(choices=["linear", "circular"])] = Field(
+        "linear", description="Polarization basis for the simulation."
+    ),
     pixel_tol: float = Field(
         1e-7,
         description="Minimum brightness for a pixel to be considered in direct Fourier transform.",
         json_schema_extra={"abbreviation": "pt"},
     ),
-    fits_spectrum: Literal["auto", "flat", "poly", "cube"] = Field(
+    fits_spectrum: Annotated[str, ParamMeta(choices=["auto", "flat", "poly", "cube"])] = Field(
         "auto",
         description="How the FITS sky model varies with frequency.",
         json_schema_extra={"abbreviation": "fsp"},
@@ -863,10 +870,12 @@ def skysim(
     fits_spectrum_order: int = Field(
         2, description="Order of the fitted log-polynomial spectrum. 1 is a plain spectral index."
     ),
-    predict_backend: Literal["auto", "dft", "fft", "perchan"] = Field(
+    predict_backend: Annotated[str, ParamMeta(choices=["auto", "dft", "fft", "perchan"])] = Field(
         "auto", description="Backend for FITS sky model prediction."
     ),
-    fft_precision: Literal["single", "double"] = Field("double", description="Precision of the FFT calculation."),
+    fft_precision: Annotated[str, ParamMeta(choices=["single", "double"])] = Field(
+        "double", description="Precision of the FFT calculation."
+    ),
     do_wstacking: bool = Field(True, description="Whether to use w-stacking for FFT-based visibility prediction."),
     ascii_delimiter: str | None = Field(
         None, description="Delimiter used in the ascii-sky.", json_schema_extra={"abbreviation": "ad"}
@@ -893,7 +902,7 @@ def skysim(
         "circular-correlation MS may be used when --beam-jones full is selected.",
         json_schema_extra={"abbreviation": "pb"},
     ),
-    beam_band: Literal["UHF", "L"] = Field(
+    beam_band: Annotated[str, ParamMeta(choices=["UHF", "L"])] = Field(
         "L", description="Default band for JimBeam entries that omit an explicit model/CSV."
     ),
     beam_pa_step: float = Field(
@@ -902,10 +911,10 @@ def skysim(
     beam_grid_max_gib: float = Field(
         4.0, description="Hard ceiling (GiB) on the sampled beam grid held in memory for the whole run."
     ),
-    beam_jones: Literal["diagonal", "full"] = Field(
+    beam_jones: Annotated[str, ParamMeta(choices=["diagonal", "full"])] = Field(
         "diagonal", description="Primary-beam application: per-feed voltage or full 2x2 E-Jones."
     ),
-    fits_beam_mode: Literal["aterm", "average"] = Field(
+    fits_beam_mode: Annotated[str, ParamMeta(choices=["aterm", "average"])] = Field(
         "aterm",
         description="Primary-beam handling for the FITS-image path: 'aterm' applies exact per-antenna "
         "a-terms in the image domain (time- and frequency-interpolated, heterogeneity-aware); 'average' "
@@ -924,21 +933,21 @@ def skysim(
         description="ANTENNA-table column holding the per-antenna telescope/type label that maps to a beam model.",
         json_schema_extra={"abbreviation": "tnc"},
     ),
-    beam_l_axis: Literal["-X", "X"] = Field(
+    beam_l_axis: Annotated[str, ParamMeta(choices=["-X", "X"])] = Field(
         "-X",
         description="Sign convention for a Cattery/DDFacet .json primary-beam config's L axis; "
         "ignored for YAML beam configs, which specify their own axis convention. "
         "Matches DDFacet's --Beam-FITSLAxis.",
         json_schema_extra={"abbreviation": "bla"},
     ),
-    beam_m_axis: Literal["Y", "-Y"] = Field(
+    beam_m_axis: Annotated[str, ParamMeta(choices=["Y", "-Y"])] = Field(
         "Y",
         description="Sign convention for a Cattery/DDFacet .json primary-beam config's M axis; "
         "ignored for YAML beam configs, which specify their own axis convention. "
         "Matches DDFacet's --Beam-FITSMAxis.",
         json_schema_extra={"abbreviation": "bma"},
     ),
-    smearing: Literal["analytic", "subsample", "none"] = Field(
+    smearing: Annotated[str, ParamMeta(choices=["analytic", "subsample", "none"])] = Field(
         "analytic",
         description="Time and bandwidth smearing of the predicted model. 'analytic' (default) "
         "applies the sinc decorrelation implied by the MS's own CHAN_WIDTH and EXPOSURE, so the "
@@ -982,7 +991,7 @@ def skysim(
         None,
         description="YAML file describing RIME Jones corruptions to apply to the predicted visibilities.",
     ),
-    ascii_species: Literal["bdsf_gaul", "aegean", "wsclean"] | None = Field(
+    ascii_species: Annotated[str | None, ParamMeta(choices=["bdsf_gaul", "aegean", "wsclean"])] = Field(
         None, description="Non-simms sky model type.", json_schema_extra={"abbreviation": "asp"}
     ),
     input_column: str | None = Field(
@@ -990,7 +999,7 @@ def skysim(
         description="Column that 'add'/'subtract' combine the simulation with. Defaults to --column.",
         json_schema_extra={"abbreviation": "ic"},
     ),
-    mode: Literal["sim", "add", "subtract"] = Field(
+    mode: Annotated[str, ParamMeta(choices=["sim", "add", "subtract"])] = Field(
         "sim",
         description="How the simulation reaches --column: 'sim' overwrites it, 'add' adds the simulation to "
         "--input-column, 'subtract' subtracts it from --input-column. --input-column defaults to --column.",
