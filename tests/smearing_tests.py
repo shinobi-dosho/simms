@@ -22,7 +22,7 @@ from simms.constants import OMEGA_EARTH, C
 from simms.skymodel.ascii_skies import ASCIISkymodel
 from simms.skymodel.kernels import NO_SMEAR_UVW, predict_vis, predict_vis_beam, predict_vis_jones
 from simms.skymodel.mstools import attach_smearing, predict_block, prepare_skymodel
-from simms.skymodel.smearing import Smearing
+from simms.skymodel.smearing import Smearing, SubsampleSmearing, midpoint_fractions, subsample_counts
 from simms.telescope.generate_ms import create_ms
 
 from . import InitTest, skysim_opts
@@ -417,6 +417,7 @@ def test_the_fits_gridder_backend_warns_and_predicts_unsmeared(smear_ms, caplog)
     with caplog.at_level("WARNING", logger="skysim"):
         skysim.runit(skysim_opts(smear_ms.ms, fits_sky=img, column="GRID", predict_backend="fft", log_level="WARNING"))
     assert "not applied on the 'fft' FITS backend" in caplog.text
+    assert "--smearing subsample" in caplog.text, "the warning must point at the mode that fixes it"
 
     skysim.runit(skysim_opts(smear_ms.ms, fits_sky=img, column="GRIDNONE", predict_backend="fft", smearing="none"))
     np.testing.assert_allclose(_column(smear_ms.ms, "GRID"), _column(smear_ms.ms, "GRIDNONE"), rtol=1e-6, atol=1e-8)
@@ -430,3 +431,207 @@ def test_the_fits_dft_backend_is_smeared(smear_ms):
     ratio = np.abs(_column(smear_ms.ms, "DFTSMEAR")) / np.abs(_column(smear_ms.ms, "DFTPLAIN"))
     assert (ratio <= 1.0 + 1e-6).all()
     assert ratio.min() < 0.95
+
+
+# --------------------------------------------------------------------------- sub-sampled smearing
+
+
+def test_rotate_uvw_matches_an_explicitly_rotated_baseline():
+    """The sub-dump uvw rotation is exact, not first-order, and dt=0 is a bypass."""
+    rng = np.random.default_rng(3)
+    for dec0 in (np.deg2rad(-30.7), np.deg2rad(55.0), np.deg2rad(-88.0)):
+        sub = SubsampleSmearing.from_ms(1e6, dec0, 2, 2)
+        baselines = rng.normal(0, 5000, (8, 3))
+        hour_angles = rng.uniform(0, 2 * np.pi, 8)
+        dts = rng.uniform(-3600.0, 3600.0, 8)  # far beyond any dump, so errors cannot hide
+        uvw = np.array([rotating_uvw(h, dec0, b) for h, b in zip(hour_angles, baselines, strict=True)])
+        want = np.array(
+            [rotating_uvw(h + OMEGA_EARTH * dt, dec0, b) for h, dt, b in zip(hour_angles, dts, baselines, strict=True)]
+        )
+        np.testing.assert_allclose(sub.rotate_uvw(uvw, dts), want, rtol=0, atol=1e-9)
+        # dt of zero must return the *input* array: the rotation's sin^2+cos^2 terms
+        # are only ulp-exact, and the (1,1) sub-sample must equal no smearing.
+        assert np.array_equal(sub.rotate_uvw(uvw, 0.0), uvw)
+        assert np.array_equal(sub.rotate_uvw(uvw, np.zeros(8)), uvw)
+
+
+def test_midpoint_fractions_and_counts():
+    np.testing.assert_allclose(midpoint_fractions(1), [0.0])
+    np.testing.assert_allclose(midpoint_fractions(2), [-0.25, 0.25])
+    np.testing.assert_allclose(midpoint_fractions(4), [-0.375, -0.125, 0.125, 0.375])
+    assert subsample_counts(0.01, 0.01, 8) == (1, 1)
+    assert subsample_counts(1.0, 2.0, 8) == (2, 4)  # PHASE_TOL = 0.5
+    assert subsample_counts(100.0, 100.0, 8) == (8, 8)  # capped
+    assert subsample_counts(100.0, 0.01, 1) == (1, 1)
+
+
+def _run(ms, column, caplog=None, **overrides):
+    opts = skysim_opts(ms, column=column, **overrides)
+    skysim.runit(opts)
+    return _column(ms, column)
+
+
+def test_subsample_cap_one_is_identical_to_none(smear_ms, caplog):
+    """(1,1) sub-samples take the explicit bypass, so the output is bit-for-bit 'none'."""
+    img = _off_axis_image(smear_ms)
+    none = _run(smear_ms.ms, "SS_NONE", fits_sky=img, predict_backend="fft", smearing="none")
+    with caplog.at_level("WARNING", logger="skysim"):
+        capped = _run(
+            smear_ms.ms,
+            "SS_CAP1",
+            fits_sky=img,
+            predict_backend="fft",
+            smearing="subsample",
+            smearing_subsamples=1,
+            log_level="WARNING",
+        )
+    assert np.array_equal(capped, none)
+    assert "--smearing-subsamples 1 caps" in caplog.text  # capped-to-nothing is still said out loud
+
+
+def test_fft_subsample_matches_the_dft_analytic_reference(smear_ms):
+    """The two smearing spellings approximate the same top-hat averages (FLAT sky).
+
+    Tolerance is the sub-sampled average's ~1% midpoint bias, not gridder epsilon:
+    subsample is a ~1% method by construction (PHASE_TOL).
+    """
+    img = _off_axis_image(smear_ms)
+    none = _run(smear_ms.ms, "SS_PLAIN", fits_sky=img, predict_backend="fft", smearing="none")
+    dft = _run(smear_ms.ms, "SS_DFT", fits_sky=img, predict_backend="dft", smearing="analytic")
+    sub = _run(
+        smear_ms.ms,
+        "SS_FFT",
+        fits_sky=img,
+        predict_backend="fft",
+        smearing="subsample",
+        smearing_subsamples=48,
+    )
+    scale = np.abs(dft).max()
+    # The regime must be real smearing, or the comparison passes vacuously.
+    assert (np.abs(dft) / np.abs(none)).min() < 0.9
+    np.testing.assert_allclose(sub, dft, rtol=0, atol=0.02 * scale)
+
+
+def test_subsample_converges_toward_the_analytic_reference(smear_ms):
+    img = _off_axis_image(smear_ms)
+    dft = _run(smear_ms.ms, "SS_REF", fits_sky=img, predict_backend="dft", smearing="analytic")
+    coarse = _run(
+        smear_ms.ms, "SS_N2", fits_sky=img, predict_backend="fft", smearing="subsample", smearing_subsamples=2
+    )
+    fine = _run(smear_ms.ms, "SS_N6", fits_sky=img, predict_backend="fft", smearing="subsample", smearing_subsamples=6)
+    err_coarse = np.abs(coarse - dft).max()
+    err_fine = np.abs(fine - dft).max()
+    # Margin, not strict monotonicity: the fine error bottoms out at the ~1%
+    # method floor, which strictness would trip over.
+    assert err_fine < 0.5 * err_coarse
+
+
+def test_subsample_is_invariant_under_chunking(smear_ms):
+    """Counts are frozen from MS-global bounds, so chunking cannot move the model."""
+    img = _off_axis_image(smear_ms)
+    kw = dict(fits_sky=img, predict_backend="fft", smearing="subsample", smearing_subsamples=4)
+    ref = _run(smear_ms.ms, "SS_CHUNK_A", **kw)
+    rechunked = _run(smear_ms.ms, "SS_CHUNK_B", chan_chunks=1, row_chunks=500, **kw)
+    np.testing.assert_allclose(rechunked, ref, rtol=1e-6, atol=0)
+
+
+def test_noise_is_added_once_outside_the_average(smear_ms):
+    """Noise inside the sub-sample loop would shrink by sqrt(n_t*n_nu) and correlate."""
+    img = _off_axis_image(smear_ms)
+    kw = dict(fits_sky=img, predict_backend="fft", sefd=400.0, seed_noise=7)
+    sub_kw = dict(smearing="subsample", smearing_subsamples=4)
+    clean_sub = _run(smear_ms.ms, "NZ_SC", fits_sky=img, predict_backend="fft", **sub_kw)
+    noisy_sub = _run(smear_ms.ms, "NZ_SN", **kw, **sub_kw)
+    clean_none = _run(smear_ms.ms, "NZ_NC", fits_sky=img, predict_backend="fft", smearing="none")
+    noisy_none = _run(smear_ms.ms, "NZ_NN", smearing="none", **kw)
+    rms_sub = np.std(noisy_sub - clean_sub)
+    rms_none = np.std(noisy_none - clean_none)
+    assert rms_none > 0
+    np.testing.assert_allclose(rms_sub, rms_none, rtol=0.02)
+
+
+def _cube_image(holder, ms, npix=64, cell=30.0 / 3600, offset=20):
+    """A 2-channel cube on the MS's own frequency grid, one off-axis pixel per channel."""
+    from astropy.io import fits
+
+    freqs = xds_from_table(f"{ms}::SPECTRAL_WINDOW")[0].CHAN_FREQ.data[0].compute()
+    header = fits.Header()
+    header["CTYPE1"], header["CRVAL1"] = "RA---SIN", 0.0
+    header["CDELT1"], header["CRPIX1"], header["CUNIT1"] = -cell, npix // 2 + 1, "deg"
+    header["CTYPE2"], header["CRVAL2"] = "DEC--SIN", -30.0
+    header["CDELT2"], header["CRPIX2"], header["CUNIT2"] = cell, npix // 2 + 1, "deg"
+    header["CTYPE3"], header["CRVAL3"] = "FREQ", float(freqs[0])
+    header["CDELT3"], header["CRPIX3"], header["CUNIT3"] = float(freqs[1] - freqs[0]), 1, "Hz"
+    header["BUNIT"] = "Jy/pixel"
+    data = np.zeros((freqs.size, npix, npix))
+    data[0, npix // 2 - offset, npix // 2] = 3.0
+    data[1, npix // 2 - offset, npix // 2] = 1.5  # a line-ish spectrum, so the cube is kept
+    path = holder.random_named_file(suffix=".fits")
+    fits.PrimaryHDU(data, header=header).writeto(path, overwrite=True)
+    return path
+
+
+def test_perchan_cube_is_smeared_under_subsample(smear_ms):
+    """The whole perchan backend -- its per-channel DFT sub-branch included -- sits inside the average."""
+    img = _cube_image(smear_ms, smear_ms.ms)
+    kw = dict(fits_sky=img, predict_backend="perchan", fits_spectrum="cube")
+    none = _run(smear_ms.ms, "PC_NONE", smearing="none", **kw)
+    sub = _run(smear_ms.ms, "PC_SUB", smearing="subsample", **kw)
+    ratio = np.abs(sub) / np.abs(none)
+    assert (ratio <= 1.0 + 1e-6).all()
+    assert ratio.min() < 0.9
+
+
+def test_aterm_beams_are_smeared_under_subsample(smear_ms):
+    """Sub-sampling wraps the a-term backend whole: shifted times track the beam, shifted uvw the fringe."""
+    from daskms import xds_from_table as _xt
+
+    img = _off_axis_image(smear_ms)
+    labels = np.unique(np.asarray(_xt(f"{smear_ms.ms}::ANTENNA")[0].TELESCOPE_NAME.data.compute()))
+    beams = smear_ms.random_named_file(suffix=".yaml")
+    with open(beams, "w") as fh:
+        for label in labels:
+            fh.write(f"{label}:\n  jimbeam: MKAT-MA-L-JIM-2026\n")
+    kw = dict(fits_sky=img, predict_backend="fft", primary_beam=beams)
+    none = _run(smear_ms.ms, "AT_NONE", smearing="none", **kw)
+    sub = _run(smear_ms.ms, "AT_SUB", smearing="subsample", smearing_subsamples=2, **kw)
+    ratio = np.abs(sub) / np.abs(none)
+    assert (ratio <= 1.0 + 1e-2).all(), "sub-sampling can only take amplitude away"
+    uvw = _column(smear_ms.ms, "UVW")
+    length = np.linalg.norm(uvw, axis=1)
+    long_ = length > np.median(length)
+    assert ratio[long_].mean() < ratio[~long_].mean()
+
+
+class _FineTest(InitTest):
+    def __init__(self):
+        self.test_files = []
+        self.ms = self.random_named_directory(suffix=".ms")
+        create_ms(
+            self.ms,
+            telescope_name="meerkat",
+            pointing_direction=["J2000", "0deg", "-30deg"],
+            dtime=1,
+            ntimes=2,
+            start_freq="1420MHz",
+            dfreq="0.01MHz",
+            nchan=2,
+            correlations=["XX", "YY"],
+            row_chunks=100000,
+            sefd=None,
+            column="DATA",
+            start_time="2025-03-06T20:00:00",
+            smooth=None,
+            fit_order=None,
+            subarray_range=[0, 16],
+        )
+
+
+def test_negligible_smearing_costs_a_single_pass(caplog):
+    holder = _FineTest()
+    img = _off_axis_image(holder, npix=64, offset=20)
+    none = _run(holder.ms, "FN_NONE", fits_sky=img, predict_backend="fft", smearing="none")
+    with caplog.at_level("INFO", logger="skysim"):
+        sub = _run(holder.ms, "FN_SUB", fits_sky=img, predict_backend="fft", smearing="subsample", log_level="INFO")
+    assert np.array_equal(sub, none)
+    assert "single unsmeared pass" in caplog.text

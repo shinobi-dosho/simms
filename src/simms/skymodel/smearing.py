@@ -46,16 +46,35 @@ Imaging in Radio Astronomy II*): the average is taken about the channel and
 interval centres, so the phase is unshifted and only the amplitude changes.
 That holds while the fringe rate is constant across one integration, which it
 is for any sane ``dt``.
+
+**Sub-sampling** (:class:`SubsampleSmearing`) is the second route, for the
+gridder backends, which transform whole images and cannot carry a
+per-visibility factor: predict the whole backend at several sub-times and
+sub-frequencies and average. Sub-times need the ``uvw`` a fraction of a dump
+away from the row's dump-centre value, which is an *exact* rotation: with
+``A(dec)`` the fixed declination tilt and ``R_z`` the plain rotation about the
+polar axis,
+
+    uvw(t + dt) = A(dec) . R_z(w0*dt) . A(dec)^T . uvw(t)
+
+(differentiating at ``dt = 0`` reproduces the derivative triplet above).
+Sub-frequencies shift each channel by fractions of its own (signed) width.
+Midpoint offsets make one sub-sample per axis the unsmeared prediction, and the
+per-axis counts are frozen once per run from MS-global worst-case phase swings
+(:func:`worst_case_swings`/:func:`subsample_counts`), so the model cannot
+depend on how the run was chunked. The average carries a one-sided midpoint
+bias of up to ``1/sinc(PHASE_TOL/4) - 1`` (about 1%) -- a ~1% method, unlike
+the analytic factor's ~1e-4 on the DFT path.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
-from simms.constants import OMEGA_EARTH
+from simms.constants import OMEGA_EARTH, PI, C
 
 log = logging.getLogger(__name__)
 
@@ -130,4 +149,132 @@ class Smearing:
         out[:, 0] = half * (w * self.cos_dec0 - v * self.sin_dec0)
         out[:, 1] = half * self.sin_dec0 * u
         out[:, 2] = -half * self.cos_dec0 * u
+        return out
+
+
+PHASE_TOL = 0.5
+"""Largest full phase swing (radians) allowed across one sub-interval.
+
+The midpoint average of a linear phasor over-estimates the top-hat average by
+``1/sinc(swing/4)`` per sub-interval half-swing; at 0.5 rad that bias is ~1%,
+one-sided (it does not average out across sub-samples).
+"""
+
+
+def midpoint_fractions(n: int) -> np.ndarray:
+    """Centres of ``n`` equal sub-intervals of ``[-1/2, 1/2]``.
+
+    ``n == 1`` gives ``[0.0]``: the single sub-sample *is* the unsmeared
+    evaluation, which is what makes auto-chosen counts free when smearing is
+    negligible.
+    """
+    return (np.arange(int(n)) + 0.5) / int(n) - 0.5
+
+
+def worst_case_swings(
+    uvw_max: float, exposure_max: float, chan_width_max: float, nu_max: float, theta_max: float
+) -> tuple[float, float]:
+    """Full phase swings across one dump and one channel for the worst-placed source.
+
+    ``theta_max`` is the largest ``||(l, m, n - 1)||`` the model can reach (for an
+    image, its corners); ``base = 2*pi*|uvw|*theta/c`` then bounds the residual
+    phase per unit frequency, ``|d(uvw)/dt| <= w0*|uvw|`` bounds the fringe rate,
+    and the time swing is evaluated at the highest sub-frequency
+    (``nu_max + chan_width_max/2``). Plain floats in, plain floats out -- the
+    caller derives the bounds (this module knows nothing about images or MSs).
+
+    Returns
+    -------
+    (swing_t, swing_nu) : tuple of float
+        Full swings in radians over one integration and one channel.
+    """
+    base_max = 2.0 * PI * abs(uvw_max) * abs(theta_max) / C
+    swing_nu = abs(chan_width_max) * base_max
+    swing_t = abs(exposure_max) * OMEGA_EARTH * (abs(nu_max) + 0.5 * abs(chan_width_max)) * base_max
+    return swing_t, swing_nu
+
+
+def subsample_counts(swing_t: float, swing_nu: float, cap: int) -> tuple[int, int]:
+    """Smallest per-axis counts keeping each sub-interval's swing below ``PHASE_TOL``.
+
+    Clipped to ``[1, cap]``; the caller warns when the cap truncates, since a
+    capped run over-predicts the residual amplitude systematically.
+
+    Returns
+    -------
+    (n_time, n_freq) : tuple of int
+    """
+    cap = max(int(cap), 1)
+
+    def count(swing: float) -> int:
+        return int(np.clip(np.ceil(swing / PHASE_TOL), 1, cap))
+
+    return count(swing_t), count(swing_nu)
+
+
+@dataclass(frozen=True)
+class SubsampleSmearing:
+    """Sub-sampled time/bandwidth smearing for the gridder prediction backends.
+
+    Carries what :func:`simms.skymodel.fits_skies.predict_fits_block` needs to
+    average whole-backend predictions over the dump and the channel: the signed
+    per-channel widths (sliced alongside the channel grid by
+    :meth:`select_channels`), the phase-centre declination that sets how a
+    baseline turns, and the per-axis counts -- frozen at build time from
+    MS-global bounds so the result cannot depend on row or channel chunking.
+
+    Attributes
+    ----------
+    chan_width : numpy.ndarray
+        ``(nchan,)`` signed channel widths (Hz); a descending grid's negative
+        widths shift the sub-frequencies the right way with no special case.
+    sin_dec0, cos_dec0 : float
+        Sine and cosine of the phase-centre declination.
+    n_time, n_freq : int
+        Sub-samples per dump and per channel (1 means no sub-sampling on that
+        axis; (1, 1) is bypassed entirely by the caller).
+    """
+
+    chan_width: np.ndarray
+    sin_dec0: float
+    cos_dec0: float
+    n_time: int
+    n_freq: int
+
+    @classmethod
+    def from_ms(cls, chan_width, dec0: float, n_time: int, n_freq: int) -> SubsampleSmearing:
+        """Build from a ``SPECTRAL_WINDOW.CHAN_WIDTH`` row, the phase-centre dec (radians), and frozen counts."""
+        widths = np.atleast_1d(np.asarray(chan_width, dtype=np.float64))
+        return cls(
+            chan_width=widths,
+            sin_dec0=float(np.sin(dec0)),
+            cos_dec0=float(np.cos(dec0)),
+            n_time=int(n_time),
+            n_freq=int(n_freq),
+        )
+
+    def select_channels(self, chan_ids: np.ndarray) -> SubsampleSmearing:
+        """Restrict to a subset of channels, alongside the prepared sky's own slicing."""
+        return replace(self, chan_width=self.chan_width[chan_ids])
+
+    def rotate_uvw(self, uvw: np.ndarray, dt) -> np.ndarray:
+        """``uvw`` as it will stand ``dt`` seconds later, exactly.
+
+        Applies ``A(dec) . R_z(w0*dt) . A(dec)^T`` per row (see the module
+        docstring); ``dt`` may be a scalar or per-row array, since ``EXPOSURE``
+        can vary by row. ``dt`` of all zeros returns the input array unchanged --
+        the rotation's ``sin^2 + cos^2`` terms are only ulp-exact, and callers
+        rely on the zero-offset sub-sample being *identical* to no smearing.
+        """
+        uvw = np.asarray(uvw, dtype=np.float64)
+        phi = OMEGA_EARTH * np.broadcast_to(np.asarray(dt, dtype=np.float64), uvw.shape[:1])
+        if not np.any(phi):
+            return uvw
+        ch, sh = np.cos(phi), np.sin(phi)
+        s, c = self.sin_dec0, self.cos_dec0
+        u, v, w = uvw[:, 0], uvw[:, 1], uvw[:, 2]
+        out = np.empty_like(uvw)
+        out[:, 0] = ch * u - s * sh * v + c * sh * w
+        out[:, 1] = s * sh * u + (s * s * ch + c * c) * v + s * c * (1.0 - ch) * w
+        out[:, 2] = -c * sh * u + s * c * (1.0 - ch) * v + (c * c * ch + s * s) * w
         return out

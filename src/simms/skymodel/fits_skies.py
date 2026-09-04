@@ -49,7 +49,7 @@ from simms.skymodel.fits_spectrum import (
 )
 from simms.skymodel.kernels import is_uniform_grid, predict_vis
 from simms.skymodel.mstools import add_noise, smear_kernel_args, stack_unpolarised_vis
-from simms.skymodel.smearing import Smearing
+from simms.skymodel.smearing import Smearing, SubsampleSmearing, midpoint_fractions
 from simms.utilities import is_range_in_range, radec2lm
 
 log = logging.getLogger(__name__)
@@ -145,9 +145,14 @@ class PreparedFitsSky:
     aterm: object | None = None
     chan_ids: np.ndarray | None = None
 
-    # DFT backend only: time/bandwidth smearing (see simms.skymodel.smearing). The
-    # gridder backends integrate whole images and cannot carry a per-visibility factor.
+    # Time/bandwidth smearing (see simms.skymodel.smearing). The DFT backend carries
+    # the analytic per-visibility factor in ``smearing``; the gridder backends integrate
+    # whole images and cannot, so they instead carry ``subsample``, which makes
+    # predict_fits_block average whole-backend predictions over the dump and the
+    # channel. skysim attaches exactly one of the two, never both -- the analytic
+    # factor inside a sub-sampled average would double-count.
     smearing: Smearing | None = None
+    subsample: SubsampleSmearing | None = None
 
     @property
     def nspec(self) -> int:
@@ -175,6 +180,8 @@ class PreparedFitsSky:
             updates["uniform_freqs"] = is_uniform_grid(self.chan_freqs[chan_ids])
         elif self.spectrum.kind is SpectralKind.CUBE:
             updates["planes"] = self.planes[..., chan_ids]
+        if self.subsample is not None:
+            updates["subsample"] = self.subsample.select_channels(chan_ids)
         return replace(self, **updates)
 
 
@@ -1023,8 +1030,10 @@ def _perchan_visibilities(prepared, uvw, epsilon, wgridding, nthreads):
                 np.ones((ncomp, 1)),
                 np.zeros(nrow, dtype=np.int64),
                 chan_vis,
-                # The gridder serves the dense channels of a perchan model, so
-                # smearing is refused for the backend as a whole (see skysim).
+                # No analytic factor here even under --smearing subsample: the whole
+                # perchan backend -- this DFT sub-branch included -- runs inside
+                # predict_fits_block's sub-sample average, and an analytic factor on
+                # top of that average would smear twice.
                 *smear_kernel_args(None, uvw, None),
             )
             if nspec != ncorr:
@@ -1100,8 +1109,9 @@ def predict_fits_block(
         an a-term (``prepared.aterm``); ignored otherwise.
     exposure : numpy.ndarray, optional
         Integration time per row (the MS ``EXPOSURE`` column, seconds). Required
-        when the model carries a :class:`~simms.skymodel.smearing.Smearing`,
-        which only the DFT backend supports.
+        when the model carries smearing of either kind -- the DFT backend's
+        analytic :class:`~simms.skymodel.smearing.Smearing`, or the gridder
+        backends' :class:`~simms.skymodel.smearing.SubsampleSmearing`.
     noise_vis : float, optional
         RMS noise per visibility (Jy).
     out_dtype : numpy.dtype, optional
@@ -1125,13 +1135,41 @@ def predict_fits_block(
         Visibilities of shape ``(nrow, nchan, ncorr)``.
     """
     uvw = np.ascontiguousarray(uvw, dtype=np.float64)
+
+    sub = prepared.subsample
+    if sub is None or prepared.backend == "dft" or (sub.n_time == 1 and sub.n_freq == 1):
+        # The (1, 1) bypass is load-bearing, not an optimisation: rotate_uvw(uvw, 0)
+        # is only ulp-exact and an accumulate-then-divide changes bits, so the
+        # single-sub-sample case must be *identical* to an unsmeared call.
+        vis = _predict_fits_once(prepared, uvw, times, antenna1, antenna2, exposure, epsilon, do_wgridding, nthreads)
+    else:
+        vis = _predict_fits_subsampled(
+            prepared, uvw, times, antenna1, antenna2, exposure, epsilon, do_wgridding, nthreads
+        )
+
+    # Noise stays outside the sub-sample average: averaged inside it would shrink by
+    # sqrt(n_time * n_freq) and correlate across sub-samples.
+    if noise_vis:
+        vis = add_noise(vis, noise_vis, seed=seed)
+    if out_dtype is not None:
+        vis = vis.astype(out_dtype, copy=False)
+    return vis
+
+
+def _predict_fits_once(prepared, uvw, times, antenna1, antenna2, exposure, epsilon, do_wgridding, nthreads):
+    """One backend dispatch: a single monochromatic, instantaneous prediction.
+
+    ``exposure`` is consumed only by the DFT branch (the analytic smearing factor);
+    the gridder branches take their time/bandwidth handling from the sub-sample
+    wrapper around this function.
+    """
     nrow, nchan, ncorr = uvw.shape[0], prepared.chan_freqs.size, prepared.ncorr
 
     if prepared.aterm is not None:
         from simms.skymodel.aterms import predict_aterm_block
 
-        vis = predict_aterm_block(prepared, uvw, times, antenna1, antenna2, epsilon, do_wgridding, nthreads)
-    elif prepared.backend == "dft":
+        return predict_aterm_block(prepared, uvw, times, antenna1, antenna2, epsilon, do_wgridding, nthreads)
+    if prepared.backend == "dft":
         vis = np.zeros((nrow, nchan, prepared.nspec), dtype=np.complex128)
         if prepared.ncomp:
             ncomp = prepared.ncomp
@@ -1150,36 +1188,108 @@ def predict_fits_block(
             )
         if prepared.nspec != ncorr:
             vis = stack_unpolarised_vis(vis[..., 0], ncorr)
-    elif prepared.backend == "perchan":
-        vis = _perchan_visibilities(prepared, uvw, epsilon, do_wgridding, nthreads)
-    else:
-        stokes_vis = np.stack(
-            [
-                _fft_stokes_visibilities(
-                    plane,
-                    prepared.spectrum,
-                    prepared.grid,
-                    uvw,
-                    prepared.chan_freqs,
-                    prepared.npix_l,
-                    prepared.npix_m,
+        return vis
+    if prepared.backend == "perchan":
+        return _perchan_visibilities(prepared, uvw, epsilon, do_wgridding, nthreads)
+
+    stokes_vis = np.stack(
+        [
+            _fft_stokes_visibilities(
+                plane,
+                prepared.spectrum,
+                prepared.grid,
+                uvw,
+                prepared.chan_freqs,
+                prepared.npix_l,
+                prepared.npix_m,
+                epsilon,
+                do_wgridding,
+                nthreads,
+            )
+            for plane in prepared.planes
+        ]
+    )
+    corrs = stokes_to_correlations(
+        _stokes_getter(stokes_vis, prepared.stokes_names),
+        ncorr,
+        prepared.polarisation,
+        prepared.linear_basis,
+    )
+    return np.stack(corrs, axis=-1)
+
+
+def _shifted(prepared, freqs):
+    """``prepared`` with its channel grid moved to ``freqs``.
+
+    ``uniform_freqs`` is recomputed even though the DFT backend -- its only
+    consumer -- is excluded from the sub-sample loop today: extending sub-sampling
+    to it must not silently hand the uniform-grid recurrence a stale flag.
+    """
+    return replace(prepared, chan_freqs=freqs, uniform_freqs=is_uniform_grid(freqs))
+
+
+def _predict_fits_subsampled(prepared, uvw, times, antenna1, antenna2, exposure, epsilon, do_wgridding, nthreads):
+    """Average whole-backend predictions over the dump and the channel.
+
+    The correlator integrates the *whole* instrument response over ``EXPOSURE``
+    and ``CHAN_WIDTH``; every gridder backend is a pure function of
+    ``(prepared.chan_freqs, uvw, times)``, so predicting at midpoint sub-times
+    (``uvw`` rotated exactly, ``times`` shifted so beams track) and sub-frequencies
+    (each channel shifted by fractions of its own signed width) and averaging
+    reproduces that -- to the ~1% midpoint bias the counts are chosen for
+    (see :mod:`simms.skymodel.smearing`).
+
+    For the fft backend with a FLAT spectrum the frequency axis is expanded into
+    one call instead of looped: that path serves the whole band from a single
+    image FFT, so looping would pay ``n_freq`` FFTs for degrid-only work. The
+    loop form remains for POLY (per-channel passes either way), CUBE/perchan
+    (per-channel planes; repeating them would multiply memory) and a-term
+    (per-channel pass structure and ``chan_ids`` bookkeeping).
+    """
+    sub: SubsampleSmearing = prepared.subsample
+    if exposure is None:
+        raise ValueError(
+            "time/bandwidth smearing needs the per-row integration time; pass the MS EXPOSURE column as 'exposure'."
+        )
+    exposure = np.asarray(exposure, dtype=np.float64)
+    nchan = prepared.chan_freqs.size
+    freq_fracs = midpoint_fractions(sub.n_freq)
+    expand = (
+        prepared.aterm is None
+        and prepared.backend == "fft"
+        and prepared.spectrum.kind is SpectralKind.FLAT
+        and sub.n_freq > 1
+    )
+    if expand:
+        # Interleave each channel's sub-frequencies: (nchan, n_freq) -> flat.
+        freqs_e = (prepared.chan_freqs[:, None] + freq_fracs[None, :] * sub.chan_width[:, None]).ravel()
+        prepared_e = _shifted(prepared, freqs_e)
+
+    vis = None
+    for ft in midpoint_fractions(sub.n_time):
+        dt = ft * exposure
+        uvw_t = sub.rotate_uvw(uvw, dt)  # returns uvw itself when dt is all zeros
+        times_t = times + dt if (times is not None and ft) else times
+        if expand:
+            part = _predict_fits_once(
+                prepared_e, uvw_t, times_t, antenna1, antenna2, exposure, epsilon, do_wgridding, nthreads
+            )
+            part = part.reshape(part.shape[0], nchan, sub.n_freq, part.shape[-1]).mean(axis=2)
+        else:
+            part = None
+            for fn in freq_fracs:
+                once = _predict_fits_once(
+                    _shifted(prepared, prepared.chan_freqs + fn * sub.chan_width),
+                    uvw_t,
+                    times_t,
+                    antenna1,
+                    antenna2,
+                    exposure,
                     epsilon,
                     do_wgridding,
                     nthreads,
                 )
-                for plane in prepared.planes
-            ]
-        )
-        corrs = stokes_to_correlations(
-            _stokes_getter(stokes_vis, prepared.stokes_names),
-            ncorr,
-            prepared.polarisation,
-            prepared.linear_basis,
-        )
-        vis = np.stack(corrs, axis=-1)
-
-    if noise_vis:
-        vis = add_noise(vis, noise_vis, seed=seed)
-    if out_dtype is not None:
-        vis = vis.astype(out_dtype, copy=False)
-    return vis
+                part = once if part is None else part + once
+            part /= sub.n_freq
+        vis = part if vis is None else vis + part
+    return vis / sub.n_time
