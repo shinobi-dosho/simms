@@ -1,5 +1,24 @@
 ### 3.0.1 -> unreleased
 
+- `skysim`: new `--smearing subsample` brings time/bandwidth smearing to the
+  FITS gridder backends (`fft`, `perchan` and a-term beams), which the analytic
+  factor cannot reach: the whole backend prediction is repeated at sub-times
+  within each dump and sub-frequencies within each channel and averaged, which
+  is what the correlator does. Sub-dump `uvw` are rotated *exactly* (a 3x3
+  rotation from the phase-centre declination -- no hour angle needed, no
+  small-angle approximation) and a-term beams track the shifted times; for a
+  flat-spectrum image on the `fft` backend the sub-frequencies ride one
+  expanded gridder call, so the extra cost there is degridding only. Per-axis
+  counts are frozen once per run from MS-global bounds -- never per dask block,
+  so the model cannot depend on `--row-chunks`/`--nworkers` -- and come out 1x1
+  (free) when the MS does not smear; `--smearing-subsamples` caps them
+  (default 8), and a capped run warns with the residual amplitude bias it
+  accepts. Sub-sampling is a ~1% method (the counts hold the per-sub-interval
+  phase swing at 0.5 rad), so the per-visibility paths keep the analytic
+  factor (~1e-4) even under `subsample`; thermal noise is added once, outside
+  the average, so it is neither shrunk nor correlated by the sub-sampling. The
+  `--smearing analytic` gridder warning now points at `--smearing subsample`.
+
 - `skysim`: predicted visibilities now carry time and bandwidth smearing, via
   the new `--smearing` option (`analytic`, the default, or `none` for the
   previous monochromatic, instantaneous prediction). The correlator averages

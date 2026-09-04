@@ -89,8 +89,19 @@ the Earth at the **phase-centre** declination (`FIELD.PHASE_DIR`, not the pointi
 the phase centre, and `sinc` is even, so an overall `uvw` sign convention cannot flip them.
 Only the per-visibility kernels carry it: ASCII, WSClean, and FITS on the `dft` backend
 (including the component bridge). The gridder and a-term backends warn and predict unsmeared
-rather than pretend. A smeared `PreparedSky` needs the per-row `EXPOSURE` passed alongside
-the `UVW`, so blockwise gains an extra row argument.
+rather than pretend -- unless `--smearing subsample` is given, which wraps the *whole*
+backend in an average over sub-times (uvw rotated exactly via `A R_z(w dt) A^T` from the
+phase-centre dec; beams track the shifted times) and sub-frequencies (fractions of each
+channel's signed width). Sub-sample counts are frozen once per run from MS-global bounds --
+never per dask block, or the model would depend on `--row-chunks`/`--nworkers` -- 1x1 when
+nothing smears, capped by `--smearing-subsamples` with a WARNING quoting the bias a capped
+run accepts. It is a ~1% method (midpoint bias at `PHASE_TOL` = 0.5 rad), so the
+per-visibility paths keep the analytic factor even under `subsample`, and exactly one of
+`smearing`/`subsample` is ever attached (both at once would smear twice). The (1,1) case
+bypasses the loop entirely -- `rotate_uvw(uvw, 0)` is only ulp-exact, and the single
+sub-sample must be *identical* to no smearing. A smeared `PreparedSky` (or subsample-carrying
+`PreparedFitsSky`) needs the per-row `EXPOSURE` passed alongside the `UVW`, so blockwise
+gains an extra row argument gated on whichever smearing object was attached.
 
 ## Corruptions
 

@@ -59,6 +59,7 @@ def skysim_opts(ms, ascii_sky=None, column="DATA", **overrides):
         "input_column": None,
         "mode": "sim",
         "smearing": "analytic",
+        "smearing_subsamples": 8,
         "column": column,
         "seed": None,
         "seed_noise": None,

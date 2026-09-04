@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import logging
 import os.path
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Literal
 
@@ -30,7 +31,7 @@ from simms.skymodel.mstools import (
     to_full_corr,
     vis_noise_from_sefd_and_ms,
 )
-from simms.skymodel.smearing import Smearing
+from simms.skymodel.smearing import PHASE_TOL, Smearing, SubsampleSmearing, subsample_counts, worst_case_swings
 from simms.skymodel.wsclean_skies import prepare_wsclean_sky
 
 log = logging.getLogger(BIN.skysim)
@@ -46,9 +47,12 @@ def _beam_row_args(msds, beam_ctx):
 def _exposure_row_args(msds, smearing):
     """The ``(EXPOSURE, idx)`` blockwise args, or a ``None`` slot when not smearing.
 
-    ``EXPOSURE`` is the time actually integrated over, which is what smears; MSv2
-    requires it, but an MS written without it falls back to ``INTERVAL`` (the same
-    thing whenever there is no dead time between dumps).
+    ``smearing`` is whichever smearing object ended up attached to the prepared
+    sky -- the analytic ``Smearing`` or a gridder-backend ``SubsampleSmearing`` --
+    or ``None`` when the model is predicted unsmeared. ``EXPOSURE`` is the time
+    actually integrated over, which is what smears; MSv2 requires it, but an MS
+    written without it falls back to ``INTERVAL`` (the same thing whenever there
+    is no dead time between dumps).
     """
     if smearing is None:
         return (None, None)
@@ -56,6 +60,82 @@ def _exposure_row_args(msds, smearing):
         return (msds.EXPOSURE.data, ("row",))
     log.warning("The MS has no EXPOSURE column; time smearing uses INTERVAL instead.")
     return (msds.INTERVAL.data, ("row",))
+
+
+def _midpoint_bias(swing: float, n: int) -> float:
+    """One-sided over-estimate of the midpoint average: ``1/sinc(swing/(2n)) - 1``."""
+    half = swing / (2.0 * max(n, 1))
+    return float(1.0 / np.sinc(half / np.pi) - 1.0)
+
+
+def _attach_subsample(opts, msds, prepared, freqs, chan_width, dec0):
+    """Freeze MS-global sub-sample counts and attach them to a gridder-backend model.
+
+    Counts come from whole-selection bounds (max ``|uvw|``, max ``EXPOSURE``, the
+    image's largest corner offset), computed once per run and never per dask
+    block: per-block counts would make the *model visibilities* depend on
+    ``--row-chunks``/``--nworkers``, and predictions here stay chunking-invariant
+    (the same rule the corruption phase references follow). Returns the prepared
+    model and whichever smearing object was attached (``None`` when the counts
+    come out (1, 1) -- then sub-sampling is the unsmeared prediction and nothing
+    needs the ``EXPOSURE`` column).
+    """
+    exp_col = msds.EXPOSURE.data if hasattr(msds, "EXPOSURE") else msds.INTERVAL.data
+    uvw_max, exposure_max = dask.compute(
+        da.sqrt((msds.UVW.data**2).sum(axis=1)).max(),
+        exp_col.max(),
+    )
+    # Largest ||(l, m, n - 1)|| the image reaches: its corners, on a rectangular grid.
+    ii = np.array([0.0, 0.0, prepared.npix_l - 1.0, prepared.npix_l - 1.0])
+    jj = np.array([0.0, prepared.npix_m - 1.0, 0.0, prepared.npix_m - 1.0])
+    theta_max = float(np.linalg.norm(prepared.grid.pixel_lmn(ii, jj), axis=-1).max())
+
+    width_max = float(np.abs(chan_width).max())
+    swing_t, swing_nu = worst_case_swings(
+        float(uvw_max), float(exposure_max), width_max, float(np.abs(freqs).max()), theta_max
+    )
+    cap = int(opts.smearing_subsamples)
+    n_t, n_nu = subsample_counts(swing_t, swing_nu, cap)
+    wanted_t = max(int(np.ceil(swing_t / PHASE_TOL)), 1)
+    wanted_nu = max(int(np.ceil(swing_nu / PHASE_TOL)), 1)
+
+    backend = f"{prepared.backend!r} FITS backend" + (" with a-term beams" if prepared.aterm is not None else "")
+    if (wanted_t, wanted_nu) != (n_t, n_nu):
+        # A capped run over-predicts the residual amplitude systematically (the
+        # midpoint bias is one-sided), so this is a degraded run, not bookkeeping.
+        log.warning(
+            "--smearing-subsamples %d caps the sub-sampling on the %s: %d (time) x %d (freq) "
+            "sub-samples are needed to hold the worst-case amplitude bias near 1%%, running "
+            "%d x %d instead (worst-case bias ~%.0f%% time, ~%.0f%% bandwidth). Raise the cap "
+            "for a more accurate (and costlier) model.",
+            cap,
+            backend,
+            wanted_t,
+            wanted_nu,
+            n_t,
+            n_nu,
+            100 * _midpoint_bias(swing_t, n_t),
+            100 * _midpoint_bias(swing_nu, n_nu),
+        )
+    if n_t == 1 and n_nu == 1:
+        if (wanted_t, wanted_nu) == (1, 1):
+            log.info(
+                "Time/bandwidth smearing is negligible for this MS and image (worst-case swings "
+                "%.3f/%.3f rad); the %s runs a single unsmeared pass.",
+                swing_t,
+                swing_nu,
+                backend,
+            )
+        # (A cap of 1 also lands here; the capped-run warning above already said so.)
+        return prepared, None
+    log.info(
+        "Sub-sampling the %s: %d (time) x %d (freq) sub-samples per visibility.",
+        backend,
+        n_t,
+        n_nu,
+    )
+    prepared = replace(prepared, subsample=SubsampleSmearing.from_ms(chan_width, dec0, n_t, n_nu))
+    return prepared, prepared.subsample
 
 
 def _array_lonlat(positions):
@@ -149,6 +229,14 @@ class _BeamContext:
         self.ncorr = ncorr
         self.t_start = float(t0)
         self.duration = float(t1 - t0) + float(interval)
+        if opts.smearing == "subsample":
+            # Sub-dump times reach half a dump before the first dump *centre*, where
+            # row_time_bins would silently clip to the edge PA knot; widen the grid
+            # so it interpolates instead. (The top end already carries a dump of
+            # slack: duration spans to t1 + interval.)
+            half = 0.5 * float(interval)
+            self.t_start -= half
+            self.duration += half
         self.pa_step = opts.beam_pa_step
         self.beam_grid_max_gib = opts.beam_grid_max_gib
 
@@ -319,9 +407,18 @@ def runit(opts):
     # Time/bandwidth smearing. Real visibilities are averaged over a channel and an
     # integration, so a monochromatic instantaneous model over-predicts every source
     # off the phase centre -- silently over-subtracting under --mode subtract. The
-    # decorrelation is a real sinc factor on the phasor, so only the per-visibility
-    # (DFT/component) kernels can carry it; the gridder backends warn below.
-    smearing = Smearing.from_ms(chan_width, dec0) if opts.smearing == "analytic" else None
+    # per-visibility (DFT/component) kernels carry the analytic sinc factor; under
+    # --smearing subsample the gridder backends instead average whole-backend
+    # predictions over sub-times and sub-frequencies (built in the FITS branch,
+    # where the resolved backend and the image extent are known). 'subsample' on a
+    # per-visibility path applies the analytic factor -- it matches brute-force
+    # integration to ~1e-4 there, far beyond the sub-sampled average's ~1% bias.
+    smearing = Smearing.from_ms(chan_width, dec0) if opts.smearing in ("analytic", "subsample") else None
+    if opts.smearing == "subsample":
+        if opts.smearing_subsamples < 1:
+            raise RuntimeError("--smearing-subsamples must be at least 1.")
+        if ascii_sky or wsclean_sky:
+            log.info("--smearing subsample on a component sky model applies the analytic factor (see --help).")
 
     # Primary beam (sky models only, not noise-only runs). When enabled, the model must
     # carry every correlation so the per-feed voltage can be applied (nspec == ncorr).
@@ -534,23 +631,33 @@ def runit(opts):
             else:
                 prepared = beam_ctx.attach_aterm(prepared, opts.aterm_freq_tol)
 
-        # Only the per-visibility DFT kernels can carry a smearing factor. The
-        # gridder backends transform whole images, so a run that lands on one is
-        # told that its model is unsmeared rather than quietly being handed one.
+        # Smearing on the FITS paths, decided against the *resolved* backend (after
+        # prepare_fits_sky's own downgrades and the beam fallbacks above). The
+        # per-visibility DFT/component paths carry the analytic factor; the gridder
+        # backends cannot, so under --smearing subsample they average whole-backend
+        # predictions instead, and under --smearing analytic they warn and predict
+        # unsmeared rather than quietly being handed a smeared-looking model.
+        # `row_smear` is whichever object ended up attached, gating the EXPOSURE
+        # blockwise argument below.
+        row_smear = None
         if smearing is not None:
             if use_component_path or (prepared.backend == "dft" and prepared.aterm is None):
                 prepared = attach_smearing(prepared, smearing)
+                row_smear = smearing
+                if opts.smearing == "subsample":
+                    log.info("--smearing subsample on the DFT/component FITS path applies the analytic factor.")
+            elif opts.smearing == "subsample":
+                prepared, row_smear = _attach_subsample(opts, msds, prepared, freqs, chan_width, dec0)
             else:
                 log.warning(
                     "Time/bandwidth smearing is not applied on the %r FITS backend%s: the "
                     "model is predicted monochromatic and instantaneous, so sources far from "
                     "the phase centre are over-predicted on long baselines. Use "
-                    "--predict-backend dft (or an --ascii-sky/--wsclean-sky model) for a "
-                    "smeared prediction, or --smearing none to silence this.",
+                    "--smearing subsample to integrate over the channel and the dump, or "
+                    "--smearing none to silence this.",
                     prepared.backend,
                     " with a-term beams" if prepared.aterm is not None else "",
                 )
-                smearing = None
 
         epsilon = 1e-7 if opts.fft_precision == "double" else 1e-6
 
@@ -567,7 +674,7 @@ def runit(opts):
                 msds.TIME.data,
                 ("row",),
                 *_beam_row_args(msds, beam_ctx),
-                *_exposure_row_args(msds, smearing),
+                *_exposure_row_args(msds, row_smear),
                 out_dtype=vis_dtype,
                 new_axes={"corr": ncorr},
                 dtype=vis_dtype,
@@ -587,7 +694,7 @@ def runit(opts):
                 ("chan",),
                 *time_args,
                 *_beam_row_args(msds, beam_ctx if aterm_on else None),
-                *_exposure_row_args(msds, smearing),
+                *_exposure_row_args(msds, row_smear),
                 out_dtype=vis_dtype,
                 epsilon=epsilon,
                 do_wgridding=opts.do_wstacking,
@@ -831,14 +938,26 @@ def skysim(
         "Matches DDFacet's --Beam-FITSMAxis.",
         json_schema_extra={"abbreviation": "bma"},
     ),
-    smearing: Literal["analytic", "none"] = Field(
+    smearing: Literal["analytic", "subsample", "none"] = Field(
         "analytic",
-        description="Time and bandwidth smearing of the predicted model. 'analytic' applies the "
-        "sinc decorrelation implied by the MS's own CHAN_WIDTH and EXPOSURE, so the model matches "
-        "averaged data instead of over-predicting sources far from the phase centre on long "
-        "baselines; 'none' predicts a monochromatic, instantaneous model. Only the per-visibility "
-        "(ASCII, WSClean and FITS --predict-backend dft) paths can carry it; the FITS gridder "
-        "backends warn and predict unsmeared.",
+        description="Time and bandwidth smearing of the predicted model. 'analytic' (default) "
+        "applies the sinc decorrelation implied by the MS's own CHAN_WIDTH and EXPOSURE, so the "
+        "model matches averaged data instead of over-predicting sources far from the phase centre "
+        "on long baselines -- but only the per-visibility (ASCII, WSClean and FITS "
+        "--predict-backend dft) paths can carry it, and the FITS gridder backends warn and predict "
+        "unsmeared. 'subsample' additionally smears the gridder backends by averaging whole "
+        "predictions over sub-times and sub-frequencies (a ~1%% method; cost multiplies with the "
+        "sub-sample counts, chosen automatically and capped by --smearing-subsamples), while the "
+        "per-visibility paths keep the analytic factor. 'none' predicts a monochromatic, "
+        "instantaneous model everywhere.",
+    ),
+    smearing_subsamples: int = Field(
+        8,
+        ge=1,
+        description="Cap on the automatically chosen per-axis (time and frequency) sub-sample "
+        "counts under --smearing subsample; capped runs warn with the residual amplitude bias. "
+        "No effect for other --smearing modes.",
+        json_schema_extra={"abbreviation": "sss"},
     ),
     field_id: int = Field(0, description="Field ID.", json_schema_extra={"abbreviation": "fi"}),
     spw_id: int = Field(0, description="Spectral Window ID."),

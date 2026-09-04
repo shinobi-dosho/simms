@@ -148,8 +148,37 @@ Only the per-visibility kernels can carry the factor, so it applies to
 ``--ascii-sky``, ``--wsclean-sky`` and a ``--fits-sky`` predicted with
 ``--predict-backend dft`` (including the component bridge a FITS model with few
 bright pixels takes when a primary beam is attached).  The FITS gridder and
-a-term backends transform whole images and cannot; a run that lands on one
-warns and predicts unsmeared.
+a-term backends transform whole images and cannot; under the default they warn
+and predict unsmeared.
+
+``--smearing subsample`` closes that gap by integrating instead of correcting:
+the whole gridder prediction is repeated at sub-times within the dump (the
+``uvw`` rotated *exactly* to each sub-time, the beam tracking along) and at
+sub-frequencies within each channel, and averaged.
+
+.. code-block:: console
+
+    $ simms skysim --fits-sky model.fits --smearing subsample visdata.ms
+
+The per-axis sub-sample counts are chosen automatically, once per run from
+MS-global bounds (longest baseline, longest dump, widest channel, the image's
+corner offset), so the result cannot depend on ``--row-chunks`` or
+``--nworkers``; when smearing is negligible the counts are 1x1 and the run
+costs nothing extra.  ``--smearing-subsamples`` caps each axis (default 8) --
+cost multiplies with the counts -- and a capped run **warns** with the residual
+amplitude bias it accepts.
+
+Two caveats.  Sub-sampling is a ~1% method: the counts hold the per-sub-interval
+phase swing at 0.5 rad, a one-sided midpoint bias of about 1%, against the
+analytic factor's ~1e-4 on the per-visibility paths (which is why those paths
+keep the analytic factor even under ``subsample``).  And for an image with an
+analytic spectrum (``--fits-spectrum poly``) the sub-sampled average also
+integrates the *sky spectrum* over the channel -- more physical, but a real
+difference from the analytic factor, which smears only the phase; spectral
+cubes keep each channel's plane and shift only the gridding frequency, the same
+first-order treatment the analytic factor applies.  Note that under
+``--predict-backend auto`` the cost model decides between ``dft`` (analytic)
+and ``fft`` (sub-sampled); the log states which algorithm actually ran.
 
 Thermal noise
 -------------
