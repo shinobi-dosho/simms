@@ -2746,7 +2746,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.6" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "scipy" },
-    { name = "stimela-ninja", url = "https://github.com/shinobi-dosho/stimela-ninja/archive/ca13e63ba97ab937de54297a4b79011114b35cf8.tar.gz" },
+    { name = "stimela-ninja", url = "https://github.com/shinobi-dosho/stimela-ninja/archive/0cd6ea39e3481a4c6aa20f1fa1a6a07c7ee1c5e4.tar.gz" },
     { name = "tqdm" },
 ]
 
@@ -2963,7 +2963,7 @@ wheels = [
 [[package]]
 name = "stimela-ninja"
 version = "0.1.0b6"
-source = { url = "https://github.com/shinobi-dosho/stimela-ninja/archive/ca13e63ba97ab937de54297a4b79011114b35cf8.tar.gz" }
+source = { url = "https://github.com/shinobi-dosho/stimela-ninja/archive/0cd6ea39e3481a4c6aa20f1fa1a6a07c7ee1c5e4.tar.gz" }
 dependencies = [
     { name = "click" },
     { name = "packaging" },
@@ -2972,7 +2972,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "rich" },
 ]
-sdist = { hash = "sha256:06ec4e49341cab46e10761ee813486a25986fcf5303976a55d138048abf168d6" }
+sdist = { hash = "sha256:f29dd8d554d4c1b88bf334ffc09622a432d113a8e04eb3f1459754839ecffd3c" }
 
 [package.metadata]
 requires-dist = [
