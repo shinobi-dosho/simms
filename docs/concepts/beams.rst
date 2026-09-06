@@ -41,8 +41,11 @@ Choosing a beam model
 
 ``--primary-beam`` takes either of two things.
 
-**A simms beam-config YAML** maps each telescope/type label found in the
-``ANTENNA`` table to a beam model. The label comes from the column named by
+A simms beam-config YAML
+...........................
+
+A YAML file maps each telescope/type label found in the ``ANTENNA`` table to a
+beam model. The label comes from the column named by
 ``--telescope-name-column`` (default ``TELESCOPE_NAME``), which is the single
 source of truth for which antenna is which kind of dish:
 
@@ -101,11 +104,14 @@ The bundled ``MKAT-AA-*`` tables and the cosine-taper model itself are vendored
 from `katbeam <https://github.com/ska-sa/katbeam>`_ under BSD-3-Clause; see
 ``src/simms/skymodel/beam_data/NOTICE``.
 
-**A Cattery/DDFacet heterogeneous-beam JSON** (any path ending in ``.json``) is
-the ``--Beam-FITSFile`` json form. It points at the same eight-file Cattery FITS
-sets, but types antennas DDFacet's way -- by raw ``ANTENNA.NAME``, not by the
-``TELESCOPE_NAME`` label a YAML config keys on -- so a config written for
-DDFacet can be handed to simms unchanged:
+A Cattery/DDFacet heterogeneous-beam JSON
+............................................
+
+Any path ending in ``.json`` is interpreted as the ``--Beam-FITSFile`` json
+form. It points at the same eight-file Cattery FITS sets, but types antennas
+DDFacet's way -- by raw ``ANTENNA.NAME``, not by the ``TELESCOPE_NAME`` label a
+YAML config keys on -- so a config written for DDFacet can be handed to simms
+unchanged:
 
 .. code-block:: json
 
@@ -247,6 +253,30 @@ visibilities. It has four modes:
     (writing them would produce a model that same schema could not read). For
     those, predict with ``skysim --primary-beam`` instead, which applies the beam
     per channel and needs no fit at all.
+
+Examples
+--------
+
+Build a MeerKAT L-band JimBeam cube and write it to a FITS file:
+
+.. code-block:: console
+
+    $ simms primary-beam to-fits --beam-pattern L --beam-band L \
+        --npix 512 --pixel-size 1arcmin --output meerkat_l_beam.fits
+
+Tag an existing MS so that every antenna is labelled ``MKAT-MA``:
+
+.. code-block:: console
+
+    $ simms primary-beam tag-ms --ms obs.ms --label MKAT-MA
+
+Apply the beam to an ASCII catalogue, writing a new catalogue whose fluxes and
+continuum coefficients have been attenuated:
+
+.. code-block:: console
+
+    $ simms primary-beam apply --ms obs.ms --ascii-sky skymodel.txt \
+        --beam-pattern L --output skymodel_beamed.txt
 
 Because ``to-fits`` and ``tag-ms`` write ordinary MS metadata and FITS files,
 they compose with tools outside simms -- you can build a beam here and hand it

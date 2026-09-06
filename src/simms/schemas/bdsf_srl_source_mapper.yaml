@@ -1,4 +1,4 @@
-info: "Mapper for PyBDSF GAUL sources: maps GAUL catalogue columns to the simms sky model schema using the 'alias' fields. Use with the --mapping option of simms skysim."
+info: "Mapper for PyBDSF SRL (source-list) catalogues: maps SRL catalogue columns to the simms sky model schema using the 'alias' fields. Use with the --ascii-species option of simms skysim."
 
 parameters:
   name:
@@ -18,7 +18,7 @@ parameters:
     units: deg
     ptype: latitude
     required: true
-  stokes_i: 
+  stokes_i:
     info: Stokes I
     alias: Total_flux
     units: Jy
@@ -41,17 +41,17 @@ parameters:
     ptype: flux
   emaj:
     info: Major axis; default units
-    alias: DC_Maj
+    alias: Maj
     units: deg
     ptype: angle
   emin:
     info: Minor axis; default units [deg]
-    alias: DC_Min
+    alias: Min
     units: deg
     ptype: angle
   pa:
     info: Position angle; default units
-    alias: DC_PA
+    alias: PA
     units: deg
     ptype: angle
   cont_reffreq:
@@ -107,7 +107,7 @@ parameters:
     alias: null
     units: s
     ptype: time
-  transient_ingress:  
+  transient_ingress:
     info: Duration of ingress; default units
     alias: null
     units: s

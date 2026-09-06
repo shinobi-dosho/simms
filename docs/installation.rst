@@ -49,3 +49,8 @@ To build the documentation locally:
     $ uv sync --group docs
     $ uv run sphinx-build -b html docs docs/_build/html
     $ open docs/_build/html/index.html
+
+``uv sync --group docs`` installs the package in the active virtual environment
+along with the Sphinx extensions listed in ``pyproject.toml``. Read the Docs
+builds the same group, so adding a documentation dependency there is the only
+change needed.
