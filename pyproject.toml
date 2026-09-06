@@ -72,7 +72,7 @@ prerelease = "if-necessary-or-explicit"
 # binary for a git source, and the casa6 image used by the CASA CI job has no git and a
 # broken apt (its KERN PPA has no ca-certificates). A tarball is fetched over plain HTTP,
 # and pins the same commit just as immutably.
-stimela-ninja = { url = "https://github.com/shinobi-dosho/stimela-ninja/archive/d5294749a7f2b74c506681da9de026b8ca76942c.tar.gz" }
+stimela-ninja = { url = "https://github.com/shinobi-dosho/stimela-ninja/archive/0cd6ea39e3481a4c6aa20f1fa1a6a07c7ee1c5e4.tar.gz" }
 
 [project.urls]
 Documentation = "https://simms.readthedocs.io"
