@@ -4,11 +4,11 @@ from types import SimpleNamespace
 from typing import Annotated
 
 import shinobi
-from dask import config as dask_config
 from pydantic import BaseModel, Field
 from shinobi.steps.schema import ParamMeta
 
 from simms import BIN, set_logger
+from simms.utilities import set_dask_workers
 
 
 class PrimaryBeamOutputs(BaseModel):
@@ -41,7 +41,7 @@ def runit(opts) -> PrimaryBeamOutputs:
 
     # pb_ops builds and computes dask graphs, so --nworkers has to reach the scheduler the
     # same way skysim sets it; without this the option was accepted and silently ignored.
-    dask_config.set(scheduler="threads", num_workers=opts.nworkers)
+    set_dask_workers(opts.nworkers)
 
     mode = opts.mode
     if mode == "to-fits":

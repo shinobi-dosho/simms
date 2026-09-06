@@ -13,10 +13,14 @@ from tqdm.dask import TqdmCallback
 
 from simms import BIN, PCKGDIR
 from simms.constants import PI
+from simms.exceptions import InvalidInputError
 from simms.telescope import array_utilities as autils
 from simms.utilities import get_noise, load_yaml
 
 CORR_TYPES = load_yaml(f"{PCKGDIR}/telescope/ms_corr_types.yaml")["CORR_TYPES"]
+# Direction reference frames casacore accepts, used only to tell 'frame,ra' (a dropped
+# declination) apart from a frameless 'ra,dec'.
+DIRECTION_FRAMES = {"J2000", "B1950", "ICRS", "GALACTIC", "SUPERGAL", "ECLIPTIC", "HADEC", "AZEL", "ITRF"}
 dm = measures()
 
 
@@ -36,6 +40,125 @@ def remove_ms(ms: str):
         log.debug(f"MS file {ms} exists. It will be overriden.")
     else:
         log.debug(f"MS file {ms} is being created.")
+
+
+def _parse_dec_degrees(value: str):
+    """The declination in degrees, or ``None`` when astropy cannot read the literal.
+
+    casacore silently *wraps* an out-of-range declination -- ``-999d0m0s`` becomes +81d --
+    so a typo produces a valid-looking MS pointed somewhere else entirely. astropy parses
+    the sexagesimal spellings simms documents and reports the value as written, which is
+    what makes the range check possible. casacore-only spellings it cannot read are left
+    for casacore, hence the ``None``.
+    """
+    from astropy.coordinates import Angle
+
+    try:
+        return float(Angle(value).deg)
+    except Exception:
+        return None
+
+
+def validate_ms_inputs(
+    *,
+    pointing_direction,
+    dtime,
+    ntimes,
+    nchan,
+    correlations,
+    row_chunks,
+    freq_range=None,
+    low_source_limit=None,
+    high_source_limit=None,
+):
+    """Reject option values that cannot produce a valid MS.
+
+    Runs first thing in ``create_ms``, before any work and well before ``remove_ms``, because
+    every one of these used to be accepted: ``--ntime 0``, ``--dtime -8`` and ``--nchan 0``
+    each wrote an MS whose EXPOSURE or NUM_CHAN made it unusable -- and a ``--dtime -8`` MS
+    then made a later ``skysim --sefd`` run fill DATA with NaNs, both steps exiting 0.
+    """
+    if nchan is not None and nchan < 1:
+        raise InvalidInputError(f"--nchan must be at least 1, got {nchan}.")
+    if ntimes < 1:
+        raise InvalidInputError(f"--ntime must be at least 1, got {ntimes}.")
+    if dtime <= 0:
+        # A non-positive EXPOSURE/INTERVAL is written straight into the MS, where it turns
+        # the thermal-noise 1/sqrt(2 dnu dt) into a NaN and the smearing kernels to nonsense.
+        raise InvalidInputError(f"--dtime must be greater than 0 seconds, got {dtime}.")
+    if row_chunks < 1:
+        raise InvalidInputError(f"--row-chunks must be at least 1, got {row_chunks}.")
+
+    if freq_range is not None:
+        if len(freq_range) != 3:
+            raise InvalidInputError(
+                "--freq-range takes exactly start-freq,end-freq,nchan; "
+                f"got {len(freq_range)} value(s): {','.join(str(v) for v in freq_range)}."
+            )
+        try:
+            range_nchan = int(freq_range[2])
+        except (TypeError, ValueError):
+            raise InvalidInputError(f"--freq-range nchan must be an integer, got {freq_range[2]!r}.") from None
+        if range_nchan < 2:
+            # The channel width is (end - start) / (nchan - 1).
+            raise InvalidInputError(f"--freq-range nchan must be at least 2, got {range_nchan}.")
+
+    if not correlations or not all(str(corr).strip() for corr in correlations):
+        raise InvalidInputError("--correlations must name at least one correlation, e.g. 'XX,YY'.")
+    unknown = [str(corr) for corr in correlations if str(corr).strip() not in CORR_TYPES]
+    if unknown:
+        raise InvalidInputError(
+            f"--correlations has unknown correlation(s) {','.join(unknown)}. "
+            f"Valid values: {', '.join(sorted(CORR_TYPES))}."
+        )
+    if len(correlations) not in (1, 2, 4):
+        raise InvalidInputError(f"--correlations must give 1, 2 or 4 correlations, got {len(correlations)}.")
+
+    if len(pointing_direction) not in (2, 3):
+        raise InvalidInputError(
+            "--direction takes 'frame,ra,dec' (or 'ra,dec'), e.g. 'J2000,0h24m20s,-30d12m33s'; "
+            f"got {len(pointing_direction)} comma-separated value(s)."
+        )
+    if len(pointing_direction) == 2 and pointing_direction[0].strip().upper() in DIRECTION_FRAMES:
+        # Two values are read as 'ra,dec' with the frame defaulted, so a dropped declination
+        # after an explicit frame ('J2000,1h0m0s') otherwise reaches casacore as an RA of
+        # "J2000" and fails somewhere unrecognisable.
+        raise InvalidInputError(
+            f"--direction gives the reference frame {pointing_direction[0]!r} but only one "
+            f"coordinate; it needs 'frame,ra,dec', e.g. 'J2000,0h24m20s,-30d12m33s'."
+        )
+    dec_deg = _parse_dec_degrees(pointing_direction[-1])
+    if dec_deg is not None and abs(dec_deg) > 90:
+        raise InvalidInputError(
+            f"--direction declination must be within +/-90 degrees, got {pointing_direction[-1]!r} "
+            f"({dec_deg:g} deg). casacore would silently wrap this to a different part of the sky."
+        )
+
+    if (
+        low_source_limit is not None
+        and high_source_limit is not None
+        and float(low_source_limit) >= float(high_source_limit)
+    ):
+        raise InvalidInputError(
+            f"--low-source-limit ({low_source_limit}) must be below --high-source-limit "
+            f"({high_source_limit}); as given, every row is flagged."
+        )
+
+
+def validate_frequencies(start_freq, dfreq, nchan):
+    """Reject parsed frequencies that cannot describe a spectral window.
+
+    Runs on the values *after* unit parsing, so it catches both ``--start-freq -1420MHz``
+    and a ``--freq-range`` that resolves to the same thing. A negative ``dfreq`` is left
+    alone: a reversed sideband is a real spectral window, and the smearing kernels are
+    written against a signed channel width.
+    """
+    if start_freq <= 0:
+        raise InvalidInputError(f"--start-freq must be a positive frequency, got {start_freq:g} Hz.")
+    if nchan > 1 and dfreq == 0:
+        raise InvalidInputError(
+            f"--chan-width must be non-zero for a {nchan}-channel MS; every channel would sit at {start_freq:g} Hz."
+        )
 
 
 def create_ms(
@@ -123,7 +246,20 @@ def create_ms(
     None
         Writes the Measurement Set and its subtables to disk.
     """
-    remove_ms(ms)
+    # Validate before remove_ms: a rejected run must not delete the MS already sitting at
+    # the target path (a --telescope typo used to do exactly that).
+    validate_ms_inputs(
+        pointing_direction=pointing_direction,
+        dtime=dtime,
+        ntimes=ntimes,
+        nchan=nchan,
+        correlations=correlations,
+        row_chunks=row_chunks,
+        freq_range=freq_range,
+        low_source_limit=low_source_limit,
+        high_source_limit=high_source_limit,
+    )
+
     telescope_array = autils.Array(
         telescope_name,
         sefd=sefd,
@@ -149,6 +285,8 @@ def create_ms(
         start_freq = parse_frequency(start_freq, "start-freq")
         dfreq = parse_frequency(dfreq, "dfreq")
         end_freq = start_freq + dfreq * (nchan - 1)
+
+    validate_frequencies(start_freq, dfreq, nchan)
 
     freqs = np.linspace(start_freq, end_freq, nchan)
 
@@ -205,6 +343,12 @@ def create_ms(
     freqs = freqs.reshape(1, freqs.shape[0])
     channel_widths = da.full(freqs.shape, dfreq)
     total_bandwidth = nchan * dfreq
+
+    # Only now, with the layout resolved, the subarray selected, the frequencies parsed and
+    # the uv coverage computed, is the existing MS at this path removed. Doing it on entry
+    # meant a typo in --telescope (or any other late failure) destroyed the MS already there
+    # and then exited with an error, leaving nothing behind.
+    remove_ms(ms)
 
     ds = {
         "DATA": (("row", "chan", "corr"), data),

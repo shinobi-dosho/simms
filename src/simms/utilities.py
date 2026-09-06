@@ -5,9 +5,22 @@ from types import NoneType
 import numpy as np
 import yaml
 from astropy import units
+from dask import config as dask_config
 from numba import njit
 
-from simms.exceptions import SkymodelSchemaError
+from simms.exceptions import InvalidInputError, SkymodelSchemaError
+
+
+def set_dask_workers(nworkers):
+    """Point dask's threaded scheduler at ``nworkers``, rejecting a non-positive count.
+
+    dask turns ``num_workers=0`` into an opaque ``ValueError`` from deep inside the pool
+    setup, and a negative count into a bare ``ValueError`` from ``ThreadPoolExecutor``;
+    neither names the option the user actually typed.
+    """
+    if nworkers < 1:
+        raise InvalidInputError(f"--nworkers must be at least 1, got {nworkers}.")
+    dask_config.set(scheduler="threads", num_workers=nworkers)
 
 
 def load_yaml(path) -> dict:

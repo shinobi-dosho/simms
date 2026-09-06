@@ -11,13 +11,13 @@ import dask
 import dask.array as da
 import numpy as np
 import shinobi
-from dask import config as dask_config
 from daskms import xds_from_ms, xds_from_table, xds_to_table
 from pydantic import BaseModel, Field
 from shinobi.steps.schema import ParamMeta
 from tqdm.dask import TqdmCallback
 
 from simms import BIN, SCHEMADIR, set_logger
+from simms.exceptions import InvalidInputError
 from simms.skymodel.ascii_skies import ASCIISkymodel
 from simms.skymodel.beams import load_beam_config, resolve_antenna_beams
 from simms.skymodel.corruptions import apply_corruptions, load_corruption_spec, needs_feed_basis, validate_spec
@@ -34,6 +34,7 @@ from simms.skymodel.mstools import (
 )
 from simms.skymodel.smearing import PHASE_TOL, Smearing, SubsampleSmearing, subsample_counts, worst_case_swings
 from simms.skymodel.wsclean_skies import prepare_wsclean_sky
+from simms.utilities import set_dask_workers
 
 log = logging.getLogger(BIN.skysim)
 
@@ -369,7 +370,11 @@ def runit(opts):
     fs = opts.fits_sky
     wsclean_sky = opts.wsclean_sky
 
-    dask_config.set(scheduler="threads", num_workers=opts.nworkers)
+    set_dask_workers(opts.nworkers)
+    if opts.row_chunks < 1:
+        # 0 reached auto_row_chunks as a divisor (ZeroDivisionError); a negative cap became
+        # an opaque dask GroupChunkingError much later, after the MS had been opened.
+        raise InvalidInputError(f"--row-chunks must be at least 1, got {opts.row_chunks}.")
 
     if sum(bool(x) for x in (ascii_sky, fs, wsclean_sky)) > 1:
         raise RuntimeError("Choose a single sky model: one of --ascii-sky, --fits-sky, or --wsclean-sky.")
