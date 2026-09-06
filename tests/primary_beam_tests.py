@@ -573,3 +573,228 @@ def test_missing_mount_column_fails_clearly(fx):
         tab.removecols("MOUNT")
     with pytest.raises(RuntimeError, match="MOUNT"):
         pb_ops._observation(fx.ms, 0, 0)
+
+
+# --------------------------------------------------------------- spectral apply/correct
+#
+# The beam narrows across the band, so an off-axis source is attenuated far more at the top
+# of the band than the bottom: the *spectrum* of the apparent source differs from the
+# intrinsic one. apply/correct used to scale the flux by a band-averaged number and leave
+# cont_coeff_* untouched, which at 0.5 deg off-axis in L band drops about -1.1 of spectral
+# index -- more than a typical synchrotron index -- and misplaces in-band flux by tens of
+# percent. These tests pin the fold into the spectrum.
+
+
+class _WidebandFixtures(InitTest):
+    """An MS spanning a real fractional bandwidth, where the beam's chromaticity shows.
+
+    The shared ``fx`` MS is two 4 MHz channels, over which no beam changes measurably.
+    """
+
+    def __init__(self):
+        self.test_files = []
+        self.ms = self.random_named_directory(suffix=".ms")
+        create_ms(
+            self.ms,
+            telescope_name="meerkat",
+            pointing_direction=["J2000", "1h0m0s", "-31deg"],
+            dtime=600,
+            ntimes=2,
+            start_freq="900MHz",
+            dfreq="90MHz",
+            nchan=8,
+            correlations=["XX", "YY"],
+            row_chunks=100000,
+            sefd=None,
+            column="DATA",
+            start_time="2025-03-06T20:00:00",
+            subarray_range=[0, 4],
+        )
+
+
+@pytest.fixture(scope="module")
+def wide():
+    return _WidebandFixtures()
+
+
+def _read_ascii_model(path, delimiter=None):
+    """``[{field: value}]``, one dict per source line, keyed by the header's column names."""
+    rows = []
+    with open(path) as fh:
+        header = fh.readline().replace("#format:", "").strip().split(delimiter)
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            rows.append(dict(zip(header, line.strip().split(delimiter), strict=True)))
+    return rows
+
+
+def _apparent_spectrum(row, freqs):
+    """Evaluate the written model's spectrum, exactly as ``contspec`` would."""
+    from simms.skymodel.source_factory import contspec
+
+    coeffs = [float(row[f"cont_coeff_{k}"]) for k in (1, 2, 3) if f"cont_coeff_{k}" in row]
+    return contspec(freqs, float(row["stokes_i"]), coeffs, float(row["cont_reffreq"]))
+
+
+def _beam_over_band(wide_ms, ra_deg, dec_deg, freqs):
+    """The same PA-averaged power beam apply uses, evaluated independently here."""
+    from simms.skymodel.pb_ops import _beam_over_frequency, _observation
+    from simms.utilities import radec2lm
+
+    obs = _observation(wide_ms)
+    ell, emm = radec2lm(obs["ra0"], obs["dec0"], np.radians(ra_deg), np.radians(dec_deg))
+    beam = _beam_over_frequency(
+        JimBeamProvider(CosineTaperBeam.from_builtin("MKAT-EA-L-JIM-2026")),
+        np.array([ell]),
+        np.array([emm]),
+        obs["ra0"],
+        obs["dec0"],
+        obs,
+        1.0,
+        freqs=freqs,
+    )
+    return beam[0]
+
+
+def _ms_freqs(ms):
+    return np.ravel(xds_from_table(f"{ms}::SPECTRAL_WINDOW")[0].CHAN_FREQ.values)
+
+
+def test_apply_folds_the_beam_into_the_spectral_index(wide):
+    """The written model must reproduce ``S(nu) * A(nu)``, not ``S(nu) * <A>``."""
+    sky = wide.random_named_file(suffix=".txt")
+    with open(sky, "w") as fh:
+        fh.write("#format: name ra dec stokes_i cont_reffreq cont_coeff_1\n")
+        fh.write("offaxis 1h0m0s -30d30m0s 1.0 1.284e9 -0.7\n")  # 0.5 deg off the pointing centre
+
+    out = wide.random_named_file(suffix=".txt")
+    primary_beam.runit(_opts("apply", ms=wide.ms, ascii_sky=sky, output=out))
+    row = _read_ascii_model(out)[0]
+
+    freqs = _ms_freqs(wide.ms)
+    beam = _beam_over_band(wide.ms, 15.0, -30.5, freqs)
+    from simms.skymodel.source_factory import contspec
+
+    intrinsic = contspec(freqs, 1.0, [-0.7], 1.284e9)
+    expected = intrinsic * beam
+    got = _apparent_spectrum(row, freqs)
+    # A cubic log-polynomial does not reproduce the beam exactly over a 1.7:1 band; the
+    # residual is what the run warns about above 1%. What matters is that it tracks A(nu)
+    # instead of the band average, which is wrong by tens of percent at the band edges.
+    np.testing.assert_allclose(got, expected, rtol=0.04)
+    band_averaged = intrinsic * beam.mean()
+    assert np.abs(got / expected - 1).max() < 0.2 * np.abs(band_averaged / expected - 1).max()
+
+    # ...and the index really moved: the beam contributes about -1.1 here.
+    assert float(row["cont_coeff_1"]) < -1.5
+
+
+def test_apply_gives_a_flat_model_a_spectrum(wide):
+    """A model with no continuum columns has nowhere to put the beam's frequency dependence,
+    so the columns are added rather than the spectral change being dropped."""
+    sky = wide.random_named_file(suffix=".txt")
+    with open(sky, "w") as fh:
+        fh.write("#format: name ra dec stokes_i\n")
+        fh.write("offaxis 1h0m0s -30d30m0s 1.0\n")
+
+    out = wide.random_named_file(suffix=".txt")
+    primary_beam.runit(_opts("apply", ms=wide.ms, ascii_sky=sky, output=out))
+    row = _read_ascii_model(out)[0]
+
+    assert "cont_reffreq" in row and "cont_coeff_1" in row
+    freqs = _ms_freqs(wide.ms)
+    expected = _beam_over_band(wide.ms, 15.0, -30.5, freqs)  # flat 1 Jy source -> just A(nu)
+    np.testing.assert_allclose(_apparent_spectrum(row, freqs), expected, rtol=0.04)
+
+
+def test_apply_then_correct_recovers_the_spectrum(wide):
+    """Dividing the beam back out must restore the intrinsic flux *and* index."""
+    sky = wide.random_named_file(suffix=".txt")
+    with open(sky, "w") as fh:
+        fh.write("#format: name ra dec stokes_i cont_reffreq cont_coeff_1\n")
+        fh.write("offaxis 1h0m0s -30d30m0s 2.5 1.284e9 -0.7\n")
+
+    apparent = wide.random_named_file(suffix=".txt")
+    primary_beam.runit(_opts("apply", ms=wide.ms, ascii_sky=sky, output=apparent))
+    recovered = wide.random_named_file(suffix=".txt")
+    primary_beam.runit(_opts("correct", ms=wide.ms, ascii_sky=apparent, output=recovered))
+
+    freqs = _ms_freqs(wide.ms)
+    from simms.skymodel.source_factory import contspec
+
+    original = contspec(freqs, 2.5, [-0.7], 1.284e9)
+    np.testing.assert_allclose(_apparent_spectrum(_read_ascii_model(recovered)[0], freqs), original, rtol=1e-3)
+
+
+def test_on_axis_source_keeps_its_spectrum(wide):
+    """At the pointing centre the beam is flat, so nothing about the source should move."""
+    sky = wide.random_named_file(suffix=".txt")
+    with open(sky, "w") as fh:
+        fh.write("#format: name ra dec stokes_i cont_reffreq cont_coeff_1\n")
+        fh.write("onaxis 1h0m0s -31d0m0s 1.0 1.284e9 -0.7\n")
+
+    out = wide.random_named_file(suffix=".txt")
+    primary_beam.runit(_opts("apply", ms=wide.ms, ascii_sky=sky, output=out))
+    row = _read_ascii_model(out)[0]
+    assert float(row["stokes_i"]) == pytest.approx(1.0, rel=2e-3)
+    assert float(row["cont_coeff_1"]) == pytest.approx(-0.7, abs=0.05)
+
+
+def test_custom_schema_without_continuum_falls_back_and_says_so(wide, caplog):
+    """A user schema need not declare cont_* at all; writing those columns would produce a
+    model that same schema can no longer read, so the scalar behaviour is kept -- loudly."""
+    schema = wide.random_named_file(suffix=".yaml")
+    with open(schema, "w") as fh:
+        fh.write(
+            "info: Aliased schema\nparameters:\n"
+            "  name: {info: Name, alias: NAME, units: null, ptype: string}\n"
+            "  ra: {info: RA, alias: RA, units: deg, ptype: longitude, required: true}\n"
+            "  dec: {info: Dec, alias: DEC, units: deg, ptype: latitude, required: true}\n"
+            "  stokes_i: {info: Stokes I, alias: I, units: Jy, ptype: flux, required: true}\n"
+        )
+    sky = wide.random_named_file(suffix=".csv")
+    with open(sky, "w") as fh:
+        fh.write("#format: NAME,RA,DEC,I\noffaxis,15.0,-30.5,1.0\n")
+
+    out = wide.random_named_file(suffix=".csv")
+    with caplog.at_level(logging.WARNING):
+        primary_beam.runit(
+            _opts(
+                "apply",
+                ms=wide.ms,
+                ascii_sky=sky,
+                ascii_delimiter=",",
+                source_schema=schema,
+                output=out,
+                log_level="WARNING",
+            )
+        )
+    assert "declares no continuum fields" in caplog.text
+
+    row = _read_ascii_model(out, delimiter=",")[0]
+    assert "cont_coeff_1" not in row  # the file still parses under the same schema
+    beam = _beam_over_band(wide.ms, 15.0, -30.5, _ms_freqs(wide.ms))
+    assert float(row["I"]) == pytest.approx(float(beam.mean()), rel=1e-3)
+
+
+def test_fits_cube_gets_a_beam_per_plane(wide):
+    """One band-averaged map applied to every plane would impose the same attenuation on
+    channels where the true beam is much wider or narrower."""
+    cube = wide.random_named_file(suffix=".fits")
+    npix, nchan, cell = 32, 8, 0.05
+    freqs = _ms_freqs(wide.ms)
+    header = make_header(npix, nchan=nchan, cell=cell, freqs=freqs)
+    fits.PrimaryHDU(data=np.ones((nchan, npix, npix), dtype=np.float32), header=header).writeto(cube)
+
+    out = wide.random_named_file(suffix=".fits")
+    primary_beam.runit(_opts("apply", ms=wide.ms, fits_sky=cube, output=out))
+    data = fits.getdata(out)  # (nchan, dec, ra)
+
+    centre = npix // 2
+    on_axis = data[:, centre, centre]
+    off_axis = data[:, centre + int(round(0.5 / cell)), centre]  # 0.5 deg north of the pointing
+    np.testing.assert_allclose(on_axis, 1.0, atol=5e-3)  # ~flat at the pointing centre
+    # ...and falling monotonically off-axis, because the beam narrows with frequency.
+    assert np.all(np.diff(off_axis) < 0)
+    assert off_axis[0] / off_axis[-1] > 1.4

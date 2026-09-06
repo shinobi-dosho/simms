@@ -5,7 +5,11 @@ Four modes, none of which run a visibility simulation:
   simms' own single-file layout or the Cattery/DDFacet 8-file ``--Beam-Model FITS`` schema.
 - ``tag_ms``       : write the per-antenna telescope-name column onto an existing MS.
 - ``apply``/``correct`` : multiply / divide a sky model (FITS image or ASCII components) by
-  the frequency- and parallactic-angle-averaged Stokes-I power beam ``A(l, m)``.
+  the parallactic-angle-averaged Stokes-I power beam ``A(l, m, nu)``. The beam narrows across
+  the band, so this is not a scale factor: a cube gets a beam per plane, and ASCII components
+  have it folded into their log-polynomial spectrum (:func:`fit_log_beam`). Only a model that
+  cannot carry a spectrum -- a 2D image, a single-channel MS, a source schema without the
+  continuum fields -- falls back to one frequency-averaged number.
 """
 
 from __future__ import annotations
@@ -84,12 +88,90 @@ def _observation(ms, field_id=0, spw_id=0):
     }
 
 
-def _averaged_beam(provider, ell, emm, ra0, dec0, obs, pa_step):
-    """Freq- and PA-averaged power beam ``A(l, m)`` at the given directions (beam centre ra0/dec0)."""
-    from simms.skymodel.beams import averaged_power_beam, pa_sample_grid
+def _beam_over_frequency(provider, ell, emm, ra0, dec0, obs, pa_step, freqs=None):
+    """PA-averaged power beam ``A(l, m, nu)``, shape ``(npts, nfreq)`` (beam centre ra0/dec0).
+
+    ``freqs`` defaults to the MS channel centres; the FITS-cube path passes the *cube's* own
+    frequencies instead, since that is where its planes live.
+    """
+    from simms.skymodel.beams import image_power_beam, pa_sample_grid
 
     _, chi_grid = pa_sample_grid(obs["t_start"], obs["duration"], ra0, dec0, obs["lon"], obs["lat"], pa_step)
-    return averaged_power_beam(provider, obs["is_altaz"], ell, emm, obs["freqs"], chi_grid)
+    freqs = obs["freqs"] if freqs is None else freqs
+    return image_power_beam(provider, obs["is_altaz"], ell, emm, freqs, chi_grid)
+
+
+def _averaged_beam(provider, ell, emm, ra0, dec0, obs, pa_step):
+    """Freq- and PA-averaged power beam ``A(l, m)`` at the given directions (beam centre ra0/dec0)."""
+    return _beam_over_frequency(provider, ell, emm, ra0, dec0, obs, pa_step).mean(axis=1)
+
+
+# The ASCII schema carries cont_coeff_1..3, so a refit can spend at most three coefficients.
+MAX_SPECTRUM_ORDER = 3
+
+
+def fit_log_beam(beam, freqs, ref_freq, order=MAX_SPECTRUM_ORDER):
+    """Fit ``ln A(nu) = a0 + a1 x + ... + a_order x**order``, ``x = ln(nu / ref_freq)``.
+
+    Returns ``(coeffs, max_fractional_residual)`` with ``coeffs`` shaped
+    ``(order + 1, npts)``: ``a0`` is the beam at the reference frequency (in the log), and
+    ``a1..a_order`` are exactly the log-polynomial coefficients a source spectrum already
+    uses. That is what makes applying a beam to a spectral model a matter of *adding*
+    coefficients rather than approximating: simms' continuum spectrum is
+    ``S(nu) = S_ref (nu/nu_ref) ** (c1 + c2 x + ...)``, i.e. ``ln S = ln S_ref + sum c_k x**k``
+    (:func:`simms.skymodel.source_factory.contspec`), and multiplying two such spectra about
+    the same reference adds their coefficients term by term.
+
+    The order is capped by the number of frequencies: a single-channel MS carries no spectral
+    information at all, and then only ``a0`` is fitted -- a plain scale factor.
+    """
+    from simms.skymodel.fits_spectrum import _design_matrix
+
+    freqs = np.atleast_1d(np.asarray(freqs, dtype=np.float64))
+    beam = np.atleast_2d(np.asarray(beam, dtype=np.float64))  # (npts, nfreq)
+    order = int(min(order, freqs.size - 1))
+
+    # A zero (or negative, from a noisy FITS beam) sample has no logarithm. Clamping to a
+    # tiny positive floor keeps the fit finite; such a point is far outside the beam and is
+    # either dropped by --pb-cutoff or already negligible.
+    ln_beam = np.log(np.maximum(beam, np.finfo(np.float64).tiny)).T  # (nfreq, npts)
+    design = _design_matrix(freqs, ref_freq, order)
+    coeffs, *_ = np.linalg.lstsq(design, ln_beam, rcond=None)
+
+    residual = np.abs(design @ coeffs - ln_beam).max(initial=0.0)
+    return coeffs, float(np.expm1(residual))
+
+
+def _fits_spectral_axis(header, ndim):
+    """``(numpy_axis, frequencies_hz)`` for a cube's spectral axis, or ``(None, None)``.
+
+    ``None`` for a plain 2D image (which has no frequency to evaluate a beam at), for a
+    degenerate one-plane axis, and for a velocity axis carrying no rest frequency to convert
+    through -- the last of which is reported, since it silently costs accuracy.
+    """
+    from astropy import units
+    from astropy.wcs import WCS
+
+    wcs = WCS(header)
+    fits_axis = wcs.wcs.spec
+    if fits_axis < 0:
+        return None, None
+    # WCS axis order is the reverse of numpy's.
+    axis = wcs.naxis - 1 - fits_axis
+    nchan = int(header[f"NAXIS{fits_axis + 1}"])
+    if nchan < 2 or axis >= ndim - 2:
+        return None, None
+    try:
+        world = wcs.spectral.pixel_to_world(np.arange(nchan))
+        freqs = np.atleast_1d(world.to_value(units.Hz, equivalencies=units.spectral()))
+    except Exception as exc:
+        log.warning(
+            "Could not convert the spectral axis to frequency (%s); falling back to one "
+            "band-averaged beam for every plane. A velocity axis needs a rest frequency (RESTFRQ).",
+            exc,
+        )
+        return None, None
+    return axis, freqs.astype(np.float64)
 
 
 def _angular_separation(ra1, dec1, ra2, dec2):
@@ -262,8 +344,27 @@ def apply_correct_image(opts, invert):
     i_ra, j_dec = np.meshgrid(np.arange(npix_ra), np.arange(npix_dec))  # (npix_dec, npix_ra)
 
     ell, emm = pixel_lm(cel, ra0, dec0, i_ra.ravel(), j_dec.ravel())
-    A = _averaged_beam(provider_from(opts), ell, emm, ra0, dec0, obs, opts.beam_pa_step)
-    A = A.reshape(npix_dec, npix_ra)
+
+    # A cube's planes each sit at their own frequency, and the beam narrows across the band,
+    # so one averaged map applied to every plane would impose the band-average attenuation on
+    # channels where the true beam is far wider or narrower. Give each plane its own beam.
+    spectral_axis, cube_freqs = _fits_spectral_axis(header, data.ndim)
+    if spectral_axis is None:
+        A = _averaged_beam(provider_from(opts), ell, emm, ra0, dec0, obs, opts.beam_pa_step)
+        A = A.reshape(npix_dec, npix_ra)
+    else:
+        log.info(
+            "Evaluating the beam per plane over the cube's %d channels (%.3f-%.3f GHz).",
+            cube_freqs.size,
+            cube_freqs.min() / 1e9,
+            cube_freqs.max() / 1e9,
+        )
+        A = _beam_over_frequency(provider_from(opts), ell, emm, ra0, dec0, obs, opts.beam_pa_step, freqs=cube_freqs)
+        # (npix_dec * npix_ra, nchan) -> the cube's own axis order, singleton elsewhere. The
+        # spectral axis always precedes both celestial axes, so no element reordering is needed.
+        shape = [1] * data.ndim
+        shape[-2], shape[-1], shape[spectral_axis] = npix_dec, npix_ra, cube_freqs.size
+        A = A.reshape(npix_dec, npix_ra, cube_freqs.size).transpose(2, 0, 1).reshape(shape)
 
     if invert:
         safe = np.where(opts.pb_cutoff > A, np.nan, A)  # blank where the beam is negligible
@@ -277,12 +378,68 @@ def apply_correct_image(opts, invert):
     return output
 
 
+def _schema_supports_continuum(sky, order):
+    """Whether the model's schema can express a log-polynomial spectrum of this order.
+
+    A custom ``--source-schema`` need not declare the continuum fields at all (the built-in
+    one always does). Folding the beam into a spectrum those fields cannot hold would write a
+    model the same schema can no longer read, so that case keeps the scalar behaviour.
+    """
+    params = getattr(sky.schema, "parameters", None)
+    fields = ["cont_reffreq", *(f"cont_coeff_{k}" for k in range(1, order + 1))]
+    return all(hasattr(params, field) for field in fields)
+
+
+def _ascii_columns(lines, sky, order=None):
+    """Column field names for the model, extended with any continuum columns a refit needs.
+
+    Returns ``(header_line, fields_by_col, added)``. A model written without a spectrum has
+    no column to hold the one the beam gives it, so the missing columns are appended rather
+    than the spectral change being dropped. Where the file's schema renames a field, its own
+    alias is reused so the result still parses under the same ``--source-schema``.
+    """
+    from simms.skymodel.ascii_skies import ASCIISource
+
+    cols = lines[0].replace("#format:", "").strip().split(sky.delimiter)
+    alias_to_field = ASCIISource(sky.schema).alias_to_field_mapper()
+    fields_by_col = [alias_to_field.get(col, col) for col in cols]
+    field_to_alias = {field: alias for alias, field in alias_to_field.items()}
+
+    # order None: read the columns as they are, for the paths that write no spectrum.
+    needed = [] if order is None else ["cont_reffreq", *(f"cont_coeff_{k}" for k in range(1, order + 1))]
+    added = [field for field in needed if field not in fields_by_col]
+    for field in added:
+        cols.append(field_to_alias.get(field, field))
+        fields_by_col.append(field)
+    header = "#format: " + (sky.delimiter or " ").join(cols)
+    return header, fields_by_col, added
+
+
+def _set_field(fields, index, value):
+    """Write ``value`` at ``index``, padding short lines so the column lands where it belongs."""
+    fields.extend("0" for _ in range(index + 1 - len(fields)))
+    fields[index] = value
+
+
 def apply_correct_ascii(opts, invert):
-    """Scale ASCII component fluxes by the averaged power beam (apply) or its inverse (correct).
+    """Fold the beam into ASCII component spectra (apply), or divide it out (correct).
+
+    The beam is not a scale factor: it narrows across the band, so a source off-axis is
+    attenuated far more at the top of the band than the bottom, and the *spectrum* of the
+    apparent source differs from the intrinsic one. At 0.5 degrees off-axis in MeerKAT
+    L-band the beam alone contributes about -1.1 to the spectral index -- larger than a
+    typical synchrotron index, so scaling the flux by a band-averaged number and leaving the
+    index alone (which is what this used to do) misplaces the in-band flux by tens of
+    percent.
+
+    Both simms' continuum spectrum and the fitted beam are log-polynomials about the same
+    reference frequency, so the fold is exact in that basis: the reference flux picks up
+    ``exp(a0)`` and each ``cont_coeff_k`` picks up ``a_k`` (:func:`fit_log_beam`). ``correct``
+    is the same with the beam's coefficients negated.
 
     Returns the path actually written, which is the defaulted name when ``--output`` was omitted.
     """
-    from simms.skymodel.ascii_skies import ASCIISkymodel, ASCIISource
+    from simms.skymodel.ascii_skies import ASCIISkymodel
     from simms.utilities import radec2lm
 
     obs = _observation(opts.ms, opts.field_id, opts.spw_id)
@@ -290,40 +447,90 @@ def apply_correct_ascii(opts, invert):
     sky = ASCIISkymodel(opts.ascii_sky, delimiter=opts.ascii_delimiter, source_schema_file=opts.source_schema)
     lm = np.array([radec2lm(obs["ra0"], obs["dec0"], s.ra, s.dec) for s in sky.sources])
     ell, emm = (lm[:, 0], lm[:, 1]) if len(lm) else (np.array([]), np.array([]))
-    A = _averaged_beam(provider_from(opts), ell, emm, obs["ra0"], obs["dec0"], obs, opts.beam_pa_step)
+    freqs = obs["freqs"]
+    beam = _beam_over_frequency(provider_from(opts), ell, emm, obs["ra0"], obs["dec0"], obs, opts.beam_pa_step)
 
-    # ASCIISkymodel is read-only, so we edit the flux fields in the original text (preserving
+    # Sources are refit about their own reference frequency where they declare one, so the
+    # flux column keeps meaning what it did; the rest share the band centre.
+    band_centre = float(np.exp(np.mean(np.log(freqs))))
+    order = int(min(MAX_SPECTRUM_ORDER, freqs.size - 1))
+
+    # ASCIISkymodel is read-only, so we edit the fields in the original text (preserving
     # formatting, comments and unknown columns) rather than reserialising. Each parsed source
     # carries its line index (source.lineno) -- the single source of truth for which line it
     # came from -- so we never re-implement the comment/blank-line skipping here.
     with open(opts.ascii_sky) as fh:
         lines = fh.read().splitlines()
-    cols = lines[0].replace("#format:", "").strip().split(sky.delimiter)
-    # The header holds column aliases when a custom schema renames them; map each
-    # column back to its schema field before looking for the stokes columns.
-    alias_to_field = ASCIISource(sky.schema).alias_to_field_mapper()
-    fields_by_col = [alias_to_field.get(col, col) for col in cols]
+    refit = order >= 1 and _schema_supports_continuum(sky, order)
+    if refit:
+        header, fields_by_col, added = _ascii_columns(lines, sky, order)
+        lines[0] = header
+    else:
+        _, fields_by_col, added = _ascii_columns(lines, sky)
+        if order >= 1:
+            log.warning(
+                "The source schema in use declares no continuum fields, so the beam's frequency "
+                "dependence cannot be written into the model; scaling the flux by the band-averaged "
+                "beam instead. Predict with skysim --primary-beam to apply the beam per channel."
+            )
     stokes_idx = [i for i, f in enumerate(fields_by_col) if f in ("stokes_i", "stokes_q", "stokes_u", "stokes_v")]
+    reffreq_idx = fields_by_col.index("cont_reffreq") if refit else None
+    coeff_idx = {k: fields_by_col.index(f"cont_coeff_{k}") for k in range(1, order + 1)} if refit else {}
 
     dropped = set()
+    worst_residual = 0.0
     for src, source in enumerate(sky.sources):
-        a = A[src]
-        if invert and a < opts.pb_cutoff:  # source outside the beam -> drop it
+        a_nu = beam[src]
+        if invert and a_nu.min() < opts.pb_cutoff:
+            # Dropped on the *weakest* channel: correcting divides by the beam, so a source
+            # the beam nulls anywhere in the band cannot be recovered over the whole band.
             dropped.add(source.lineno)
             continue
-        factor = (1.0 / a) if invert else a
+        if refit:
+            ref_freq = source.value_or_default("cont_reffreq") or band_centre
+            coeffs, residual = fit_log_beam(a_nu, freqs, ref_freq, order)
+            worst_residual = max(worst_residual, residual)
+            coeffs = -coeffs[:, 0] if invert else coeffs[:, 0]
+            scale = float(np.exp(coeffs[0]))
+        else:
+            a = float(a_nu.mean())
+            scale = (1.0 / a) if invert else a
+
         fields = lines[source.lineno].split(sky.delimiter)
         for idx in stokes_idx:
             if idx < len(fields) and fields[idx].lower() not in ("null", "none", ""):
                 # A non-numeric Stokes field is left exactly as written.
                 with contextlib.suppress(ValueError):
-                    fields[idx] = f"{float(fields[idx]) * factor:.8g}"
+                    fields[idx] = f"{float(fields[idx]) * scale:.8g}"
+        if refit:
+            old_coeffs = source.continuum_coefficients()
+            _set_field(fields, reffreq_idx, f"{ref_freq:.8g}")
+            for k, idx in coeff_idx.items():
+                old = old_coeffs[k - 1] if k <= len(old_coeffs) else 0.0
+                _set_field(fields, idx, f"{old + coeffs[k]:.8g}")
         lines[source.lineno] = (sky.delimiter or " ").join(fields)
 
     out_lines = [ln for i, ln in enumerate(lines) if i not in dropped]
     output = opts.output or ("corrected.txt" if invert else "apparent.txt")
     with open(output, "w") as fh:
         fh.write("\n".join(out_lines) + "\n")
+    if added:
+        log.info("Added %s to the model; the beam gives every source a spectrum.", ", ".join(added))
+    if order < MAX_SPECTRUM_ORDER:
+        log.warning(
+            "The MS has %d channel(s), so the beam's frequency dependence was fitted to order %d. "
+            "A single channel carries none at all, leaving a plain scale factor.",
+            freqs.size,
+            order,
+        )
+    if worst_residual > 0.01:
+        log.warning(
+            "The order-%d log-polynomial reproduces the beam to only %.1f%% over the band for the "
+            "worst source (typically one near a null). Predicting with skysim --primary-beam "
+            "applies the beam per channel and needs no fit.",
+            order,
+            100 * worst_residual,
+        )
     log.info(
         "%s primary beam to %d sources -> %s",
         "Corrected" if invert else "Applied",
