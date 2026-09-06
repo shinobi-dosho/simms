@@ -1,5 +1,66 @@
 ### 3.0.1 -> unreleased
 
+- `primary-beam`: `apply`/`correct` now fold the beam into a model's *spectrum*
+  rather than scaling its flux by one band-averaged number. The beam narrows
+  across the band, so an off-axis source is attenuated far harder at the top of
+  the band than the bottom: in MeerKAT L band the beam alone contributes about
+  -1.1 to the spectral index at 0.5 degrees off axis -- larger than a typical
+  synchrotron index -- and -6.5 at 1 degree. Scaling the flux and leaving
+  `cont_coeff_*` untouched therefore wrote a model whose in-band flux was wrong
+  by tens of percent: for a 1 Jy, alpha=-0.7 source at 0.5 degrees over
+  900-1530 MHz, an effective index of -0.70 against a true -1.72, and -21% to
+  +33% per channel. The fold is exact in the basis both sides already use --
+  simms' continuum spectrum is `ln S = ln S_ref + sum c_k x**k` with
+  `x = ln(nu/nu_ref)`, and the beam is fitted as `ln A(nu)` in the same basis
+  about the same reference, so multiplying the two spectra is adding their
+  coefficients: the reference flux picks up `exp(a0)` and each `cont_coeff_k`
+  picks up `a_k` (`correct` negates them). That takes the same case to 0.98%
+  worst-channel error and reproduces the -1.72 index. The residual is the
+  log-polynomial fit error, reported when it exceeds 1%. FITS cubes get a beam
+  per plane at the cube's own frequencies, in place of one 2D map broadcast
+  across every channel. A model written without continuum columns gains them
+  (the beam gives every source a spectrum whether or not it had one), reusing
+  the file's own aliases where a schema renames fields. Three cases cannot
+  carry a spectrum and keep one averaged number with a warning: a 2D image, a
+  single-channel MS, and a custom `--source-schema` that does not declare the
+  continuum fields, since writing them would produce a model that same schema
+  could not read. Two behaviour changes come with this: `apply` may add columns
+  to a model that had none, and `correct` now drops a source when the beam
+  falls below `--pb-cutoff` anywhere in the band rather than when the band
+  average does -- dividing by a per-channel beam cannot recover a channel the
+  beam nulls. `skysim --primary-beam` was already correct and is unchanged: it
+  carries a per-channel beam grid and needs no fit at all.
+
+- CLI: six defects found by fuzzing the command surface, none of which the
+  option-contract tests could see -- they check the shape of the generated
+  options, not what happens when the values are wrong. **Options placed after
+  the positional argument were silently dropped**: `chain=True` on the root
+  group makes click give every subcommand `allow_interspersed_args=False`, so
+  parsing stopped at the MS and the rest was reassigned to a following command
+  that does not exist, surfacing as `Error: No such option '-n'` from
+  `simms telsim obs.ms --telescope meerkat`. Interspersing is now re-enabled
+  whenever nothing in the remaining arguments names another subcommand, so
+  `simms telsim ... skysim ...` still splits and a sky model file called
+  `skysim` stays a path. **Errors below the CLI reached the terminal as bare
+  tracebacks** (68 of 88 fuzzed invocations); they are now reported as one
+  `Error:` line, with the traceback still available under `--log-level DEBUG`
+  or `SIMMS_TRACEBACK=1`. **`telsim` accepted values that cannot describe an
+  MS** and exited 0 -- `--nchan 0` wrote `NUM_CHAN=0`, `--dtime -8` a negative
+  `EXPOSURE`, `--direction J2000,1h0m0s,-999d0m0s` silently wrapped to +81
+  degrees -- with the worst case compounding: a `--dtime -8` MS made a later
+  `skysim --sefd` fill `DATA` with NaNs, both steps reporting success. These
+  are rejected up front; a negative `--chan-width` is deliberately still
+  accepted, since a reversed sideband is a real spectral window. **A typo in
+  `--telescope` deleted the MS already at the target path** before failing:
+  `create_ms` removed it on entry, and now does so just before the first write,
+  once the layout, subarray, frequencies and uv coverage have resolved.
+  **`--log-level` omitted `DEBUG`** while `set_logger` had always honoured it;
+  it is added and case-insensitive, and an unknown level now falls back to INFO
+  rather than to DEBUG (a typo used to turn logging all the way up).
+  **`--chain` permanently stripped the `ms` argument from `telsim`** for the
+  rest of the process, since the shared command object was mutated in place --
+  visible to a shinobi Recipe, dosho, or any in-process caller.
+
 - `skysim`: new `--smearing subsample` brings time/bandwidth smearing to the
   FITS gridder backends (`fft`, `perchan` and a-term beams), which the analytic
   factor cannot reach: the whole backend prediction is repeated at sub-times

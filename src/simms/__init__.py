@@ -25,7 +25,9 @@ SCHEMADIR = os.path.join(PCKGDIR, "schemas")
 
 def set_logger(name, level="INFO"):
     if isinstance(level, str):
-        level = getattr(logging, level, 10)
+        # An unrecognised name used to fall through to 10 (DEBUG), so a typo turned the
+        # logging all the way *up*. INFO is the documented default and the safer landing.
+        level = getattr(logging, level.upper(), logging.INFO)
 
         # create logger
     logger = logging.getLogger(name)

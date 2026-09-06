@@ -230,6 +230,24 @@ visibilities. It has four modes:
     Multiply a sky model by the beam, or divide it out, writing a new sky model
     rather than touching visibilities. Takes ``--fits-sky`` or ``--ascii-sky``.
 
+    The beam narrows across the band, so it is not a scale factor: a source
+    0.5 degrees off-axis in MeerKAT L band is attenuated roughly twice as hard at
+    the top of the band as at the bottom, which alone contributes about -1.1 to
+    its spectral index. So the beam is folded into the model's *spectrum*, not
+    just its flux. A FITS cube gets its own beam per plane. ASCII components are
+    refit: simms' continuum spectrum and the fitted beam are both log-polynomials
+    about the same reference frequency, so the reference flux picks up the beam
+    there and each ``cont_coeff_k`` picks up the beam's own coefficient. A model
+    written without ``cont_reffreq``/``cont_coeff_*`` columns gains them, since
+    the beam gives every source a spectrum whether or not it had one.
+
+    Three cases cannot carry a spectrum and fall back to a single
+    frequency-averaged number, with a warning: a 2D image, a single-channel MS,
+    and a custom ``--source-schema`` that does not declare the continuum fields
+    (writing them would produce a model that same schema could not read). For
+    those, predict with ``skysim --primary-beam`` instead, which applies the beam
+    per channel and needs no fit at all.
+
 Because ``to-fits`` and ``tag-ms`` write ordinary MS metadata and FITS files,
 they compose with tools outside simms -- you can build a beam here and hand it
 to DDFacet, or tag an MS that another simulator produced.
