@@ -980,7 +980,7 @@ def skysim(
         description="YAML file describing RIME Jones corruptions to apply to the predicted visibilities.",
     ),
     ascii_species: Annotated[
-        str | None, ParamMeta(choices=["bdsf_gaul", "aegean", "wsclean"], abbreviation="asp")
+        str | None, ParamMeta(choices=["bdsf_gaul", "bdsf_srl", "aegean", "wsclean"], abbreviation="asp")
     ] = Field(None, description="Non-simms sky model type."),
     input_column: Annotated[str | None, ParamMeta(abbreviation="ic")] = Field(
         None,

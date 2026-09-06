@@ -1,10 +1,11 @@
 """Operations for the ``simms primary-beam`` command.
 
 Four modes, none of which run a visibility simulation:
-- ``to_fits``      : sample an analytic cosine-taper beam onto a FITS beam cube, in either
+
+* ``to_fits``: sample an analytic cosine-taper beam onto a FITS beam cube, in either
   simms' own single-file layout or the Cattery/DDFacet 8-file ``--Beam-Model FITS`` schema.
-- ``tag_ms``       : write the per-antenna telescope-name column onto an existing MS.
-- ``apply``/``correct`` : multiply / divide a sky model (FITS image or ASCII components) by
+* ``tag_ms``: write the per-antenna telescope-name column onto an existing MS.
+* ``apply``/``correct``: multiply / divide a sky model (FITS image or ASCII components) by
   the parallactic-angle-averaged Stokes-I power beam ``A(l, m, nu)``. The beam narrows across
   the band, so this is not a scale factor: a cube gets a beam per plane, and ASCII components
   have it folded into their log-polynomial spectrum (:func:`fit_log_beam`). Only a model that

@@ -17,6 +17,10 @@ what :doc:`skysim` reads to select a primary beam per antenna. It is never
 inferred from other columns such as ``DISH_DIAMETER`` -- if the column is
 absent, tools should fail clearly rather than guess.
 
+When you create an MS with ``telsim`` the column is populated from the bundled
+layout. If you have an MS from another source, ``simms primary-beam tag-ms``
+can write it for you (see :doc:`beams`).
+
 Pointing centre vs. phase centre
 -----------------------------------
 
@@ -46,6 +50,9 @@ all. The beam centre above is then only defined for antenna 0, which happens to
 work while every antenna points the same way and breaks silently as soon as they
 do not.
 
+If you write ``POINTING`` yourself, make sure ``ANTENNA_ID`` varies fastest and
+matches the time axis of the main table.
+
 Spectral frame must be set
 -----------------------------
 
@@ -64,3 +71,12 @@ standard subtable needs an explicit descriptor, e.g.:
 .. code-block:: python
 
     xds_to_table(..., "{ms}::ANTENNA", columns=[col], descriptor="mssubtable('ANTENNA')")
+
+MOUNT column
+-------------
+
+The ``ANTENNA.MOUNT`` column is required for beam rotation. It tells simms
+whether the dish is ``ALT-AZ`` (so the beam rotates with parallactic angle) or,
+for example, ``EQUATORIAL`` (no rotation). ``telsim`` writes this from the
+layout; an MS that lacks it will fail with a clear error when a beam is
+requested.

@@ -601,3 +601,59 @@ def test_parse_error_names_the_offending_row(params):
                 "#format: ra dec stokes_i line_peak line_width\n0 -30 1.0 1.42e9 1e7\n0 -31 1.0 1.42e9 0\n"
             )
         )
+
+
+def test_pybdsf_gaul_schema_parsing(params):
+    from simms import SCHEMADIR
+
+    schema_path = os.path.join(SCHEMADIR, "bdsf_gaul_source_mapper.yaml")
+    content = "\n".join(
+        [
+            "#format: Source_id RA DEC Total_flux DC_Maj DC_Min DC_PA Spec_Indx",
+            "0 0.0 -30.0 1.5 0.01 0.005 45.0 -0.7",
+        ]
+    )
+    model = ASCIISkymodel(params.write_temp_file(content), source_schema_file=schema_path)
+    assert len(model.sources) == 1
+    src = model.sources[0]
+    assert src.name == "0"
+    assert pytest.approx(src.stokes_i, abs=1e-12) == 1.5
+    assert src.is_point is False
+    assert pytest.approx(src.continuum_coefficients()[0], abs=1e-12) == -0.7
+
+
+def test_pybdsf_srl_schema_parsing(params):
+    from simms import SCHEMADIR
+
+    schema_path = os.path.join(SCHEMADIR, "bdsf_srl_source_mapper.yaml")
+    content = "\n".join(
+        [
+            "#format: Source_id RA DEC Total_flux Maj Min PA Spec_Indx",
+            "0 0.0 -30.0 1.5 0.01 0.005 45.0 -0.7",
+        ]
+    )
+    model = ASCIISkymodel(params.write_temp_file(content), source_schema_file=schema_path)
+    assert len(model.sources) == 1
+    src = model.sources[0]
+    assert src.name == "0"
+    assert pytest.approx(src.stokes_i, abs=1e-12) == 1.5
+    assert src.is_point is False
+    assert pytest.approx(src.continuum_coefficients()[0], abs=1e-12) == -0.7
+
+
+def test_pybdsf_schema_with_polarisation(params):
+    from simms import SCHEMADIR
+
+    schema_path = os.path.join(SCHEMADIR, "bdsf_gaul_source_mapper.yaml")
+    content = "\n".join(
+        [
+            "#format: Source_id RA DEC Total_flux Total_Q Total_U Total_V",
+            "0 0.0 -30.0 1.5 0.1 0.05 0.01",
+        ]
+    )
+    model = ASCIISkymodel(params.write_temp_file(content), source_schema_file=schema_path)
+    src = model.sources[0]
+    assert src.is_polarised is True
+    assert pytest.approx(src.stokes_q, abs=1e-12) == 0.1
+    assert pytest.approx(src.stokes_u, abs=1e-12) == 0.05
+    assert pytest.approx(src.stokes_v, abs=1e-12) == 0.01

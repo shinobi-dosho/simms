@@ -67,7 +67,8 @@ row. ``null``, ``none``, ``nan`` and an empty field are all accepted, in any
 case.
 
 See :doc:`schemas` for the full schema, and use ``--ascii-species`` to select
-a non-default catalogue mapping (e.g. ``bdsf_gaul`` for a PyBDSF catalogue).
+a non-default catalogue mapping (e.g. ``bdsf_gaul`` or ``bdsf_srl`` for PyBDSF
+Gaussian or source catalogues, ``aegean`` or ``wsclean``).
 
 FITS sky models
 ----------------
@@ -76,10 +77,43 @@ FITS sky models
 
     $ simms skysim --fits-sky skymodel.fits --column DATA visdata.ms
 
-Provide separate FITS files per Stokes when simulating polarised sources.
-Tune the prediction with ``--pixel-tol`` (minimum pixel brightness considered,
-default ``1e-7``), ``--fft-precision`` (``single``/``double``), and
-``--no-do-wstacking`` to disable w-stacking.
+``--fits-sky`` can be a single FITS cube or a directory containing ``*I.fits``,
+``*Q.fits``, ``*U.fits`` and ``*V.fits`` Stokes cubes. Several options tune
+how the image is interpreted and predicted:
+
+- ``--predict-backend`` -- choose ``auto`` (default), ``dft`` (a direct
+  Fourier transform over bright pixels), ``fft`` (image-plane FFT with
+  w-stacking) or ``perchan`` (one FFT per channel). ``auto`` picks a backend
+  from the image size and source content.
+- ``--pixel-tol`` -- minimum pixel brightness considered for the ``dft``
+  backend (default ``1e-7``).
+- ``--fits-spectrum`` -- how the FITS cube represents frequency: ``auto``,
+  ``flat`` (constant per channel), ``poly`` (analytic log-polynomial), or
+  ``cube`` (the cube is already a spectral cube). ``auto`` inspects the FITS
+  header.
+- ``--fits-spi`` -- spectral-index (and curvature) maps used with
+  ``--fits-spectrum poly``.
+- ``--fits-ref-freq`` -- reference frequency in Hz for the analytic spectrum.
+  Defaults to the MS band centre.
+- ``--fits-spectrum-order`` -- order of the log-polynomial (1 is a plain
+  spectral index).
+- ``--fits-sky-interp`` -- interpolation when the MS and FITS frequency grids
+  do not match: ``nearest``, ``linear`` or ``cubic`` (default ``linear``).
+- ``--do-wstacking`` / ``--no-do-wstacking`` -- enable or disable w-stacking
+  on the FFT backends.
+- ``--fft-precision`` -- ``single`` or ``double`` (default ``double``).
+
+WSClean component lists
+------------------------
+
+.. code-block:: console
+
+    $ simms skysim --wsclean-sky wsclean-model.txt --column DATA visdata.ms
+
+``--wsclean-sky`` predicts from a WSClean component list (point and Gaussian
+components, Stokes I). It shares the per-visibility prediction path with the
+ASCII catalogue, so time/bandwidth smearing and primary beams work the same
+way.
 
 Adding to or subtracting from an existing column
 -------------------------------------------------
@@ -108,14 +142,17 @@ The correlator averages each visibility over a channel of width ``CHAN_WIDTH``
 and over an integration of length ``EXPOSURE``.  Both averages reduce the
 amplitude of a source away from the phase centre, by more the longer the
 baseline -- the familiar time and bandwidth smearing.  ``skysim`` reproduces
-that, so a predicted model matches averaged data instead of over-predicting it:
+that, so a predicted model matches averaged data instead of over-predicting it.
+The default is analytic smearing:
 
 .. code-block:: console
 
-    # the default: decorrelation from the MS's own CHAN_WIDTH and EXPOSURE
     $ simms skysim --ascii-sky skymodel.txt --smearing analytic visdata.ms
 
-    # a monochromatic, instantaneous prediction (the pre-3.1 behaviour)
+A monochromatic, instantaneous prediction (the pre-3.1 behaviour) is:
+
+.. code-block:: console
+
     $ simms skysim --ascii-sky skymodel.txt --smearing none visdata.ms
 
 The residual phase of a source is :math:`\phi = 2\pi\nu(ul + vm + w(n-1))/c`,
@@ -193,6 +230,8 @@ from it when building the MS; ``skysim`` takes the SEFD directly.)
 
 Use ``--seed-noise`` to make the noise realisation reproducible at a given
 chunking. (``--seed`` is the deprecated pre-3.1 name for the same option.)
+The realisation depends on ``--row-chunks`` and ``--nworkers``, so reproducing
+it needs the same values for all three options.
 
 Corruptions
 -----------
@@ -305,6 +344,23 @@ J_q^H + n_{pq}`: ``--sefd`` noise is added after the corruptions and is not
 gain-modulated.  A noise-only run (``--sefd`` with no sky model) therefore has
 nothing for ``--corruptions`` to act on, and warns.
 
+Polarisation and polarisation basis
+-------------------------------------
+
+``--polarisation`` (default true) simulates all available Stokes parameters;
+``--no-polarisation`` restricts the prediction to Stokes I. ``--pol-basis``
+chooses ``linear`` (default) or ``circular`` for the simulated coherency. Note
+that beams build the brightness in the linear feed basis internally, so a
+circular MS with a beam still carries the physics correctly once the basis
+transform is folded into the Jones.
+
+Selecting a field or spectral window
+--------------------------------------
+
+``--field-id`` and ``--spw-id`` select one field and one spectral window from a
+multi-field or multi-SPW MS. Defaults are ``0``. ``skysim`` runs one field/SPW
+at a time; repeat the command with different IDs if you need several.
+
 Chunking large MSs
 -------------------
 
@@ -312,13 +368,21 @@ Chunking large MSs
 
     $ simms skysim --ascii-sky skymodel.txt --column SIMULATED_DATA --row-chunks 5000 largevis.ms
 
-``--row-chunks`` controls the row-wise task/memory granularity (default
-``10000``).
+``--row-chunks`` controls the row-wise task/memory granularity. It is an upper
+bound: the actual chunk size is reduced so that every worker (``--nworkers``)
+gets several chunks, floored at 256 rows. This prevents a short track from
+leaving workers idle. ``--chan-chunks`` splits the channel axis in the same way
+when you need smaller per-channel tasks.
+
+Because thermal noise is generated per dask block, its realisation for a given
+``--seed-noise`` depends on the chunking. To reproduce a previous noisy run,
+pass the same ``--row-chunks`` and ``--nworkers``.
 
 Where to next
 -------------
 
 - :doc:`telsim` -- create the target MS.
+- :doc:`beams` -- attach primary beams and a-terms.
 - :doc:`ms-conventions` -- how the primary beam centre is read from
   ``POINTING.DIRECTION``.
 - :doc:`schemas` -- full sky model and catalogue-mapper schemas.
