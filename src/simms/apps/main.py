@@ -191,7 +191,7 @@ def _make_command(step, *, positional, chained, extra_options=()):
     "--log-level",
     "-ll",
     help="Log level. DEBUG also restores the full traceback on an unexpected failure.",
-    # DEBUG was missing while set_logger has always honoured it, so the most useful level was
+    # DEBUG was missing from the accepted choices, so the most useful level was
     # the one level the CLI could not ask for. Case-insensitive so `-ll debug` works too.
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
     default="INFO",

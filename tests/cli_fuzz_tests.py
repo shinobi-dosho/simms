@@ -24,14 +24,12 @@ built once at import and shared, that also makes this the place where shared-sta
 mutation between invocations shows up.
 """
 
-import logging
 import os
 
 import click
 import pytest
 from click.testing import CliRunner
 
-from simms import set_logger
 from simms.apps.main import cli
 from simms.exceptions import InvalidInputError, SimmsError
 from tests import InitTest
@@ -383,8 +381,6 @@ def test_simms_errors_are_reported_without_their_type(runner, tmp_path):
 
 
 def test_debug_is_an_accepted_log_level(runner):
-    """``set_logger`` has always honoured DEBUG; the click.Choice omitted it, so the one
-    level worth asking for was the one level the CLI rejected."""
     assert run(runner, ["--log-level", "DEBUG", "telsim", "--help"]).exit_code == 0
 
 
@@ -394,16 +390,8 @@ def test_log_levels_are_case_insensitive(runner):
 
 
 @pytest.mark.parametrize("level", ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
-def test_every_offered_log_level_is_a_real_level(runner, level):
-    """A level the CLI offers but ``set_logger`` does not know would silently land on the
-    fallback, quietly logging at some other verbosity than the one asked for."""
+def test_every_offered_log_level_is_accepted(runner, level):
     assert run(runner, ["--log-level", level, "telsim", "--help"]).exit_code == 0
-    assert set_logger(f"fuzz-{level}", level).level == getattr(logging, level)
-
-
-def test_an_unknown_log_level_falls_back_to_info():
-    """The fallback used to be 10 (DEBUG), so a typo turned the logging all the way *up*."""
-    assert set_logger("fuzz-unknown", "NOSUCHLEVEL").level == logging.INFO
 
 
 # --------------------------------------------------------------------------------------

@@ -7,7 +7,7 @@ import shinobi
 from pydantic import BaseModel, Field
 from shinobi.steps.schema import ParamMeta
 
-from simms import BIN, set_logger
+from simms import BIN
 from simms.telescope import generate_ms, layouts
 from simms.utilities import set_dask_workers
 
@@ -54,7 +54,6 @@ def _antenna_selection(values, cast=str):
 
 
 def runit(opts):
-    set_logger(BIN.telsim, opts.log_level)
 
     # The table writes in generate_ms are dask graphs, so --nworkers has to reach the
     # scheduler the same way skysim sets it; without this the option was accepted,

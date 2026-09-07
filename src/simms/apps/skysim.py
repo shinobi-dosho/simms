@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from shinobi.steps.schema import ParamMeta
 from tqdm.dask import TqdmCallback
 
-from simms import BIN, SCHEMADIR, set_logger
+from simms import BIN, SCHEMADIR
 from simms.exceptions import InvalidInputError
 from simms.skymodel.ascii_skies import ASCIISkymodel
 from simms.skymodel.beams import load_beam_config, resolve_antenna_beams
@@ -355,8 +355,6 @@ class _BeamContext:
 
 
 def runit(opts):
-    # Set logger here, so subsequent modeules get it via logging.getLogger(<name>)
-    set_logger(BIN.skysim, opts.log_level)
 
     # --seed only ever seeded the thermal noise, so it maps onto --seed-noise.
     seed_noise = opts.seed_noise

@@ -7,7 +7,7 @@ import shinobi
 from pydantic import BaseModel, Field
 from shinobi.steps.schema import ParamMeta
 
-from simms import BIN, set_logger
+from simms import BIN
 from simms.utilities import set_dask_workers
 
 
@@ -36,7 +36,6 @@ def _require(opts, field):
 
 def runit(opts) -> PrimaryBeamOutputs:
     """Run one primary-beam mode and report the paths it actually wrote."""
-    set_logger(BIN.primary_beam, opts.log_level)
     from simms.skymodel import pb_ops
 
     # pb_ops builds and computes dask graphs, so --nworkers has to reach the scheduler the
