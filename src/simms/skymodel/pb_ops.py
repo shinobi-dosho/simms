@@ -10,7 +10,10 @@ Four modes, none of which run a visibility simulation:
   the band, so this is not a scale factor: a cube gets a beam per plane, and ASCII components
   have it folded into their log-polynomial spectrum (:func:`fit_log_beam`). Only a model that
   cannot carry a spectrum -- a 2D image, a single-channel MS, a source schema without the
-  continuum fields -- falls back to one frequency-averaged number.
+  continuum fields -- falls back to one frequency-averaged number. For a joint mosaic, the
+  effective response is the weighted RMS ``sqrt(sum(w A**2) / sum(w))`` used by a standard
+  flat-noise joint mosaic; pointings come from repeated MS inputs or explicit centres sharing
+  one reference MS's observation metadata.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ log = logging.getLogger(BIN.primary_beam)
 # --------------------------------------------------------------------- geometry
 
 
-def _observation(ms, field_id=0, spw_id=0):
+def _observation(ms, field_id=0, spw_id=0, pointing_centre=None):
     """Read the geometry an averaged beam needs from an MS (for the given field/spw)."""
     import dask
     from daskms import xds_from_ms, xds_from_table
@@ -38,7 +41,6 @@ def _observation(ms, field_id=0, spw_id=0):
 
     ant = xds_from_table(f"{ms}::ANTENNA")[0]
     spw = xds_from_table(f"{ms}::SPECTRAL_WINDOW")[0]
-    field = xds_from_table(f"{ms}::FIELD")[0]
     msds = xds_from_ms(ms, group_cols=["DATA_DESC_ID"], taql_where=f"FIELD_ID=={int(field_id)}")[int(spw_id)]
     if "MOUNT" not in ant:
         # Whether the beam rotates with parallactic angle is metadata, not something to
@@ -49,14 +51,13 @@ def _observation(ms, field_id=0, spw_id=0):
             f"rotates with parallactic angle cannot be determined. Add the column (MSv2 "
             f"requires it) with the mount of each antenna, e.g. 'ALT-AZ'."
         )
-    pos, mount, t0, t1, interval, chan_freq, phase_dir = dask.compute(
+    pos, mount, t0, t1, interval, chan_freq = dask.compute(
         ant.POSITION.data,
         ant.MOUNT.data,
         msds.TIME.data.min(),
         msds.TIME.data.max(),
         msds.INTERVAL.data[0],
         spw.CHAN_FREQ.data[int(spw_id)],
-        field.PHASE_DIR.data[int(field_id)],
     )
     lon, lat = array_lonlat(pos)
     # One representative beam is applied to the whole array here, so one mount decides
@@ -72,11 +73,18 @@ def _observation(ms, field_id=0, spw_id=0):
             "ALT-AZ" if is_altaz else "non-rotating",
             mounts[0],
         )
-    # Beam centre is the antenna pointing centre, not the phase centre. POINTING carries no
-    # FIELD_ID, so the selected rows' TIME span is what picks this field's pointing.
-    ra0, dec0 = read_pointing_centre(
-        ms, phase_dir[0][0], phase_dir[0][1], int(field_id), time_range=(float(t0), float(t1))
-    )
+    if pointing_centre is None:
+        field = xds_from_table(f"{ms}::FIELD")[0]
+        (phase_dir,) = dask.compute(field.PHASE_DIR.data[int(field_id)])
+        # Beam centre is the antenna pointing centre, not the phase centre. POINTING carries
+        # no FIELD_ID, so the selected rows' TIME span is what picks this field's pointing.
+        ra0, dec0 = read_pointing_centre(
+            ms, phase_dir[0][0], phase_dir[0][1], int(field_id), time_range=(float(t0), float(t1))
+        )
+    else:
+        # An explicit centre is authoritative. In particular, do not require a usable
+        # POINTING table merely to read unrelated time/location/frequency metadata.
+        ra0, dec0 = pointing_centre
     return {
         "t_start": float(t0),
         "duration": float(t1 - t0) + float(interval),
@@ -89,8 +97,107 @@ def _observation(ms, field_id=0, spw_id=0):
     }
 
 
-def _beam_over_frequency(provider, ell, emm, ra0, dec0, obs, pa_step, freqs=None):
-    """PA-averaged power beam ``A(l, m, nu)``, shape ``(npts, nfreq)`` (beam centre ra0/dec0).
+def _ms_paths(value):
+    """Normalize a scalar or repeatable ``--ms`` value to a list."""
+    if not value:
+        return []
+    return [value] if isinstance(value, str) else list(value)
+
+
+def _parse_pointing_centre(value):
+    """Parse ``frame,ra,dec`` (or ``ra,dec``) and return J2000 radians."""
+    from astropy.coordinates import Angle
+    from casacore.measures import measures
+
+    from simms.exceptions import InvalidInputError
+
+    parts = [part.strip() for part in str(value).split(",")]
+    if len(parts) == 2:
+        frame, ra, dec = "J2000", *parts
+    elif len(parts) == 3:
+        frame, ra, dec = parts
+    else:
+        raise InvalidInputError(
+            f"--pointing-centre takes 'frame,ra,dec' (or 'ra,dec'), e.g. 'J2000,1h0m0s,-31deg'; got {value!r}."
+        )
+    try:
+        dec_deg = float(Angle(dec).deg)
+    except Exception:
+        dec_deg = None
+    if dec_deg is not None and abs(dec_deg) > 90:
+        raise InvalidInputError(f"--pointing-centre declination must be within +/-90 degrees; got {dec!r}.")
+    try:
+        dm = measures()
+        direction = dm.measure(dm.direction(frame, ra, dec), "J2000")
+    except Exception as exc:
+        raise InvalidInputError(f"Could not parse --pointing-centre {value!r}: {exc}") from None
+    return float(direction["m0"]["value"]), float(direction["m1"]["value"])
+
+
+def _observations(opts):
+    """Observation metadata for every mosaic pointing requested by apply/correct."""
+    from simms.exceptions import InvalidInputError
+
+    paths = _ms_paths(opts.ms)
+    centres = _ms_paths(opts.pointing_centre)
+    if centres and len(paths) != 1:
+        raise InvalidInputError(
+            "--pointing-centre requires exactly one --ms whose time, location, mount and "
+            "frequencies are reused for every explicit centre."
+        )
+
+    if centres:
+        parsed = [_parse_pointing_centre(value) for value in centres]
+        template = _observation(paths[0], opts.field_id, opts.spw_id, pointing_centre=parsed[0])
+        observations = [template | {"ra0": ra0, "dec0": dec0} for ra0, dec0 in parsed]
+    else:
+        observations = [_observation(path, opts.field_id, opts.spw_id) for path in paths]
+
+    supplied_weights = opts.mosaic_weight
+    if supplied_weights is None:
+        weights = [1.0] * len(observations)
+    elif np.isscalar(supplied_weights):
+        weights = [supplied_weights]
+    else:
+        weights = list(supplied_weights)
+    if len(weights) != len(observations):
+        raise InvalidInputError(
+            f"Got {len(weights)} --mosaic-weight value(s) for {len(observations)} mosaic pointing(s); "
+            "provide exactly one per --ms or --pointing-centre."
+        )
+    try:
+        weights = [float(weight) for weight in weights]
+    except (TypeError, ValueError):
+        raise InvalidInputError("Every --mosaic-weight must be a number greater than zero.") from None
+    if not all(np.isfinite(weight) and weight > 0 for weight in weights):
+        raise InvalidInputError("Every --mosaic-weight must be finite and greater than zero.")
+    # Only ratios matter. Scaling by the largest value prevents otherwise valid weights
+    # such as [1e308, 1e308] from overflowing their sum or weighted beam accumulator.
+    scale = max(weights)
+    weights = [weight / scale for weight in weights]
+    for obs, weight in zip(observations, weights, strict=True):
+        obs["mosaic_weight"] = float(weight)
+
+    if len(observations) > 1:
+        reference = observations[0]["freqs"]
+        for path, obs in zip(paths[1:], observations[1:], strict=False):
+            if obs["freqs"].shape != reference.shape or not np.allclose(obs["freqs"], reference, rtol=1e-10, atol=1e-3):
+                label = path if path else "an explicit pointing"
+                raise InvalidInputError(
+                    f"Mosaic pointing {label!r} has a different selected frequency grid. "
+                    "All --ms values must select matching channels; use one reference --ms "
+                    "with repeated --pointing-centre values when only the centres differ."
+                )
+        log.info(
+            "Using the weighted PB-squared response of %d pointings for the joint mosaic%s.",
+            len(observations),
+            " (equal weights)" if supplied_weights is None else "",
+        )
+    return observations
+
+
+def _beam_over_frequency(provider, ell, emm, ra0, dec0, obs, pa_step, freqs=None, moment=1):
+    """PA-averaged power-beam moment, shape ``(npts, nfreq)`` (beam centre ra0/dec0).
 
     ``freqs`` defaults to the MS channel centres; the FITS-cube path passes the *cube's* own
     frequencies instead, since that is where its planes live.
@@ -99,12 +206,58 @@ def _beam_over_frequency(provider, ell, emm, ra0, dec0, obs, pa_step, freqs=None
 
     _, chi_grid = pa_sample_grid(obs["t_start"], obs["duration"], ra0, dec0, obs["lon"], obs["lat"], pa_step)
     freqs = obs["freqs"] if freqs is None else freqs
-    return image_power_beam(provider, obs["is_altaz"], ell, emm, freqs, chi_grid)
+    return image_power_beam(provider, obs["is_altaz"], ell, emm, freqs, chi_grid, moment=moment)
 
 
 def _averaged_beam(provider, ell, emm, ra0, dec0, obs, pa_step):
     """Freq- and PA-averaged power beam ``A(l, m)`` at the given directions (beam centre ra0/dec0)."""
     return _beam_over_frequency(provider, ell, emm, ra0, dec0, obs, pa_step).mean(axis=1)
+
+
+def _mosaic_beam(provider, observations, lm_for_observation, pa_step, freqs=None):
+    """Weighted-RMS power response over pointings, shaped ``(npts, nfreq)``.
+
+    A standard linear mosaic has normal matrix ``sum(w_i <A_i(t)**2>_t)``. Dividing by
+    ``sum(w_i)`` gives an effective response that is invariant to duplicating every
+    pointing and reduces exactly to ``A`` for one pointing. Accumulate in place so a
+    large FITS grid does not retain one full beam array per pointing.
+    """
+    sum_weighted_beam2 = None
+    sum_weight = 0.0
+    for obs in observations:
+        ell, emm = lm_for_observation(obs)
+        beam2 = _beam_over_frequency(
+            provider,
+            ell,
+            emm,
+            obs["ra0"],
+            obs["dec0"],
+            obs,
+            pa_step,
+            freqs=freqs,
+            moment=2,
+        )
+        weight = obs["mosaic_weight"]
+        if sum_weighted_beam2 is None:
+            sum_weighted_beam2 = weight * beam2
+        else:
+            sum_weighted_beam2 += weight * beam2
+        sum_weight += weight
+    return np.sqrt(sum_weighted_beam2 / sum_weight)
+
+
+def _effective_beam(provider, observations, lm_for_observation, pa_step, freqs=None):
+    """Single-pointing apparent PB, or multi-pointing joint normal-matrix PB.
+
+    The pre-mosaic CLI corrects an ordinary apparent image with ``<A>``. Preserve
+    that contract for one pointing; ``sqrt(sum(w <A**2>) / sum(w))`` is specifically
+    the PB-aware joint-mosaic response requested when multiple pointings are supplied.
+    """
+    if len(observations) == 1:
+        obs = observations[0]
+        ell, emm = lm_for_observation(obs)
+        return _beam_over_frequency(provider, ell, emm, obs["ra0"], obs["dec0"], obs, pa_step, freqs=freqs)
+    return _mosaic_beam(provider, observations, lm_for_observation, pa_step, freqs=freqs)
 
 
 # The ASCII schema carries cont_coeff_1..3, so a refit can spend at most three coefficients.
@@ -288,7 +441,12 @@ def tag_ms(opts):
     import dask.array as da
     from daskms import xds_from_table, xds_to_table
 
-    ms, col = opts.ms, opts.telescope_name_column
+    from simms.exceptions import InvalidInputError
+
+    paths = _ms_paths(opts.ms)
+    if len(paths) != 1:
+        raise InvalidInputError("tag-ms requires exactly one --ms.")
+    ms, col = paths[0], opts.telescope_name_column
     ant = xds_from_table(f"{ms}::ANTENNA")[0]
     names = [str(x) for x in np.asarray(ant.NAME.data.compute()).astype(str)]
     labels = _resolve_labels(opts, names)
@@ -324,34 +482,42 @@ def apply_correct_image(opts, invert):
     # The primary beam sits on the antenna pointing centre (POINTING.DIRECTION) -- not the
     # correlator phase centre, and not necessarily the image's reference pixel. Centre the beam
     # (pixel l/m and the PA track) there; the image WCS only maps pixels to world coordinates.
-    obs = _observation(opts.ms, opts.field_id, opts.spw_id)
-    ra0, dec0 = obs["ra0"], obs["dec0"]
+    observations = _observations(opts)
     img_ra0 = np.radians(cel.wcs.crval[cel.wcs.lng])
     img_dec0 = np.radians(cel.wcs.crval[cel.wcs.lat])
-    sep = _angular_separation(img_ra0, img_dec0, ra0, dec0)
-    if sep > np.radians(1.0 / 3600.0):  # > 1 arcsec: image reference and antenna pointing disagree
-        log.warning(
-            "Image reference pixel (%.6f, %.6f deg) differs from the antenna pointing centre "
-            "(%.6f, %.6f deg) by %.1f arcsec; centring the beam on the pointing centre.",
-            np.degrees(img_ra0),
-            np.degrees(img_dec0),
-            np.degrees(ra0),
-            np.degrees(dec0),
-            np.degrees(sep) * 3600.0,
-        )
+    if len(observations) == 1:
+        ra0, dec0 = observations[0]["ra0"], observations[0]["dec0"]
+        sep = _angular_separation(img_ra0, img_dec0, ra0, dec0)
+        if sep > np.radians(1.0 / 3600.0):  # > 1 arcsec: image reference and antenna pointing disagree
+            log.warning(
+                "Image reference pixel (%.6f, %.6f deg) differs from the antenna pointing centre "
+                "(%.6f, %.6f deg) by %.1f arcsec; centring the beam on the pointing centre.",
+                np.degrees(img_ra0),
+                np.degrees(img_dec0),
+                np.degrees(ra0),
+                np.degrees(dec0),
+                np.degrees(sep) * 3600.0,
+            )
 
     # Standard axis order: FITS axis 1 = RA (numpy last), axis 2 = DEC (numpy second-last).
     npix_dec, npix_ra = data.shape[-2], data.shape[-1]
     i_ra, j_dec = np.meshgrid(np.arange(npix_ra), np.arange(npix_dec))  # (npix_dec, npix_ra)
 
-    ell, emm = pixel_lm(cel, ra0, dec0, i_ra.ravel(), j_dec.ravel())
+    def pixel_directions(obs):
+        return pixel_lm(cel, obs["ra0"], obs["dec0"], i_ra.ravel(), j_dec.ravel())
+
+    provider = provider_from(opts)
 
     # A cube's planes each sit at their own frequency, and the beam narrows across the band,
     # so one averaged map applied to every plane would impose the band-average attenuation on
     # channels where the true beam is far wider or narrower. Give each plane its own beam.
     spectral_axis, cube_freqs = _fits_spectral_axis(header, data.ndim)
     if spectral_axis is None:
-        A = _averaged_beam(provider_from(opts), ell, emm, ra0, dec0, obs, opts.beam_pa_step)
+        # With no spectral axis, approximate a continuum normal matrix with equal MS-channel
+        # weights. The square root belongs outside that frequency average, just as it does
+        # outside the PA average above.
+        A_nu = _effective_beam(provider, observations, pixel_directions, opts.beam_pa_step)
+        A = A_nu.mean(axis=1) if len(observations) == 1 else np.sqrt(np.mean(np.square(A_nu), axis=1))
         A = A.reshape(npix_dec, npix_ra)
     else:
         log.info(
@@ -360,7 +526,7 @@ def apply_correct_image(opts, invert):
             cube_freqs.min() / 1e9,
             cube_freqs.max() / 1e9,
         )
-        A = _beam_over_frequency(provider_from(opts), ell, emm, ra0, dec0, obs, opts.beam_pa_step, freqs=cube_freqs)
+        A = _effective_beam(provider, observations, pixel_directions, opts.beam_pa_step, freqs=cube_freqs)
         # (npix_dec * npix_ra, nchan) -> the cube's own axis order, singleton elsewhere. The
         # spectral axis always precedes both celestial axes, so no element reordering is needed.
         shape = [1] * data.ndim
@@ -443,13 +609,16 @@ def apply_correct_ascii(opts, invert):
     from simms.skymodel.ascii_skies import ASCIISkymodel
     from simms.utilities import radec2lm
 
-    obs = _observation(opts.ms, opts.field_id, opts.spw_id)
+    observations = _observations(opts)
     # ASCIISkymodel falls back to the built-in source schema when source_schema is unset
     sky = ASCIISkymodel(opts.ascii_sky, delimiter=opts.ascii_delimiter, source_schema_file=opts.source_schema)
-    lm = np.array([radec2lm(obs["ra0"], obs["dec0"], s.ra, s.dec) for s in sky.sources])
-    ell, emm = (lm[:, 0], lm[:, 1]) if len(lm) else (np.array([]), np.array([]))
-    freqs = obs["freqs"]
-    beam = _beam_over_frequency(provider_from(opts), ell, emm, obs["ra0"], obs["dec0"], obs, opts.beam_pa_step)
+
+    def source_directions(obs):
+        lm = np.array([radec2lm(obs["ra0"], obs["dec0"], s.ra, s.dec) for s in sky.sources])
+        return (lm[:, 0], lm[:, 1]) if len(lm) else (np.array([]), np.array([]))
+
+    freqs = observations[0]["freqs"]
+    beam = _effective_beam(provider_from(opts), observations, source_directions, opts.beam_pa_step)
 
     # Sources are refit about their own reference frequency where they declare one, so the
     # flux column keeps meaning what it did; the rest share the band centre.
