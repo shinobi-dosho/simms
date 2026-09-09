@@ -8,9 +8,12 @@ import numpy as np
 import pytest
 from astropy.io import fits
 from astropy.wcs import WCS
+from click.testing import CliRunner
 from daskms import xds_from_table
+from shinobi.clickutil import build_options
 
 from simms.apps import primary_beam
+from simms.apps.main import cli
 from simms.skymodel.beams import CosineTaperBeam, FitsBeamProvider, JimBeamProvider
 from simms.telescope.generate_ms import create_ms
 
@@ -29,6 +32,8 @@ def _opts(mode, **over):
         "beam_l_axis": "-X",
         "beam_m_axis": "Y",
         "ms": None,
+        "pointing_centre": None,
+        "mosaic_weight": None,
         "fits_sky": None,
         "ascii_sky": None,
         "ascii_delimiter": None,
@@ -270,6 +275,57 @@ def test_outputs_declare_both_passthrough_paths():
     assert set(primary_beam.PrimaryBeamOutputs.model_fields) == {"ms", "output", "files"}
 
 
+def test_mosaic_inputs_are_repeatable_and_keep_scalar_recipe_compatibility():
+    options = {option.name: option for option in build_options(primary_beam.primary_beam.step.inputs_model)}
+    assert options["ms"].multiple
+    assert options["pointing_centre"].multiple
+    assert options["mosaic_weight"].multiple
+    assert primary_beam.primary_beam.step.inputs_model(mode="apply", ms="one.ms").ms == ["one.ms"]
+    assert primary_beam.primary_beam.step.inputs_model(mode="apply", mosaic_weight=2.0).mosaic_weight == [2.0]
+
+
+def test_real_cli_collects_repeated_mosaic_options(monkeypatch):
+    seen = {}
+
+    def capture(opts):
+        seen.update(vars(opts))
+        return primary_beam.PrimaryBeamOutputs()
+
+    monkeypatch.setattr(primary_beam, "runit", capture)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "primary-beam",
+            "--ms",
+            "reference.ms",
+            "--pointing-centre",
+            "1h0m0s,-31deg",
+            "--pointing-centre",
+            "1h1m0s,-31deg",
+            "--mosaic-weight",
+            "1",
+            "--mosaic-weight",
+            "2.5",
+            "apply",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["ms"] == ["reference.ms"]
+    assert seen["pointing_centre"] == ["1h0m0s,-31deg", "1h1m0s,-31deg"]
+    assert seen["mosaic_weight"] == ["1", "2.5"]
+
+    seen.clear()
+    result = CliRunner().invoke(
+        cli,
+        ["primary-beam", "--ms", "first.ms", "--ms", "second.ms", "apply"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["ms"] == ["first.ms", "second.ms"]
+
+
 # --- the resolved-output contract -------------------------------------------------
 #
 # Each mode defaults its filename when --output is omitted, so the outputs model has to
@@ -338,6 +394,13 @@ def test_tag_ms_reports_the_ms_and_writes_no_files(fx):
     assert res.files == []
 
 
+def test_tag_ms_rejects_repeated_measurement_sets(fx):
+    from simms.exceptions import InvalidInputError
+
+    with pytest.raises(InvalidInputError, match="exactly one --ms"):
+        primary_beam.runit(_opts("tag-ms", ms=[fx.ms, fx.ms], label="FOO"))
+
+
 def _write_ascii_sky(fx):
     path = fx.random_named_file(suffix=".txt")
     with open(path, "w") as fh:
@@ -353,6 +416,267 @@ def _write_image(fx, npix=256, off=90):
     path = fx.random_named_file(suffix=".fits")
     fits.PrimaryHDU(data=data, header=make_header(npix, nstokes=1, nchan=1)).writeto(path)
     return path, (npix // 2, npix // 2), (npix // 2 - off, npix // 2)
+
+
+def _write_uniform_image(fx, npix=64, cell=0.02):
+    path = fx.random_named_file(suffix=".fits")
+    data = np.ones((npix, npix), dtype=np.float32)
+    fits.PrimaryHDU(data=data, header=make_header(npix, nstokes=1, nchan=1, cell=cell)).writeto(path)
+    return path
+
+
+def test_mosaic_can_read_pointings_from_multiple_mss_or_explicit_centres(fx):
+    other = _Fixtures()
+    _set_pointing_direction(other.ms, np.radians(RA0_DEG), np.radians(DEC0_DEG + 0.5))
+    image = _write_uniform_image(fx)
+
+    first = fx.random_named_file(suffix=".fits")
+    second = fx.random_named_file(suffix=".fits")
+    # Duplicate each field to obtain its standalone normal-matrix response. Duplicate
+    # pointings are invariant under relative weighting but intentionally activate mosaic
+    # semantics rather than the legacy single-image <A> response.
+    primary_beam.runit(_opts("apply", ms=[fx.ms, fx.ms], fits_sky=image, output=first))
+    primary_beam.runit(_opts("apply", ms=[other.ms, other.ms], fits_sky=image, output=second))
+    first_beam = fits.getdata(first)
+    second_beam = fits.getdata(second)
+    expected = np.sqrt(0.5 * (first_beam**2 + second_beam**2))
+
+    from_mss = fx.random_named_file(suffix=".fits")
+    result = primary_beam.runit(_opts("apply", ms=[fx.ms, other.ms], fits_sky=image, output=from_mss))
+    assert result.ms == [fx.ms, other.ms]
+    np.testing.assert_allclose(fits.getdata(from_mss), expected, rtol=2e-5, atol=2e-7)
+
+    from_centres = fx.random_named_file(suffix=".fits")
+    primary_beam.runit(
+        _opts(
+            "apply",
+            ms=fx.ms,
+            pointing_centre=["J2000,1h0m0s,-31deg", "J2000,1h0m0s,-30d30m0s"],
+            fits_sky=image,
+            output=from_centres,
+        )
+    )
+    np.testing.assert_allclose(fits.getdata(from_centres), expected, rtol=2e-5, atol=2e-7)
+
+    weighted = fx.random_named_file(suffix=".fits")
+    primary_beam.runit(_opts("apply", ms=[fx.ms, other.ms], mosaic_weight=["1", "3"], fits_sky=image, output=weighted))
+    expected_weighted = np.sqrt((first_beam**2 + 3 * second_beam**2) / 4)
+    np.testing.assert_allclose(fits.getdata(weighted), expected_weighted, rtol=2e-5, atol=2e-7)
+
+    # Correct an independently constructed flat-noise mosaic. This is not an
+    # apply-then-correct tautology: the apparent input comes from the two single-field
+    # responses and the PB-squared equation above.
+    apparent = fx.random_named_file(suffix=".fits")
+    fits.PrimaryHDU(data=(7 * expected).astype(np.float32), header=fits.getheader(image)).writeto(apparent)
+    corrected = fx.random_named_file(suffix=".fits")
+    primary_beam.runit(_opts("correct", ms=[fx.ms, other.ms], fits_sky=apparent, output=corrected, pb_cutoff=0.1))
+    got = fits.getdata(corrected)
+    np.testing.assert_allclose(got[expected >= 0.1], 7, rtol=2e-5)
+    assert np.isnan(got[expected < 0.1]).all()
+
+
+@pytest.mark.parametrize("weights", [[1], [1, 0], [1, "not-a-number"]])
+def test_mosaic_weights_are_validated(fx, weights):
+    from simms.exceptions import InvalidInputError
+
+    with pytest.raises(InvalidInputError, match="mosaic-weight"):
+        primary_beam.runit(
+            _opts(
+                "apply",
+                ms=fx.ms,
+                pointing_centre=["1h0m0s,-31deg", "1h1m0s,-31deg"],
+                mosaic_weight=weights,
+                fits_sky=_write_uniform_image(fx),
+            )
+        )
+
+
+def test_relative_mosaic_weights_are_numerically_stable(monkeypatch):
+    from simms.skymodel import pb_ops
+
+    class ConstantBeam:
+        def voltage(self, ell, emm, freqs, chis):
+            out = np.empty((1, len(ell), len(freqs), 2), dtype=np.complex128)
+            out[..., 0] = np.sqrt(0.5)
+            out[..., 1] = np.sqrt(0.5)
+            return out
+
+    def observation(ms, field_id, spw_id):
+        return {
+            "t_start": 5.0e9,
+            "duration": 0.0,
+            "lon": 0.0,
+            "lat": 0.0,
+            "freqs": np.array([1e9]),
+            "ra0": 0.0,
+            "dec0": 0.0,
+            "is_altaz": False,
+        }
+
+    monkeypatch.setattr(pb_ops, "_observation", observation)
+    observations = pb_ops._observations(
+        SimpleNamespace(
+            ms=["first.ms", "second.ms"],
+            pointing_centre=None,
+            mosaic_weight=[1e308, 1e308],
+            field_id=0,
+            spw_id=0,
+        )
+    )
+    assert [obs["mosaic_weight"] for obs in observations] == [1.0, 1.0]
+    beam = pb_ops._mosaic_beam(
+        ConstantBeam(),
+        observations,
+        lambda obs: (np.array([0.0]), np.array([0.0])),
+        pa_step=1.0,
+    )
+    assert beam.item() == pytest.approx(0.5)
+
+    single = pb_ops._observations(
+        SimpleNamespace(ms="one.ms", pointing_centre=None, mosaic_weight=2.0, field_id=0, spw_id=0)
+    )
+    assert single[0]["mosaic_weight"] == 1.0
+
+
+def test_pb_square_is_averaged_after_sampling_parallactic_angle():
+    from simms.skymodel.beams import image_power_beam
+
+    class VaryingBeam:
+        def voltage(self, ell, emm, freqs, chis):
+            power = 1.0 if chis.item() == 0.0 else 0.5
+            return np.full((1, len(ell), len(freqs), 2), np.sqrt(power), dtype=np.complex128)
+
+    args = (VaryingBeam(), True, np.array([0.0]), np.array([0.0]), np.array([1e9]), np.array([0.0, 1.0]))
+    mean_beam = image_power_beam(*args)
+    mean_beam_squared = image_power_beam(*args, moment=2)
+
+    assert mean_beam.item() == pytest.approx(0.75)
+    assert mean_beam_squared.item() == pytest.approx(0.625)
+    assert mean_beam_squared.item() != pytest.approx(mean_beam.item() ** 2)
+
+
+def test_one_pointing_preserves_apparent_beam_moment(monkeypatch):
+    from simms.skymodel import pb_ops
+
+    seen = []
+
+    def beam_over_frequency(*args, moment=1, **kwargs):
+        seen.append(moment)
+        return np.array([[0.75]])
+
+    monkeypatch.setattr(pb_ops, "_beam_over_frequency", beam_over_frequency)
+    observation = {"ra0": 0.0, "dec0": 0.0}
+    got = pb_ops._effective_beam(
+        object(),
+        [observation],
+        lambda obs: (np.array([0.0]), np.array([0.0])),
+        pa_step=1.0,
+    )
+
+    assert got.item() == 0.75
+    assert seen == [1]
+
+
+def test_explicit_centres_do_not_read_pointing_table(fx, monkeypatch):
+    import simms.skymodel.beams as beams
+
+    def fail(*args, **kwargs):
+        raise AssertionError("explicit centres must not consult POINTING.DIRECTION")
+
+    monkeypatch.setattr(beams, "read_pointing_centre", fail)
+    output = fx.random_named_file(suffix=".fits")
+    primary_beam.runit(
+        _opts(
+            "apply",
+            ms=fx.ms,
+            pointing_centre=["1h0m0s,-31deg", "1h1m0s,-31deg"],
+            fits_sky=_write_uniform_image(fx),
+            output=output,
+        )
+    )
+    assert os.path.exists(output)
+
+
+def test_repeated_ms_ascii_uses_pb_squared_response(fx):
+    other = _Fixtures()
+    _set_pointing_direction(other.ms, np.radians(RA0_DEG), np.radians(DEC0_DEG + 0.5))
+    sky = _write_ascii_sky(fx)  # 5 Jy at the first pointing centre
+
+    individual_fluxes = []
+    for ms in (fx.ms, other.ms):
+        output = fx.random_named_file(suffix=".txt")
+        primary_beam.runit(_opts("apply", ms=ms, ascii_sky=sky, output=output))
+        individual_fluxes.append(_read_ascii_flux(output)["A"])
+
+    mosaic = fx.random_named_file(suffix=".txt")
+    primary_beam.runit(_opts("apply", ms=[fx.ms, other.ms], ascii_sky=sky, output=mosaic))
+    expected_flux = np.sqrt(0.5 * np.sum(np.square(individual_fluxes)))
+    assert _read_ascii_flux(mosaic)["A"] == pytest.approx(expected_flux, rel=2e-4)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["J2000,1h0m0s", "J2000,1h0m0s,-91deg", "not-a-direction,-31deg"],
+)
+def test_pointing_centre_rejects_malformed_values(value):
+    from simms.exceptions import InvalidInputError
+    from simms.skymodel.pb_ops import _parse_pointing_centre
+
+    with pytest.raises(InvalidInputError, match="pointing-centre"):
+        _parse_pointing_centre(value)
+
+
+def test_two_part_pointing_centre_defaults_to_j2000():
+    from simms.skymodel.pb_ops import _parse_pointing_centre
+
+    explicit = _parse_pointing_centre("J2000,1h0m0s,-31deg")
+    np.testing.assert_allclose(_parse_pointing_centre("1h0m0s,-31deg"), explicit, atol=1e-14)
+
+
+def test_explicit_centres_cannot_be_paired_ambiguously_with_multiple_mss(fx):
+    from simms.exceptions import InvalidInputError
+
+    with pytest.raises(InvalidInputError, match="exactly one --ms"):
+        primary_beam.runit(
+            _opts(
+                "apply",
+                ms=[fx.ms, fx.ms],
+                pointing_centre=["1h0m0s,-31deg"],
+                fits_sky=_write_uniform_image(fx),
+            )
+        )
+
+
+def test_repeated_mss_require_matching_frequency_grids(monkeypatch):
+    from simms.exceptions import InvalidInputError
+    from simms.skymodel import pb_ops
+
+    def observation(ms, field_id, spw_id):
+        return {
+            "freqs": np.array([1.0e9, 1.1e9 if ms == "first.ms" else 1.2e9]),
+            "ra0": 0.0,
+            "dec0": 0.0,
+        }
+
+    monkeypatch.setattr(pb_ops, "_observation", observation)
+    with pytest.raises(InvalidInputError, match="different selected frequency grid"):
+        pb_ops._observations(
+            SimpleNamespace(
+                ms=["first.ms", "second.ms"],
+                pointing_centre=None,
+                mosaic_weight=None,
+                field_id=0,
+                spw_id=0,
+            )
+        )
+
+
+def test_legacy_programmatic_options_need_no_mosaic_attributes(fx):
+    opts = _opts("apply", ms=fx.ms, fits_sky=_write_uniform_image(fx), output=fx.random_named_file(suffix=".fits"))
+    del opts.pointing_centre
+    del opts.mosaic_weight
+    primary_beam.runit(opts)
+    assert os.path.exists(opts.output)
 
 
 def test_apply_then_correct_image_is_identity(fx):
@@ -727,6 +1051,26 @@ def test_apply_then_correct_recovers_the_spectrum(wide):
     np.testing.assert_allclose(_apparent_spectrum(_read_ascii_model(recovered)[0], freqs), original, rtol=1e-3)
 
 
+def test_mosaic_apply_then_correct_recovers_an_ascii_spectrum(wide):
+    sky = wide.random_named_file(suffix=".txt")
+    with open(sky, "w") as fh:
+        fh.write("#format: name ra dec stokes_i cont_reffreq cont_coeff_1\n")
+        fh.write("between 1h0m0s -30d45m0s 2.5 1.284e9 -0.7\n")
+
+    centres = ["J2000,1h0m0s,-31deg", "J2000,1h0m0s,-30d30m0s"]
+    apparent = wide.random_named_file(suffix=".txt")
+    primary_beam.runit(_opts("apply", ms=wide.ms, pointing_centre=centres, ascii_sky=sky, output=apparent))
+    recovered = wide.random_named_file(suffix=".txt")
+    primary_beam.runit(_opts("correct", ms=wide.ms, pointing_centre=centres, ascii_sky=apparent, output=recovered))
+
+    freqs = _ms_freqs(wide.ms)
+    from simms.skymodel.source_factory import contspec
+
+    original = contspec(freqs, 2.5, [-0.7], 1.284e9)
+    got = _apparent_spectrum(_read_ascii_model(recovered)[0], freqs)
+    np.testing.assert_allclose(got, original, rtol=1e-3)
+
+
 def test_on_axis_source_keeps_its_spectrum(wide):
     """At the pointing centre the beam is flat, so nothing about the source should move."""
     sky = wide.random_named_file(suffix=".txt")
@@ -798,3 +1142,23 @@ def test_fits_cube_gets_a_beam_per_plane(wide):
     # ...and falling monotonically off-axis, because the beam narrows with frequency.
     assert np.all(np.diff(off_axis) < 0)
     assert off_axis[0] / off_axis[-1] > 1.4
+
+
+def test_mosaic_fits_cube_combines_pb_squared_per_plane(wide):
+    cube = wide.random_named_file(suffix=".fits")
+    npix, nchan = 16, 8
+    freqs = _ms_freqs(wide.ms)
+    header = make_header(npix, nchan=nchan, cell=0.05, freqs=freqs)
+    fits.PrimaryHDU(data=np.ones((nchan, npix, npix), dtype=np.float32), header=header).writeto(cube)
+    centres = ["1h0m0s,-31deg", "1h0m0s,-30d30m0s"]
+
+    individual = []
+    for centre in centres:
+        output = wide.random_named_file(suffix=".fits")
+        primary_beam.runit(_opts("apply", ms=wide.ms, pointing_centre=[centre], fits_sky=cube, output=output))
+        individual.append(fits.getdata(output))
+
+    mosaic = wide.random_named_file(suffix=".fits")
+    primary_beam.runit(_opts("apply", ms=wide.ms, pointing_centre=centres, fits_sky=cube, output=mosaic))
+    expected = np.sqrt(0.5 * (individual[0] ** 2 + individual[1] ** 2))
+    np.testing.assert_allclose(fits.getdata(mosaic), expected, rtol=2e-5, atol=2e-7)

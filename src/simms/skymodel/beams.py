@@ -1015,8 +1015,13 @@ def build_beam_grid_jones(
 EVAL_SLAB_PIXELS = 1 << 20
 
 
-def image_power_beam(provider, is_altaz, ell, emm, freqs, chi_grid):
-    """Parallactic-angle-averaged power beam ``<0.5(|g^X|^2 + |g^V|^2)>`` at each point.
+def image_power_beam(provider, is_altaz, ell, emm, freqs, chi_grid, moment=1):
+    """PA-averaged power-beam moment ``<A**moment>`` at each point.
+
+    ``moment=1`` returns ``<A> = <0.5(|g^X|^2 + |g^V|^2)>``, the apparent-image
+    response. ``moment=2`` returns ``<A**2>``, the diagonal of a PB-aware normal
+    matrix; squaring *after* this function would incorrectly give ``<A>**2`` for a
+    beam that rotates during the observation.
 
     For the FITS-*image* path, which grids one apparent sky for all baselines and times:
     there is no per-baseline beam, so the beam is averaged over the observation's
@@ -1058,7 +1063,8 @@ def image_power_beam(provider, is_altaz, ell, emm, freqs, chi_grid):
             acc = np.zeros(l_slab.size)
             for chi in chis:
                 g = provider.voltage(l_slab, m_slab, fk, np.array([chi]))  # (1, nslab, 1, 2)
-                acc += 0.5 * (np.abs(g[0, :, 0, 0]) ** 2 + np.abs(g[0, :, 0, 1]) ** 2)
+                sample = 0.5 * (np.abs(g[0, :, 0, 0]) ** 2 + np.abs(g[0, :, 0, 1]) ** 2)
+                acc += sample**moment
             power[sl, k] = acc / chis.size
     return power
 

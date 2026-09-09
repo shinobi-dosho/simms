@@ -236,6 +236,68 @@ visibilities. It has four modes:
     Multiply a sky model by the beam, or divide it out, writing a new sky model
     rather than touching visibilities. Takes ``--fits-sky`` or ``--ascii-sky``.
 
+    For a combined or jointly imaged mosaic, repeat ``--ms`` once per pointing.
+    A standard linear PB-aware mosaic has a normalisation image
+
+    .. math::
+
+        W(l,m,\nu) = \sum_i w_i \left\langle A_i(l,m,\nu,t)^2\right\rangle_t,
+
+    where :math:`A_i` is a pointing's instantaneous *power* beam and :math:`w_i`
+    is its relative imaging weight. The square is taken before averaging a
+    rotating beam over time/parallactic angle. ``primary-beam`` therefore
+    applies or corrects the weighted-RMS effective response
+
+    .. math::
+
+        A_\mathrm{eff} =
+        \sqrt{\frac{\sum_i w_i \left\langle A_i^2\right\rangle_t}
+                    {\sum_i w_i}}.
+
+    This mosaic response is unchanged if every pointing is duplicated. A single
+    pointing retains the CLI's established apparent-image response
+    :math:`\langle A\rangle_t`; the PB-squared normal-matrix convention activates
+    when multiple pointings are supplied. Weights default to equal; repeat
+    ``--mosaic-weight`` to supply relative inverse-noise-variance or integrated
+    imaging weights in the same order as the pointings. Equal weights are only
+    appropriate when the input fields have comparable noise and imaging weight.
+    Every MS supplies its own pointing centre, time/parallactic-angle track,
+    array location, mount and frequencies; selected frequency grids must match.
+    The PA moment samples the continuous span between each MS's first and last
+    selected time. Gaps, flags, variable integration weights, and per-channel
+    imager weights are not inferred; fold those into ``--mosaic-weight`` where a
+    scalar per-pointing approximation is adequate.
+
+    When the pointings share all observation metadata except their centres, one
+    reference MS is enough: repeat ``--pointing-centre`` instead, using
+    ``frame,ra,dec`` or ``ra,dec`` values; the two-part form defaults to J2000.
+    The reference MS then supplies the
+    common time track, location, mount and frequencies. Explicit centres replace
+    its recorded pointing rather than adding to it, and its ``POINTING`` table is
+    not consulted.
+
+    This distinction matters for Montage-based image-plane mosaics. MosaicQueen uses
+    :math:`\sum_i I_i A_i/\sigma_i^2` as its numerator and
+    :math:`\sum_i A_i^2/\sigma_i^2` as its normalisation, then divides the two.
+    Its final ``*_image.fits`` is consequently already PB-corrected: do **not**
+    run ``primary-beam correct`` on a catalogue extracted from that final image.
+    The accompanying ``*_weights.fits`` is actually
+    :math:`\sqrt{\sum_i A_i^2/\sigma_i^2}` (a sensitivity image), despite the
+    filename. The effective response here is for a flat-noise joint image or for
+    deliberately moving a sky model between intrinsic and apparent mosaic
+    conventions. It is normalized by total pointing weight as shown above;
+    external imagers may use another overall scale (CASA, for example, scales
+    its mosaic PB to peak unity). For exact correction of an external image, use
+    that imager's PB product and normalization rather than assuming these differ
+    only in their list of pointing centres.
+    Also, MosaicQueen squares the PB image supplied for each field. If that file
+    is already :math:`\langle A\rangle_t`, its time convention differs from the
+    visibility-domain :math:`\langle A^2\rangle_t` normal matrix implemented for
+    multi-pointing joint images here.
+    Montage/MosaicQueen's cutoffs also differ: it first masks each individual
+    beam, then masks on sensitivity relative to the mosaic maximum. Simms's
+    ``--pb-cutoff`` is one absolute threshold on :math:`A_\mathrm{eff}`.
+
     The beam narrows across the band, so it is not a scale factor: a source
     0.5 degrees off-axis in MeerKAT L band is attenuated roughly twice as hard at
     the top of the band as at the bottom, which alone contributes about -1.1 to
@@ -247,12 +309,14 @@ visibilities. It has four modes:
     written without ``cont_reffreq``/``cont_coeff_*`` columns gains them, since
     the beam gives every source a spectrum whether or not it had one.
 
-    Three cases cannot carry a spectrum and fall back to a single
-    frequency-averaged number, with a warning: a 2D image, a single-channel MS,
-    and a custom ``--source-schema`` that does not declare the continuum fields
-    (writing them would produce a model that same schema could not read). For
-    those, predict with ``skysim --primary-beam`` instead, which applies the beam
-    per channel and needs no fit at all.
+    Three cases cannot carry a spectrum. A 2D image uses an equal-channel
+    PB-squared normal matrix. A single-channel MS leaves a plain scale factor. A
+    custom ``--source-schema`` that does not declare the continuum fields falls
+    back, with a warning, to a band-averaged scale (writing the spectral fields
+    would produce a model that same schema could not read). For exact MFS
+    behaviour, use the imager's own PB product; to apply a beam during prediction,
+    use ``skysim --primary-beam``, which works per channel and needs no spectral
+    fit.
 
 Examples
 --------
@@ -277,6 +341,26 @@ continuum coefficients have been attenuated:
 
     $ simms primary-beam apply --ms obs.ms --ascii-sky skymodel.txt \
         --beam-pattern L --output skymodel_beamed.txt
+
+Correct a catalogue extracted from a flat-noise joint image of three mosaic
+pointings, giving the middle field twice the relative imaging weight:
+
+.. code-block:: console
+
+    $ simms primary-beam correct --ms pointing-1.ms --ms pointing-2.ms \
+        --ms pointing-3.ms --mosaic-weight 1 --mosaic-weight 2 \
+        --mosaic-weight 1 --ascii-sky apparent.txt --beam-pattern L \
+        --output intrinsic.txt
+
+Or provide the centres directly when all pointings share the metadata in one
+reference MS:
+
+.. code-block:: console
+
+    $ simms primary-beam correct --ms reference.ms \
+        --pointing-centre J2000,12h00m00s,-30d00m00s \
+        --pointing-centre J2000,12h03m00s,-30d00m00s \
+        --ascii-sky apparent.txt --beam-pattern L --output intrinsic.txt
 
 Because ``to-fits`` and ``tag-ms`` write ordinary MS metadata and FITS files,
 they compose with tools outside simms -- you can build a beam here and hand it

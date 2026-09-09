@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from typing import Annotated
 
 import shinobi
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 from shinobi.steps.schema import ParamMeta
 
 from simms import BIN
@@ -24,7 +24,7 @@ class PrimaryBeamOutputs(BaseModel):
     `--Beam-FITSFile` consume, so it round-trips into a later `--beam-pattern`.
     `files` lists every file written (empty for `tag-ms`, which writes none)."""
 
-    ms: str | None = None
+    ms: str | list[str] | None = None
     output: str | None = None
     files: list[str] = []
 
@@ -34,9 +34,32 @@ def _require(opts, field):
         raise RuntimeError(f"--{field.replace('_', '-')} is required for mode {opts.mode!r}.")
 
 
+def _as_list(value):
+    """Keep scalar recipe inputs compatible when a CLI option becomes repeatable."""
+    if value is None or isinstance(value, list | tuple):
+        return value
+    return [value]
+
+
+def _reported_ms(value):
+    """Preserve the old scalar output for one MS and report every MS for a mosaic."""
+    if not value:
+        return None
+    if isinstance(value, str):
+        return value
+    values = list(value)
+    return values[0] if len(values) == 1 else values
+
+
 def runit(opts) -> PrimaryBeamOutputs:
     """Run one primary-beam mode and report the paths it actually wrote."""
     from simms.skymodel import pb_ops
+
+    # Keep programmatic callers that construct the pre-mosaic SimpleNamespace working.
+    if not hasattr(opts, "pointing_centre"):
+        opts.pointing_centre = None
+    if not hasattr(opts, "mosaic_weight"):
+        opts.mosaic_weight = None
 
     # pb_ops builds and computes dask graphs, so --nworkers has to reach the scheduler the
     # same way skysim sets it; without this the option was accepted and silently ignored.
@@ -46,12 +69,12 @@ def runit(opts) -> PrimaryBeamOutputs:
     if mode == "to-fits":
         _require(opts, "beam_pattern")
         output, files = pb_ops.to_fits(opts)
-        return PrimaryBeamOutputs(ms=opts.ms, output=output, files=files)
+        return PrimaryBeamOutputs(ms=_reported_ms(opts.ms), output=output, files=files)
     elif mode == "tag-ms":
         _require(opts, "ms")
         pb_ops.tag_ms(opts)
         # tag-ms edits ANTENNA in place and writes no new file, so the echoed MS is the handle.
-        return PrimaryBeamOutputs(ms=opts.ms, output=None, files=[])
+        return PrimaryBeamOutputs(ms=_reported_ms(opts.ms), output=None, files=[])
     elif mode in ("apply", "correct"):
         _require(opts, "ms")
         _require(opts, "beam_pattern")
@@ -60,7 +83,7 @@ def runit(opts) -> PrimaryBeamOutputs:
         invert = mode == "correct"
         run = pb_ops.apply_correct_image if opts.fits_sky else pb_ops.apply_correct_ascii
         output = run(opts, invert)
-        return PrimaryBeamOutputs(ms=opts.ms, output=output, files=[output])
+        return PrimaryBeamOutputs(ms=_reported_ms(opts.ms), output=output, files=[output])
     else:
         raise RuntimeError(f"Unknown primary-beam mode {mode!r}.")
 
@@ -102,10 +125,21 @@ def primary_beam(
         description="Sign convention for the cattery fits-format M axis, matching DDFacet's "
         "--Beam-FITSMAxis (pass the same value to both).",
     ),
-    ms: str | None = Field(
+    ms: Annotated[list[str] | None, BeforeValidator(_as_list)] = Field(
         None,
-        description="Measurement set (time/PA range, array position and frequencies). "
-        "Required for tag-ms/apply/correct.",
+        description="Measurement set supplying time/PA range, array position, frequencies and pointing centre. "
+        "Required for tag-ms/apply/correct; repeat for every pointing in a mosaic.",
+    ),
+    pointing_centre: Annotated[list[str] | None, BeforeValidator(_as_list), ParamMeta(abbreviation="pc")] = Field(
+        None,
+        description="Explicit mosaic pointing centre as 'frame,ra,dec' or 'ra,dec'; repeat for each pointing. "
+        "The two-part form defaults to J2000. Requires one --ms whose time, location, mount and frequencies are "
+        "reused for every centre (apply/correct).",
+    ),
+    mosaic_weight: Annotated[list[str | float] | None, BeforeValidator(_as_list), ParamMeta(abbreviation="mw")] = Field(
+        None,
+        description="Relative inverse-variance/imaging weight for each mosaic pointing; repeat in the same order "
+        "as --ms or --pointing-centre. Defaults to equal weights.",
     ),
     fits_sky: Annotated[str | None, ParamMeta(abbreviation="fits")] = Field(
         None, description="Input FITS image sky model (apply/correct)."
