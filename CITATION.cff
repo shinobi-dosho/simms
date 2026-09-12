@@ -26,7 +26,7 @@ authors:
     given-names: "Senkhosi"
     email: "senkhxsi@gmail.com"
 version: "3.0beta3"
-license: GPL-3.0-only
+license: Apache-2.0
 repository-code: "https://github.com/shinobi-dosho/simms"
 url: "https://simms.readthedocs.io"
 keywords:

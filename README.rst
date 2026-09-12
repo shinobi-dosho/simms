@@ -23,3 +23,8 @@ Tools for:
 .. |Python Versions| image:: https://img.shields.io/pypi/pyversions/simms.svg
                     :target: https://pypi.python.org/pypi/simms
                     :alt:
+
+License
+-------
+
+Apache License 2.0 — see `LICENSE <LICENSE>`_ and `NOTICE <NOTICE>`_.
