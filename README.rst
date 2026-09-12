@@ -2,6 +2,10 @@
 simms 3.0
 ============
 
+Please acknowledge this project and its contributors when using the work
+in research, and cite the associated publications and software release
+where applicable. This is a scholarly request, not an additional licence
+condition.
 
 |Pypi Version|
 |Python Versions|  
