@@ -25,7 +25,7 @@ authors:
   - family-names: "Simelane"
     given-names: "Senkhosi"
     email: "senkhxsi@gmail.com"
-version: "3.0beta3"
+version: "3.0.2"
 license: Apache-2.0
 repository-code: "https://github.com/shinobi-dosho/simms"
 url: "https://simms.readthedocs.io"

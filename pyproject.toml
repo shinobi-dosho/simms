@@ -43,7 +43,6 @@ include = [
     "/README.rst",
     "/LICENSE",
     "/NOTICE",
-    "/CITATION.md",
     "/CHANGES.md",
     "/AGENTS.md",
     "/CONTRIBUTING.md",
