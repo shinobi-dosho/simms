@@ -191,6 +191,17 @@
   segment in diagonal mode; `attach_fits_aterm` and `component_sky_from_fits_dft`
   reject a circular-basis model rather than silently producing wrong cross-hands;
   the planned gridder-pass count is logged at DEBUG.
+- Packaging: dropped the `[tool.uv.sources]` GitHub-archive pin for
+  `stimela-ninja` and raised the floor to `>=0.1.0b7`. The pin originally
+  existed for the CASA CI image's lack of a `git` binary, but it was also
+  pinning an unreleased feature -- the `ParamMeta.abbreviation` fix
+  (stimela-ninja#127) that the short CLI aliases (`-tel`, `-nt`, ...) need,
+  which no PyPI release had. `0.1.0b7` ships that fix, so the dependency now
+  resolves from the registry alone. The pin was leaking into downstream uv
+  installs: any project that also named stimela-ninja by a different URL (even
+  the same commit as `git+…@<sha>`) failed with a "conflicting URLs" error, and
+  pip/uv diverged on the same requirements file. Downstream users can now pick
+  their own stimela-ninja again.
 
 ### 3.0.0 -> 3.0.1
 
