@@ -85,8 +85,8 @@ jobs:
 
     steps:
     # The image has no git, so checkout falls back to the REST API tarball. That is fine --
-    # nothing here needs history, and fitstoolz is pinned as an archive URL rather than a
-    # git source precisely so `uv sync` needs no git binary either (see [tool.uv.sources]).
+    # nothing here needs history, and every Python dependency comes from PyPI, so `uv sync`
+    # needs no git binary either.
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
     - name: Install uv
       uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0

@@ -27,7 +27,7 @@ dependencies = [
     "ephem>=4.1,<5.0",
     "pydantic>=2.6",
     "pyyaml>=6.0",
-    "stimela-ninja>=0.1.0b4",
+    "stimela-ninja>=0.1.0b7",
     "codex-africanus[complete]>=0.3.7,<1.0",
     "ducc0>=0.41.0",
     "fitstoolz>=0.1.0",
@@ -64,16 +64,6 @@ simms = "simms.apps.main:cli"
 # own default, stated here so it is not widened back to "allow". A blanket "allow" put
 # pydantic on a 2.14 alpha and omegaconf on a dev build, at runtime.
 prerelease = "if-necessary-or-explicit"
-
-[tool.uv.sources]
-# The shinobi port of fitstoolz, which drops scabha for stimela-ninja/pydantic -- the same
-# move simms itself made. Not on PyPI yet, so pinned to a commit here.
-#
-# Sourced as a GitHub archive rather than `git = ...` on purpose: uv shells out to the git
-# binary for a git source, and the casa6 image used by the CASA CI job has no git and a
-# broken apt (its KERN PPA has no ca-certificates). A tarball is fetched over plain HTTP,
-# and pins the same commit just as immutably.
-stimela-ninja = { url = "https://github.com/shinobi-dosho/stimela-ninja/archive/0cd6ea39e3481a4c6aa20f1fa1a6a07c7ee1c5e4.tar.gz" }
 
 [project.urls]
 Documentation = "https://simms.readthedocs.io"

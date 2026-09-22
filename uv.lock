@@ -2746,7 +2746,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.6" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "scipy" },
-    { name = "stimela-ninja", url = "https://github.com/shinobi-dosho/stimela-ninja/archive/0cd6ea39e3481a4c6aa20f1fa1a6a07c7ee1c5e4.tar.gz" },
+    { name = "stimela-ninja", specifier = ">=0.1.0b7" },
     { name = "tqdm" },
 ]
 
@@ -2962,8 +2962,8 @@ wheels = [
 
 [[package]]
 name = "stimela-ninja"
-version = "0.1.0b6"
-source = { url = "https://github.com/shinobi-dosho/stimela-ninja/archive/0cd6ea39e3481a4c6aa20f1fa1a6a07c7ee1c5e4.tar.gz" }
+version = "0.1.0b7"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "packaging" },
@@ -2972,16 +2972,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "rich" },
 ]
-sdist = { hash = "sha256:f29dd8d554d4c1b88bf334ffc09622a432d113a8e04eb3f1459754839ecffd3c" }
-
-[package.metadata]
-requires-dist = [
-    { name = "click", specifier = ">=8.1" },
-    { name = "packaging", specifier = ">=23" },
-    { name = "pydantic", specifier = ">=2.6" },
-    { name = "pydantic-settings", specifier = ">=2.2" },
-    { name = "pyyaml", specifier = ">=6.0" },
-    { name = "rich", specifier = ">=13.7" },
+sdist = { url = "https://files.pythonhosted.org/packages/cf/d9/3deedb542f2594c0ed401f96f71b057ca60abf3546196f68f6ca4948d999/stimela_ninja-0.1.0b7.tar.gz", hash = "sha256:5e1c657f0ef54a972a15cb8028758aab094fde0b907984e88b1269714794b81a", size = 401541, upload-time = "2026-09-22T19:38:53.769Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/95/9b/6bfe7359e3188016f3c40c295bf8229de815634ce6c936ef184d5b8dedcf/stimela_ninja-0.1.0b7-py3-none-any.whl", hash = "sha256:4ed8b74f4e8f423da3804943494ed10c5ac66e1ccb4c4318cf0cde6c1a2ea0da", size = 403213, upload-time = "2026-09-22T19:38:52.413Z" },
 ]
 
 [[package]]
