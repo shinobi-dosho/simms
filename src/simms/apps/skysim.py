@@ -20,7 +20,13 @@ from simms import BIN, SCHEMADIR
 from simms.exceptions import InvalidInputError
 from simms.skymodel.ascii_skies import ASCIISkymodel
 from simms.skymodel.beams import load_beam_config, resolve_antenna_beams
-from simms.skymodel.corruptions import apply_corruptions, load_corruption_spec, needs_feed_basis, validate_spec
+from simms.skymodel.corruptions import (
+    apply_corruptions,
+    build_pointing_model,
+    load_corruption_spec,
+    needs_feed_basis,
+    validate_spec,
+)
 from simms.skymodel.fits_skies import component_sky_from_fits_dft, predict_fits_channel_block, prepare_fits_sky
 from simms.skymodel.mstools import (
     attach_beam,
@@ -142,6 +148,19 @@ def _attach_subsample(opts, msds, prepared, freqs, chan_width, dec0):
     )
     prepared = replace(prepared, subsample=SubsampleSmearing.from_ms(chan_width, dec0, n_t, n_nu))
     return prepared, prepared.subsample
+
+
+def _ms_wide_refs(ms):
+    """``(nant, t0)``: the ``ANTENNA`` row count and the earliest ``TIME`` in the whole MS.
+
+    Corruptions are sized and phased from these rather than from the field/SPW a run
+    selects: skysim runs one field and one SPW at a time, so selection-derived values
+    would give the same antenna a different gain (or pointing drift) in each run over
+    the same MS.
+    """
+    nant = xds_from_table(f"{ms}::ANTENNA")[0].sizes["row"]
+    t0 = float(xds_from_ms(ms, columns=["TIME"], group_cols=[])[0].TIME.data.min().compute())
+    return nant, t0
 
 
 def _array_lonlat(positions):
@@ -317,8 +336,12 @@ class _BeamContext:
             max_gib=self.beam_grid_max_gib,
         )
 
-    def attach(self, prepared):
-        """Force full-correlation brightness and attach the beam grid (diagonal or full Jones)."""
+    def attach(self, prepared, pointing=None):
+        """Force full-correlation brightness and attach the beam grid (diagonal or full Jones).
+
+        ``pointing`` is an optional :class:`~simms.skymodel.corruptions.PointingModel`
+        whose per-antenna offsets perturb the beam (see :func:`attach_beam`).
+        """
         from simms.skymodel.beams import corr_basis_transform
 
         if self.full_jones:
@@ -351,6 +374,7 @@ class _BeamContext:
             phase_ra0=self.phase_ra0,
             phase_dec0=self.phase_dec0,
             beam_grid_max_gib=self.beam_grid_max_gib,
+            pointing=pointing,
         )
 
 
@@ -411,6 +435,33 @@ def runit(opts):
     ncorr = msds.DATA.data.shape[-1]
     vis_dtype = msds.DATA.data.dtype
     linear_basis = opts.pol_basis == "linear"
+
+    # The corruption spec is loaded and validated up front, even when there is nothing
+    # to corrupt: a malformed spec must fail here rather than let a noise-only run write
+    # a clean column that looks like it was corrupted. Pointing errors act inside the
+    # beam kernels, so they also have to be known before the sky is prepared.
+    spec = load_corruption_spec(opts.corruptions) if opts.corruptions else None
+    if spec is not None and spec.has_gains:
+        validate_spec(spec, ncorr=ncorr)
+        if needs_feed_basis(spec, ncorr):
+            # diagonal/full terms map correlation index to feed index by
+            # position, so they need the correlations in a standard order. A
+            # scalar gain reaches every correlation alike and does not.
+            corr_type = xds_from_table(f"{ms}::POLARIZATION")[0].CORR_TYPE.data[0].compute()
+            _corr_basis(list(np.asarray(corr_type).ravel()), what="Non-scalar RIME corruptions")
+    if spec is not None and spec.pointing is not None:
+        if not ascii_sky:
+            raise RuntimeError(
+                "Pointing errors are only supported for --ascii-sky in this version "
+                "(not --fits-sky, --wsclean-sky or a noise-only run)."
+            )
+        if not opts.primary_beam:
+            raise RuntimeError("Pointing errors act through the primary beam; give --primary-beam.")
+    # MS-wide (nant, t0) for the pointing draw and the gain chain, read once per run
+    # (t0 scans TIME over the whole MS). Not needed when nothing will be corrupted: a
+    # noise-only run has no sky signal for the gains to act on.
+    corrupts_sky = spec is not None and (spec.pointing is not None or bool(ascii_sky or fs or wsclean_sky))
+    ms_nant, ms_t0 = _ms_wide_refs(ms) if corrupts_sky else (None, None)
 
     # Time/bandwidth smearing. Real visibilities are averaged over a channel and an
     # integration, so a monochromatic instantaneous model over-predicts every source
@@ -488,8 +539,12 @@ def runit(opts):
             linear_basis=beam_ctx.brightness_linear_basis if beam_ctx else linear_basis,
             unique_times=unique_times,
         )
+        pointing_model = None
+        if spec is not None and spec.pointing is not None:
+            # Sized and phased from the whole MS, like the gains, so per-field runs agree.
+            pointing_model = build_pointing_model(spec.pointing, ms_nant, ms_t0, random_seed=opts.seed_gains)
         if beam_ctx:
-            prepared = beam_ctx.attach(prepared)
+            prepared = beam_ctx.attach(prepared, pointing=pointing_model)
         prepared = attach_smearing(prepared, smearing)
 
         # A blockwise index of None passes the argument through untouched, so a
@@ -714,19 +769,8 @@ def runit(opts):
     # Corruptions go on the model, before the noise. Receiver noise enters the
     # signal chain after the antenna gains, so a noisy RIME is
     # V' = J_p V J_q^H + n -- corrupting the sum would gain-modulate the noise.
-    if opts.corruptions:
-        # Loaded and validated even when there is nothing to corrupt: a malformed
-        # spec must fail here rather than let a noise-only run write a clean
-        # column that looks like it was corrupted.
-        spec = load_corruption_spec(opts.corruptions)
-        validate_spec(spec, ncorr=ncorr)
-        if needs_feed_basis(spec, ncorr):
-            # diagonal/full terms map correlation index to feed index by
-            # position, so they need the correlations in a standard order. A
-            # scalar gain reaches every correlation alike and does not.
-            corr_type = xds_from_table(f"{ms}::POLARIZATION")[0].CORR_TYPE.data[0].compute()
-            _corr_basis(list(np.asarray(corr_type).ravel()), what="Non-scalar RIME corruptions")
-
+    # (The spec itself was loaded and validated before the sky was prepared.)
+    if spec is not None and spec.has_gains:
         if simvis is None:
             if vis_noise:
                 log.warning(
@@ -737,16 +781,14 @@ def runit(opts):
             # Phase origins and array size come from the MS, not from this
             # field/SPW selection: skysim runs one field and one SPW at a time,
             # so selection-derived references would give the same antenna a
-            # different gain in each run over the same MS.
-            ant_ds = xds_from_table(f"{ms}::ANTENNA")[0]
-            ms_nant = ant_ds.sizes["row"]
+            # different gain in each run over the same MS. (ms_nant/ms_t0 were read
+            # once, above, and are shared with the pointing draw.)
             # Every SPECTRAL_WINDOW dataset, not just the first: daskms splits
             # the subtable into one dataset per distinct channel count, so an MS
             # whose SPWs differ in width would otherwise reference only some of
             # its bandwidth.
             spw_dss = xds_from_table(f"{ms}::SPECTRAL_WINDOW")
             ms_freq0 = float(min(dask.compute(*[sds.CHAN_FREQ.data.min() for sds in spw_dss])))
-            ms_t0 = float(xds_from_ms(ms, columns=["TIME"], group_cols=[])[0].TIME.data.min().compute())
 
             simvis = apply_corruptions(
                 simvis,
@@ -901,7 +943,9 @@ def skysim(
         1.0, description="Spacing (degrees) of the parallactic-angle grid the beam is sampled on."
     ),
     beam_grid_max_gib: float = Field(
-        4.0, description="Hard ceiling (GiB) on the sampled beam grid held in memory for the whole run."
+        4.0,
+        description="Hard ceiling (GiB) on the sampled beam grid held in memory for the whole run; "
+        "pointing errors add 2 (first) or 3 (laplacian) derivative grids of the same size.",
     ),
     beam_jones: Annotated[str, ParamMeta(choices=["diagonal", "full"])] = Field(
         "diagonal", description="Primary-beam application: per-feed voltage or full 2x2 E-Jones."
@@ -966,8 +1010,9 @@ def skysim(
     ),
     seed_gains: int | None = Field(
         None,
-        description="Random seed for the corruption terms' random phases/matrices. Omit for a "
-        "deterministic per-label draw; the thermal noise stream is unaffected either way.",
+        description="Random seed for the corruption terms' random phases/matrices and the "
+        "pointing-error draws. Omit for a deterministic per-label draw; the thermal noise stream "
+        "is unaffected either way.",
     ),
     seed: int | None = Field(
         None,
@@ -975,7 +1020,9 @@ def skysim(
     ),
     corruptions: str | None = Field(
         None,
-        description="YAML file describing RIME Jones corruptions to apply to the predicted visibilities.",
+        description="YAML file describing RIME corruptions: antenna 'gains' applied to the predicted "
+        "visibilities and/or antenna 'pointing' errors, which are applied through the primary beam "
+        "(--ascii-sky with --primary-beam only).",
     ),
     ascii_species: Annotated[
         str | None, ParamMeta(choices=["bdsf_gaul", "bdsf_srl", "aegean", "wsclean"], abbreviation="asp")

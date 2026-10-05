@@ -63,12 +63,65 @@ class TermSpec:
     amplitude: float = 0.0
 
 
+#: Label the pointing-error draws are seeded under (see :func:`_term_seed`).
+POINTING_SEED_LABEL = "pointing"
+
+#: Taylor order of each pointing model: ``first`` is ``E + d.D``; ``laplacian`` adds
+#: ``1/4 |d|^2 lap(E)``, which makes the mean over antennas right to second order.
+TAYLOR_ORDERS: dict[str, int] = {"first": 1, "laplacian": 2}
+
+
+@dataclass
+class PointingSpec:
+    """Antenna pointing errors, parsed to base units (radians, radians, seconds).
+
+    Each antenna's offset along each feed-frame axis is
+    ``static_a + amplitude * cos(2 pi (t - t0) / period + phi_a)``, with ``static_a``
+    drawn from ``N(0, static)`` and ``phi_a`` from ``U[0, 2 pi)``; the two axes are
+    drawn independently. ``taylor`` picks how the offset perturbs the beam (see
+    :data:`TAYLOR_ORDERS`).
+    """
+
+    static: float = 0.0
+    amplitude: float = 0.0
+    period: float | None = None
+    taylor: str = "laplacian"
+
+    def __post_init__(self):
+        values = {"static": self.static, "amplitude": self.amplitude}
+        if self.period is not None:
+            values["period"] = self.period
+        for key, value in values.items():
+            if not np.isfinite(value):
+                raise RuntimeError(f"pointing.{key} must be finite, got {value!r}")
+        for key in ("static", "amplitude"):
+            if values[key] < 0:
+                raise RuntimeError(f"pointing.{key} must be non-negative, got {values[key]!r}")
+        if self.amplitude > 0 and self.period is None:
+            raise RuntimeError("'pointing.period' is required when 'pointing.amplitude' is non-zero")
+        if self.period is not None and self.period <= 0:
+            raise RuntimeError(f"pointing.period must be positive, got {self.period!r}")
+        if self.static == 0 and self.amplitude == 0:
+            raise RuntimeError(
+                "pointing.static and pointing.amplitude are both 0, so the pointing block would leave "
+                "the visibilities unchanged; give at least one a non-zero value"
+            )
+        if not isinstance(self.taylor, str) or self.taylor not in TAYLOR_ORDERS:
+            raise RuntimeError(f"pointing.taylor must be one of {sorted(TAYLOR_ORDERS)}, got {self.taylor!r}")
+
+
 @dataclass
 class CorruptionSpec:
-    """A full corruption specification loaded from YAML."""
+    """A full corruption specification loaded from YAML.
+
+    ``has_gains`` is False for a file holding only a ``pointing`` block, whose
+    empty ``terms``/``spec`` then mean "no gain chain" rather than a mistake.
+    """
 
     terms: list[str]
     spec: list[TermSpec]
+    pointing: PointingSpec | None = None
+    has_gains: bool = True
 
 
 def _stable_label_hash(label: str) -> int:
@@ -110,12 +163,62 @@ def _normalise_period(
     return {axes[0]: _parse_period(period, axes[0])}
 
 
+def _parse_angle(value, key: str) -> float:
+    """An angle in radians from a unit-bearing string such as ``"30arcsec"``.
+
+    A bare number is refused (radians? degrees? arcsec?) unless it is 0, which
+    means the same thing in every unit.
+    """
+    if isinstance(value, bool):
+        raise RuntimeError(f"pointing.{key} must be an angle, got {value!r}")
+    if isinstance(value, int | float):
+        if value == 0:
+            return 0.0
+        raise RuntimeError(
+            f"pointing.{key} needs an explicit angle unit, e.g. '30arcsec' (a bare number is ambiguous); got {value!r}"
+        )
+    if not isinstance(value, str):
+        raise RuntimeError(f"pointing.{key} must be an angle string such as '30arcsec', got {value!r}")
+    try:
+        quantity = u.Quantity(value)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(f"pointing.{key}: cannot parse {value!r} as an angle: {exc}") from exc
+    if quantity.unit.physical_type != "angle":
+        raise RuntimeError(f"pointing.{key} = {value!r} is not an angle (give a unit such as 'arcsec' or 'deg')")
+    return float(quantity.to_value(u.rad))
+
+
+def _parse_pointing(raw, path: str) -> PointingSpec:
+    """Parse the top-level ``pointing`` block into a :class:`PointingSpec`."""
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Corruption spec '{path}': 'pointing' must be a mapping, got {type(raw).__name__}")
+    known = ("static", "amplitude", "period", "taylor")
+    unknown = sorted(str(k) for k in raw if k not in known)
+    if unknown:
+        raise RuntimeError(f"Corruption spec '{path}': unknown key(s) {unknown} in 'pointing'; expected {list(known)}")
+    kwargs = {}
+    for key in ("static", "amplitude"):
+        if key in raw:
+            kwargs[key] = _parse_angle(raw[key], key)
+    if raw.get("period") is not None:
+        try:
+            kwargs["period"] = _parse_period(raw["period"], "time")
+        except (ValueError, TypeError, u.UnitsError) as exc:
+            raise RuntimeError(f"Corruption spec '{path}': invalid pointing.period {raw['period']!r}: {exc}") from exc
+    if "taylor" in raw:
+        kwargs["taylor"] = raw["taylor"]
+    try:
+        return PointingSpec(**kwargs)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Corruption spec '{path}': {exc}") from exc
+
+
 def load_corruption_spec(path: str) -> CorruptionSpec:
     """Load a corruption specification from a YAML file.
 
-    Everything hangs off a top-level ``gains`` block. A file without one used to
-    load as an empty spec, so a misspelled key -- or the wrong file entirely --
-    ran to completion having corrupted nothing.
+    The file holds a top-level ``gains`` block, a ``pointing`` block, or both. A
+    file with neither used to load as an empty spec, so a misspelled key -- or
+    the wrong file entirely -- ran to completion having corrupted nothing.
 
     ``gains.terms`` is normally a YAML list, but a plain string is accepted as
     shorthand and split on commas and whitespace, so ``terms: "G, B"`` and
@@ -127,11 +230,22 @@ def load_corruption_spec(path: str) -> CorruptionSpec:
     if not isinstance(data, dict):
         raise RuntimeError(f"Corruption spec '{path}' is empty or is not a YAML mapping")
 
+    has_pointing = "pointing" in data
     gains = data.get("gains")
-    if gains is None:
+    if gains is None and not has_pointing:
         raise RuntimeError(
-            f"Corruption spec '{path}' has no top-level 'gains' block; found {sorted(data) or 'nothing'}"
+            f"Corruption spec '{path}' has no top-level 'gains' block (nor a 'pointing' block); "
+            f"found {sorted(data) or 'nothing'}"
         )
+    unknown = sorted(str(k) for k in data if k not in ("gains", "pointing"))
+    if unknown:
+        log.warning("Corruption spec '%s': ignoring unknown top-level key(s) %s.", path, unknown)
+
+    pointing = _parse_pointing(data["pointing"], path) if has_pointing else None
+    if "gains" not in data:
+        return CorruptionSpec(terms=[], spec=[], pointing=pointing, has_gains=False)
+    # A bare 'gains:' (YAML null) beside 'pointing' is a gain chain left unwritten,
+    # not an absent one; refuse it rather than silently run pointing-only.
     if not isinstance(gains, dict):
         raise RuntimeError(f"Corruption spec '{path}': 'gains' must be a mapping, got {type(gains).__name__}")
 
@@ -164,7 +278,14 @@ def load_corruption_spec(path: str) -> CorruptionSpec:
                 "scalar" if term.diagonal else "full",
             )
 
-    return CorruptionSpec(terms=terms, spec=specs)
+    if pointing is not None and any(term.label == POINTING_SEED_LABEL for term in specs):
+        # Both would draw from _term_seed(seed, label): the same random stream.
+        raise RuntimeError(
+            f"Corruption spec '{path}': a gains term may not be labelled '{POINTING_SEED_LABEL}' alongside a "
+            f"'pointing' block, since both would draw from the same random stream; rename the term"
+        )
+
+    return CorruptionSpec(terms=terms, spec=specs, pointing=pointing)
 
 
 def resolve_type(spec: TermSpec, ncorr: int) -> str:
@@ -592,4 +713,62 @@ def apply_corruptions(
         term_params=term_params,
         out_dtype=vis.dtype,
         meta=np.empty((0, 0, vis.shape[-1]), dtype=vis.dtype),
+    )
+
+
+@dataclass(eq=False)
+class PointingModel:
+    """Per-antenna pointing offsets, drawn once per run and evaluated per row.
+
+    Plain arrays and floats, so it pickles cleanly into every dask task. Column 0
+    of ``static``/``phase`` is the feed-frame ``l`` axis, column 1 ``m``; offsets
+    are where the beam centre actually points relative to nominal (radians).
+    """
+
+    static: np.ndarray  # (nant, 2) float64 rad
+    phase: np.ndarray  # (nant, 2) float64 rad, U[0, 2 pi)
+    amplitude: float  # rad
+    period: float | None  # s
+    t0: float  # MS-wide earliest TIME
+    static_rms: float = 0.0
+    taylor: str = "laplacian"
+
+    @property
+    def nant(self) -> int:
+        return self.static.shape[0]
+
+    @property
+    def sigma_eff(self) -> float:
+        """Per-axis rms offset over antennas and time: ``sqrt(static**2 + amplitude**2 / 2)``."""
+        return float(np.sqrt(self.static_rms**2 + 0.5 * self.amplitude**2))
+
+    def offsets(self, times: np.ndarray, ant: np.ndarray) -> np.ndarray:
+        """Feed-frame ``(dl, dm)`` of antenna ``ant[r]`` at ``times[r]``: ``(nrow, 2)`` C-contiguous float64."""
+        ant = np.asarray(ant)
+        out = self.static[ant]  # fancy indexing copies, so the in-place add below is safe
+        if self.amplitude:
+            arg = 2.0 * np.pi * (np.asarray(times, dtype=np.float64) - self.t0) / self.period
+            out += self.amplitude * np.cos(arg[:, None] + self.phase[ant])
+        return np.ascontiguousarray(out, dtype=np.float64)
+
+
+def build_pointing_model(spec: PointingSpec, nant: int, t0: float, random_seed: int | None = None) -> PointingModel:
+    """Draw every antenna's static offset and drift phase from ``spec``.
+
+    Seeded like a gain term labelled :data:`POINTING_SEED_LABEL`, so ``--seed-gains``
+    reproduces it. Both draws are always made, in a fixed order, so switching the
+    drift on or off never changes the static offsets. ``nant`` and ``t0`` should be
+    the whole MS's, as for the gains, so per-field runs agree.
+    """
+    rng = np.random.default_rng(_term_seed(random_seed, POINTING_SEED_LABEL))
+    static = spec.static * rng.standard_normal((nant, 2))
+    phase = 2.0 * np.pi * rng.random((nant, 2))
+    return PointingModel(
+        static=np.ascontiguousarray(static, dtype=np.float64),
+        phase=np.ascontiguousarray(phase, dtype=np.float64),
+        amplitude=float(spec.amplitude),
+        period=None if spec.period is None else float(spec.period),
+        t0=float(t0),
+        static_rms=float(spec.static),
+        taylor=spec.taylor,
     )

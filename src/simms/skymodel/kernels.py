@@ -16,6 +16,13 @@ correlator's averaging over a channel and over an integration; see
 ``smear_uvw`` are built. ``smear=False`` skips it, and the hot
 point-source path keeps a separate loop for that case, so a run that does not
 ask for smearing runs the kernel it always ran.
+
+The beam kernels optionally apply antenna pointing errors as a Taylor expansion
+of each antenna's beam about its nominal pointing: with a per-row feed-frame
+offset ``d = (dl, dm)``, ``E -> E + dl*D_l + dm*D_m`` at ``ptg_order == 1``, plus
+``0.25*|d|^2*L`` (``L`` the feed-frame Laplacian of ``E``) at ``ptg_order == 2``.
+The derivative grids are PA-interpolated exactly like ``E``. ``ptg_order == 0``
+skips every pointing term, leaving the arithmetic of an unpointed run untouched.
 """
 
 import numpy as np
@@ -34,6 +41,15 @@ _JIT = dict(cache=True, nogil=True, fastmath=True)
 # still needs an array of the right type, but never reads it.
 NO_SMEAR_UVW = np.zeros((1, 3))
 
+# Placeholders for the pointing-error arguments when ``ptg_order`` is 0 (and for the
+# unused Laplacian grid at order 1). Same dtype and ndim as the real arguments, so
+# each beam kernel compiles to one signature whatever the pointing mode.
+NO_PTG_ROWS = np.zeros((1, 2))
+NO_BEAM_GRAD = np.zeros((1, 1, 1, 1, 2), dtype=np.complex64)
+NO_BEAM_GRAD_JONES = np.zeros((1, 1, 1, 1, 2, 2), dtype=np.complex64)
+NO_POINTING = (0, NO_PTG_ROWS, NO_PTG_ROWS, NO_BEAM_GRAD, NO_BEAM_GRAD, NO_BEAM_GRAD)
+NO_POINTING_JONES = (0, NO_PTG_ROWS, NO_PTG_ROWS, NO_BEAM_GRAD_JONES, NO_BEAM_GRAD_JONES, NO_BEAM_GRAD_JONES)
+
 
 @njit(inline="always", **_JIT)
 def _sinc(x):
@@ -49,6 +65,28 @@ def _smear_row(smear_uvw, r, smear):
     if smear:
         return smear_uvw[r, 0], smear_uvw[r, 1], smear_uvw[r, 2]
     return 0.0, 0.0, 0.0
+
+
+@njit(inline="always", **_JIT)
+def _ptg_row(ptg, r, order):
+    """Row ``r``'s pointing offset ``(dl, dm)`` and ``0.25*(dl^2 + dm^2)``, or zeros when off."""
+    if order > 0:
+        dl = ptg[r, 0]
+        dm = ptg[r, 1]
+        return dl, dm, 0.25 * (dl * dl + dm * dm)
+    return 0.0, 0.0, 0.0
+
+
+@njit(inline="always", **_JIT)
+def _interp5(grid, t, k, s, f, i, wt):
+    """PA-interpolate entry ``i`` of a diagonal ``(ntype, n_pa, nsrc, nchan, 2)`` grid."""
+    return grid[t, k, s, f, i] * (1.0 - wt) + grid[t, k + 1, s, f, i] * wt
+
+
+@njit(inline="always", **_JIT)
+def _interp6(grid, t, k, s, f, i, j, wt):
+    """PA-interpolate entry ``(i, j)`` of a Jones ``(ntype, n_pa, nsrc, nchan, 2, 2)`` grid."""
+    return grid[t, k, s, f, i, j] * (1.0 - wt) + grid[t, k + 1, s, f, i, j] * wt
 
 
 @njit(inline="always", **_JIT)
@@ -260,6 +298,12 @@ def predict_vis_beam(
     smear,
     bw_half,
     smear_uvw,
+    ptg_order,
+    ptg_p,
+    ptg_q,
+    beam_dl,
+    beam_dm,
+    beam_lap,
 ):
     """Accumulate model visibilities with a per-antenna primary beam applied.
 
@@ -289,6 +333,14 @@ def predict_vis_beam(
     smear_uvw : (nrow, 3) float64
         Per-row ``0.5 * dt * d(u, v, w)/dt`` from
         :meth:`simms.skymodel.smearing.Smearing.row_uvw`.
+    ptg_order : int
+        Pointing-error Taylor order: 0 off (the remaining arguments are placeholders),
+        1 first order, 2 adds the Laplacian term.
+    ptg_p, ptg_q : (nrow, 2) float64
+        Feed-frame pointing offset ``(dl, dm)`` (radians) of the first/second antenna.
+    beam_dl, beam_dm, beam_lap : complex64, shaped like ``beam_grid``
+        Derivatives of ``beam_grid`` with respect to a feed-frame pointing offset, and
+        its feed-frame Laplacian (a placeholder below order 2).
     """
     nrow = uvw.shape[0]
     nchan = freqs.shape[0]
@@ -309,6 +361,8 @@ def predict_vis_beam(
         k = pa_lo[r]
         wt = pa_wt[r]
         su, sv, sw = _smear_row(smear_uvw, r, smear)
+        dlp, dmp, qp = _ptg_row(ptg_p, r, ptg_order)
+        dlq, dmq, qq = _ptg_row(ptg_q, r, ptg_order)
 
         for s in range(nsrc):
             amp = lightcurve[s, tidx]
@@ -348,6 +402,18 @@ def predict_vis_beam(
                 gq0 = beam_grid[tq, k, s, f, 0] * (1.0 - wt) + beam_grid[tq, k + 1, s, f, 0] * wt
                 gq1 = beam_grid[tq, k, s, f, 1] * (1.0 - wt) + beam_grid[tq, k + 1, s, f, 1] * wt
 
+                # Pointing errors: Taylor-expand each antenna's beam about nominal pointing.
+                if ptg_order > 0:
+                    gp0 += dlp * _interp5(beam_dl, tp, k, s, f, 0, wt) + dmp * _interp5(beam_dm, tp, k, s, f, 0, wt)
+                    gp1 += dlp * _interp5(beam_dl, tp, k, s, f, 1, wt) + dmp * _interp5(beam_dm, tp, k, s, f, 1, wt)
+                    gq0 += dlq * _interp5(beam_dl, tq, k, s, f, 0, wt) + dmq * _interp5(beam_dm, tq, k, s, f, 0, wt)
+                    gq1 += dlq * _interp5(beam_dl, tq, k, s, f, 1, wt) + dmq * _interp5(beam_dm, tq, k, s, f, 1, wt)
+                    if ptg_order > 1:
+                        gp0 += qp * _interp5(beam_lap, tp, k, s, f, 0, wt)
+                        gp1 += qp * _interp5(beam_lap, tp, k, s, f, 1, wt)
+                        gq0 += qq * _interp5(beam_lap, tq, k, s, f, 0, wt)
+                        gq1 += qq * _interp5(beam_lap, tq, k, s, f, 1, wt)
+
                 for c in range(ncorr):
                     gpc = gp0 if corr_feed_p[c] == 0 else gp1
                     gqc = gq0 if corr_feed_q[c] == 0 else gq1
@@ -384,6 +450,12 @@ def predict_vis_jones(
     smear,
     bw_half,
     smear_uvw,
+    ptg_order,
+    ptg_p,
+    ptg_q,
+    beam_dl,
+    beam_dm,
+    beam_lap,
 ):
     """Accumulate visibilities with a full 2x2 Jones primary beam.
 
@@ -404,6 +476,10 @@ def predict_vis_jones(
     smear_uvw : (nrow, 3) float64
         Per-row ``0.5 * dt * d(u, v, w)/dt`` from
         :meth:`simms.skymodel.smearing.Smearing.row_uvw`.
+    ptg_order, ptg_p, ptg_q, beam_dl, beam_dm, beam_lap
+        Pointing errors, as for :func:`predict_vis_beam`; the derivative grids are
+        ``(ntype, n_pa, nsrc, nchan, 2, 2)`` with the basis transform folded in like
+        ``beam_grid``.
     """
     nrow = uvw.shape[0]
     nchan = freqs.shape[0]
@@ -424,6 +500,8 @@ def predict_vis_jones(
         wt = pa_wt[r]
         wt0 = 1.0 - wt
         su, sv, sw = _smear_row(smear_uvw, r, smear)
+        dlp, dmp, qp = _ptg_row(ptg_p, r, ptg_order)
+        dlq, dmq, qq = _ptg_row(ptg_q, r, ptg_order)
 
         for s in range(nsrc):
             amp = lightcurve[s, tidx]
@@ -466,6 +544,42 @@ def predict_vis_jones(
                 eq01 = beam_grid[tq, k, s, f, 0, 1] * wt0 + beam_grid[tq, k + 1, s, f, 0, 1] * wt
                 eq10 = beam_grid[tq, k, s, f, 1, 0] * wt0 + beam_grid[tq, k + 1, s, f, 1, 0] * wt
                 eq11 = beam_grid[tq, k, s, f, 1, 1] * wt0 + beam_grid[tq, k + 1, s, f, 1, 1] * wt
+
+                # Pointing errors: Taylor-expand each antenna's Jones about nominal pointing.
+                if ptg_order > 0:
+                    ep00 += dlp * _interp6(beam_dl, tp, k, s, f, 0, 0, wt) + dmp * _interp6(
+                        beam_dm, tp, k, s, f, 0, 0, wt
+                    )
+                    ep01 += dlp * _interp6(beam_dl, tp, k, s, f, 0, 1, wt) + dmp * _interp6(
+                        beam_dm, tp, k, s, f, 0, 1, wt
+                    )
+                    ep10 += dlp * _interp6(beam_dl, tp, k, s, f, 1, 0, wt) + dmp * _interp6(
+                        beam_dm, tp, k, s, f, 1, 0, wt
+                    )
+                    ep11 += dlp * _interp6(beam_dl, tp, k, s, f, 1, 1, wt) + dmp * _interp6(
+                        beam_dm, tp, k, s, f, 1, 1, wt
+                    )
+                    eq00 += dlq * _interp6(beam_dl, tq, k, s, f, 0, 0, wt) + dmq * _interp6(
+                        beam_dm, tq, k, s, f, 0, 0, wt
+                    )
+                    eq01 += dlq * _interp6(beam_dl, tq, k, s, f, 0, 1, wt) + dmq * _interp6(
+                        beam_dm, tq, k, s, f, 0, 1, wt
+                    )
+                    eq10 += dlq * _interp6(beam_dl, tq, k, s, f, 1, 0, wt) + dmq * _interp6(
+                        beam_dm, tq, k, s, f, 1, 0, wt
+                    )
+                    eq11 += dlq * _interp6(beam_dl, tq, k, s, f, 1, 1, wt) + dmq * _interp6(
+                        beam_dm, tq, k, s, f, 1, 1, wt
+                    )
+                    if ptg_order > 1:
+                        ep00 += qp * _interp6(beam_lap, tp, k, s, f, 0, 0, wt)
+                        ep01 += qp * _interp6(beam_lap, tp, k, s, f, 0, 1, wt)
+                        ep10 += qp * _interp6(beam_lap, tp, k, s, f, 1, 0, wt)
+                        ep11 += qp * _interp6(beam_lap, tp, k, s, f, 1, 1, wt)
+                        eq00 += qq * _interp6(beam_lap, tq, k, s, f, 0, 0, wt)
+                        eq01 += qq * _interp6(beam_lap, tq, k, s, f, 0, 1, wt)
+                        eq10 += qq * _interp6(beam_lap, tq, k, s, f, 1, 0, wt)
+                        eq11 += qq * _interp6(beam_lap, tq, k, s, f, 1, 1, wt)
 
                 # B (coherency) and M = E_p @ B.
                 b00 = bmat[s, 0, f]

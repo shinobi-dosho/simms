@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import dask.array as da
 import numpy as np
 from daskms import xds_from_ms, xds_from_table
 
+from simms import BIN
 from simms.constants import FWHM_TO_GAUSS_SCALE
 from simms.skymodel.ascii_skies import ASCIISkymodel
 from simms.skymodel.kernels import (
+    NO_BEAM_GRAD,
+    NO_BEAM_GRAD_JONES,
+    NO_POINTING,
+    NO_POINTING_JONES,
     NO_SMEAR_UVW,
     is_uniform_grid,
     predict_vis,
@@ -17,6 +24,15 @@ from simms.skymodel.kernels import (
 )
 from simms.skymodel.smearing import Smearing
 from simms.utilities import radec2lm
+
+if TYPE_CHECKING:
+    from simms.skymodel.corruptions import PointingModel
+
+log = logging.getLogger(BIN.skysim)
+
+# Largest relative error of the pointing Taylor model, against the exact offset
+# beam at the worst-case offset, before attach_beam warns.
+POINTING_TAYLOR_WARN = 1e-2
 
 DEFAULT_ROW_CHUNK_CAP = 10000
 """Default upper bound on rows per chunk (the ``--row-chunks`` default)."""
@@ -261,6 +277,13 @@ class PreparedSky:
     corr_feed_q: np.ndarray | None = None
     # Time/bandwidth smearing, applied when set (see attach_smearing).
     smearing: Smearing | None = None
+    # Antenna pointing errors, applied in the beam kernels when set (see attach_beam).
+    # The derivative grids are shaped like beam_grid; beam_lap only at pointing_order 2.
+    pointing: PointingModel | None = None
+    pointing_order: int = 0
+    beam_dl: np.ndarray | None = None
+    beam_dm: np.ndarray | None = None
+    beam_lap: np.ndarray | None = None
 
     @property
     def nspec(self) -> int:
@@ -270,15 +293,25 @@ class PreparedSky:
     def select_channels(self, chan_ids: np.ndarray) -> PreparedSky:
         """Restrict the model to a subset of channels, for channel-chunked prediction."""
         freqs = self.freqs[chan_ids]
+
         # Advanced-index the chan axis (3); trailing feed/Jones axes are kept as-is, so this
         # works for both the diagonal (...,2) and full-Jones (...,2,2) grids.
         beam_grid = self.beam_grid[:, :, :, chan_ids] if self.beam_enabled else self.beam_grid
+
+        # np.take, unlike the indexing above, returns C-contiguous grids, matching the
+        # kernels' C-contiguous placeholders so each kernel keeps a single signature.
+        def chans(grid):
+            return None if grid is None else np.take(grid, chan_ids, axis=3)
+
         return replace(
             self,
             freqs=freqs,
             bmat=self.bmat[:, :, chan_ids],
             uniform_freqs=is_uniform_grid(freqs),
             beam_grid=beam_grid,
+            beam_dl=chans(self.beam_dl),
+            beam_dm=chans(self.beam_dm),
+            beam_lap=chans(self.beam_lap),
         )
 
 
@@ -424,6 +457,8 @@ def attach_beam(
     phase_ra0: float | None = None,
     phase_dec0: float | None = None,
     beam_grid_max_gib: float | None = None,
+    pointing: PointingModel | None = None,
+    pointing_step: float | None = None,
 ) -> PreparedSky:
     """Return a copy of ``prepared`` with a primary-beam grid attached.
 
@@ -435,9 +470,21 @@ def attach_beam(
     brightness (``nspec == ncorr``). With ``full_jones`` the grid holds 2x2 Jones (folding
     ``basis_transform``) and the ``predict_vis_jones`` kernel is used; otherwise the diagonal
     per-feed grid.
+
+    With a ``pointing`` model the beam derivatives are sampled on the same grid, and the
+    kernels perturb each antenna's beam by its per-row pointing offset (see
+    :mod:`simms.skymodel.kernels`): 2 extra grids for ``taylor: first``, 3 for
+    ``laplacian``, all within ``beam_grid_max_gib``. ``pointing_step`` is the
+    finite-difference step (radians), defaulting to
+    :data:`~simms.skymodel.beams.POINTING_FD_STEP`.
     """
     from simms.skymodel.beams import (
         BEAM_GRID_MAX_GIB_DEFAULT,
+        POINTING_FD_STEP,
+        _beam_grid_gib,
+        _check_beam_grid_footprint,
+        build_beam_derivative_grids,
+        build_beam_derivative_grids_jones,
         build_beam_grid,
         build_beam_grid_jones,
         corr_feed_maps,
@@ -450,14 +497,84 @@ def attach_beam(
     ell, emm = prepared.lmn[:, 0], prepared.lmn[:, 1]
     if phase_ra0 is not None:
         ell, emm = reproject_lm(ell, emm, phase_ra0, phase_dec0, ra0, dec0)
+
+    fold = 4 if full_jones else 2
+    dims = (len(providers), chi_grid.size, ell.size, prepared.freqs.size)
+    order = 0
+    build_gib = max_gib
+    if pointing is not None:
+        order = _pointing_order(pointing, providers)
+        if pointing.nant < np.size(ant_type):
+            raise ValueError(
+                f"The pointing model covers {pointing.nant} antennas but the beam has {np.size(ant_type)}."
+            )
+        # The whole set -- E plus its 2 or 3 derivative grids -- has to fit, so check it
+        # once, before allocating any of it. The builders would each re-check their own
+        # share against the same ceiling, repeating the warning with smaller numbers.
+        _check_beam_grid_footprint(*dims, fold, max_gib, pointing_grids=order + 1)
+        build_gib = np.inf
+
     if full_jones:
         beam_grid = build_beam_grid_jones(
-            providers, type_is_altaz, ell, emm, prepared.freqs, chi_grid, basis_transform, max_gib=max_gib
+            providers, type_is_altaz, ell, emm, prepared.freqs, chi_grid, basis_transform, max_gib=build_gib
         )
         corr_feed_p = corr_feed_q = None
     else:
-        beam_grid = build_beam_grid(providers, type_is_altaz, ell, emm, prepared.freqs, chi_grid, max_gib=max_gib)
+        beam_grid = build_beam_grid(providers, type_is_altaz, ell, emm, prepared.freqs, chi_grid, max_gib=build_gib)
         corr_feed_p, corr_feed_q = corr_feed_maps(ncorr)
+
+    pointing_fields = {}
+    if pointing is not None:
+        step = POINTING_FD_STEP if pointing_step is None else pointing_step
+        laplacian = order == 2
+        if full_jones:
+            beam_dl, beam_dm, beam_lap = build_beam_derivative_grids_jones(
+                providers,
+                type_is_altaz,
+                ell,
+                emm,
+                prepared.freqs,
+                chi_grid,
+                basis_transform,
+                laplacian,
+                step=step,
+                max_gib=build_gib,
+            )
+        else:
+            beam_dl, beam_dm, beam_lap = build_beam_derivative_grids(
+                providers, type_is_altaz, ell, emm, prepared.freqs, chi_grid, laplacian, step=step, max_gib=build_gib
+            )
+        pointing_fields = dict(
+            pointing=pointing, pointing_order=order, beam_dl=beam_dl, beam_dm=beam_dm, beam_lap=beam_lap
+        )
+        _log_pointing(
+            pointing,
+            order,
+            providers,
+            type_is_altaz,
+            ell,
+            emm,
+            prepared.freqs,
+            chi_grid,
+            step,
+            _beam_grid_gib(*dims, fold) * (order + 1),
+        )
+        _warn_taylor_error(
+            pointing,
+            order,
+            providers,
+            type_is_altaz,
+            ell,
+            emm,
+            prepared.freqs,
+            chi_grid,
+            basis_transform if full_jones else None,
+            beam_grid,
+            beam_dl,
+            beam_dm,
+            beam_lap,
+        )
+
     return replace(
         prepared,
         beam_enabled=True,
@@ -467,7 +584,126 @@ def attach_beam(
         tgrid=tgrid,
         corr_feed_p=corr_feed_p,
         corr_feed_q=corr_feed_q,
+        **pointing_fields,
     )
+
+
+def _pointing_order(pointing: PointingModel, providers: list) -> int:
+    """The Taylor order a pointing model runs at on these beam types.
+
+    ``laplacian`` needs a smooth pattern; a bilinear FITS cube has no meaningful
+    curvature, so those types get first-order pointing (a zero ``L`` slab), and a run
+    where no type has curvature is first order outright.
+    """
+    from simms.skymodel.corruptions import TAYLOR_ORDERS
+
+    requested = TAYLOR_ORDERS[pointing.taylor]
+    curved = [bool(getattr(p, "smooth_curvature", True)) for p in providers]
+    if requested == 2 and not all(curved):
+        flat = [_provider_label(p, i) for i, (p, c) in enumerate(zip(providers, curved, strict=True)) if not c]
+        everywhere = not any(curved)
+        log.warning(
+            "Pointing errors with taylor: laplacian, but beam type(s) %s are bilinear FITS cubes whose "
+            "Laplacian is undefined; those types use first-order pointing (no mean loss)%s.",
+            ", ".join(flat),
+            " -- with no smooth type left, this run is effectively taylor: first" if everywhere else "",
+        )
+    return 2 if requested == 2 and any(curved) else 1
+
+
+def _provider_label(provider, index: int) -> str:
+    """A short name for a beam type in log messages."""
+    name = getattr(provider, "name", "") or getattr(getattr(provider, "beam", None), "name", "")
+    return f"{index} ({name or type(provider).__name__})"
+
+
+def _log_pointing(pointing, order, providers, type_is_altaz, ell, emm, freqs, chi_grid, step, added_gib) -> None:
+    """INFO summary of the pointing model, with the predicted mean loss in laplacian mode."""
+    from simms.skymodel.beams import UnityBeamProvider, _pointing_derivatives
+
+    sigma = pointing.sigma_eff
+    mode = "laplacian" if order == 2 else "first"
+    log.info(
+        "Pointing errors: sigma_eff %.2f arcsec per axis, taylor: %s, %d antennas; the derivative grids add %.3f GiB.",
+        np.degrees(sigma) * 3600.0,
+        mode,
+        pointing.nant,
+        added_gib,
+    )
+    if order == 2 and ell.size:
+        # The source nearest the beam centre, the first smooth type's feed-0 voltage (a
+        # FITS-cube type has L = 0, which would report no loss), the middle PA sample and
+        # channel. Re-derived here (5 evaluations) rather than read off the grid, which a
+        # full-Jones run holds in the MS correlation basis. Order 2 implies one exists.
+        ti = next(i for i, p in enumerate(providers) if getattr(p, "smooth_curvature", True))
+        s = int(np.argmin(ell * ell + emm * emm))
+        k, f = chi_grid.size // 2, freqs.size // 2
+        chi = chi_grid[k : k + 1] if type_is_altaz[ti] else np.zeros(1)
+        _, _, lap = _pointing_derivatives(
+            providers[ti], ell[s : s + 1], emm[s : s + 1], freqs[f : f + 1], chi, True, step, False
+        )
+        log.info(
+            "Predicted mean voltage change 0.5*sigma_eff^2*lap(E) = %.3g (beam type %s, feed 0, source %d at "
+            "%.3f deg from the pointing centre, %.4g MHz).",
+            0.5 * sigma * sigma * lap[0, 0, 0].real,
+            _provider_label(providers[ti], ti),
+            s,
+            np.degrees(np.hypot(ell[s], emm[s])),
+            freqs[f] / 1e6,
+        )
+    if all(isinstance(p, UnityBeamProvider) for p in providers):
+        log.warning("Pointing errors are set but every antenna has a unity beam, so they change nothing.")
+
+
+def _warn_taylor_error(
+    pointing,
+    order,
+    providers,
+    type_is_altaz,
+    ell,
+    emm,
+    freqs,
+    chi_grid,
+    transform,
+    beam_grid,
+    beam_dl,
+    beam_dm,
+    beam_lap,
+) -> None:
+    """Warn when the Taylor model misses the exact offset beam at the largest offset drawn.
+
+    Probes the middle PA sample at ``+-d_max`` along each feed axis, with ``d_max`` the
+    largest per-antenna ``|static| + amplitude`` offset; beyond ~1% of the beam peak the
+    offsets are too large a fraction of the beam for a Taylor expansion.
+    """
+    d_max = float(np.max(np.hypot(*(np.abs(pointing.static) + pointing.amplitude).T))) if pointing.nant else 0.0
+    if d_max == 0.0:
+        return
+    k = chi_grid.size // 2
+    worst = 0.0
+    for ti, prov in enumerate(providers):
+        chi = chi_grid[k : k + 1] if type_is_altaz[ti] else np.zeros(1)
+        e0 = beam_grid[ti, k].astype(np.complex128)
+        peak = float(np.abs(e0).max())
+        if peak == 0.0:
+            continue
+        for dl, dm in ((d_max, 0.0), (-d_max, 0.0), (0.0, d_max), (0.0, -d_max)):
+            if transform is None:
+                exact = prov.voltage(ell, emm, freqs, chi, offset=(dl, dm))[0]
+            else:
+                exact = np.einsum("ij,sfjk->sfik", transform, prov.jones(ell, emm, freqs, chi, offset=(dl, dm))[0])
+            model = e0 + dl * beam_dl[ti, k] + dm * beam_dm[ti, k]
+            if order == 2:
+                model = model + 0.25 * (dl * dl + dm * dm) * beam_lap[ti, k]
+            worst = max(worst, float(np.abs(exact - model).max()) / peak)
+    if worst > POINTING_TAYLOR_WARN:
+        log.warning(
+            "Pointing-error Taylor model is off by up to %.1f%% of the beam peak at the largest offset drawn "
+            "(%.1f arcsec): the offsets are too large a fraction of the beam for a %s expansion.",
+            100.0 * worst,
+            np.degrees(d_max) * 3600.0,
+            "second-order" if order == 2 else "first-order",
+        )
 
 
 def attach_smearing(prepared, smearing: Smearing | None):
@@ -497,6 +733,29 @@ def smear_kernel_args(smearing: Smearing | None, uvw: np.ndarray, exposure) -> t
             "time/bandwidth smearing needs the per-row integration time; pass the MS EXPOSURE column as 'exposure'."
         )
     return True, smearing.bw_half, smearing.row_uvw(uvw, exposure)
+
+
+def pointing_kernel_args(prepared: PreparedSky, times, antenna1, antenna2) -> tuple:
+    """The ``(ptg_order, ptg_p, ptg_q, beam_dl, beam_dm, beam_lap)`` trailing beam-kernel arguments.
+
+    Placeholders (:data:`~simms.skymodel.kernels.NO_POINTING`) when ``prepared`` has no
+    pointing model; otherwise each row's offsets for its two antennas, evaluated at the
+    row's own time, and the derivative grids (the Laplacian a placeholder at order 1).
+    """
+    jones = prepared.beam_full_jones
+    if prepared.pointing is None:
+        return NO_POINTING_JONES if jones else NO_POINTING
+    times = np.asarray(times, dtype=np.float64)
+    order = prepared.pointing_order
+    no_lap = NO_BEAM_GRAD_JONES if jones else NO_BEAM_GRAD
+    return (
+        order,
+        prepared.pointing.offsets(times, antenna1),
+        prepared.pointing.offsets(times, antenna2),
+        np.ascontiguousarray(prepared.beam_dl),
+        np.ascontiguousarray(prepared.beam_dm),
+        np.ascontiguousarray(prepared.beam_lap) if order == 2 else no_lap,
+    )
 
 
 def predict_channel_block(
@@ -576,6 +835,8 @@ def predict_block(
         time_index = np.searchsorted(prepared.unique_times, times).astype(np.int64)
 
     smear_args = smear_kernel_args(prepared.smearing, uvw, exposure)
+    if prepared.pointing is not None and not prepared.beam_enabled:
+        raise ValueError("pointing errors act through the primary beam, but no beam is attached")
 
     vis = np.zeros((nrow, prepared.freqs.size, nspec), dtype=prepared.bmat.dtype)
     if prepared.beam_enabled:
@@ -611,10 +872,11 @@ def predict_block(
             pa_lo,
             pa_wt,
         )
+        ptg_args = pointing_kernel_args(prepared, times, a1, a2)
         if prepared.beam_full_jones:
-            predict_vis_jones(*common, *smear_args)
+            predict_vis_jones(*common, *smear_args, *ptg_args)
         else:
-            predict_vis_beam(*common, prepared.corr_feed_p, prepared.corr_feed_q, *smear_args)
+            predict_vis_beam(*common, prepared.corr_feed_p, prepared.corr_feed_q, *smear_args, *ptg_args)
     else:
         predict_vis(
             uvw,

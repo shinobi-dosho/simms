@@ -130,6 +130,14 @@ gain-modulated. `--seed-noise` seeds thermal
 noise and `--seed-gains` the corruption terms, so corruptions cannot alter the noise realisation.
 `--seed` is a deprecated alias for `--seed-noise` (the same value gives the same noise).
 
+Pointing errors (`pointing:`) are direction-dependent, so they live in the beam kernel, not the
+post-prediction gain chain: per-row feed-frame offsets perturb E via Taylor grids PA-interpolated
+like E -- `first`: `E + δ·D` (3× beam-grid memory); `laplacian` (default): `+ ¼|δ|²∇²E` (4×),
+which makes the mean loss `½σ²∇²E` exact to second order. Derivatives by central differences at
+1e-5 rad via `BeamProvider(..., offset=)`, the centre in complex128 (a complex64 centre ruins the
+second difference). FITS-cube (bilinear) types get L = 0. ASCII + `--primary-beam` only. Seeded via
+`_term_seed(--seed-gains, "pointing")`, `nant`/`t0` from the whole MS like gains.
+
 ## Git
 
 - Branch off `main` for changes; open PRs against `main` (repo `shinobi-dosho/simms`).
