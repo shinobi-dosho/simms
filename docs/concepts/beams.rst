@@ -212,7 +212,9 @@ near zenith, so a coarse step there is the usual source of error.
 
 ``--beam-grid-max-gib`` is a hard ceiling on how much of the sampled beam grid
 is held in memory for the whole run. It is a guard rail, not a tuning knob: hit
-it and you need a coarser grid, not a bigger machine.
+it and you need a coarser grid, not a bigger machine. Pointing errors (see
+:doc:`skysim`) add derivative grids of the same size under the same ceiling, so
+they need 3 (``taylor: first``) or 4 (``taylor: laplacian``) times the memory.
 
 The standalone ``primary-beam`` tool
 --------------------------------------

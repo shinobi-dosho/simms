@@ -328,9 +328,10 @@ form fits *this* MS is checked only for the terms you list, so an unused
 ``full`` entry does not veto a scalar-only run on a 2-correlation MS.
 
 A spec that would corrupt nothing is rejected rather than run: an empty file,
-one with no top-level ``gains`` block, an empty ``terms`` list, or every listed
-term at ``amplitude: 0``.  A single zero-amplitude term beside a real one is
-the identity and stays valid.
+one with no top-level ``gains`` or ``pointing`` block, an empty ``terms`` list,
+or every listed term at ``amplitude: 0``.  A single zero-amplitude term beside
+a real one is the identity and stays valid.  Any other top-level key is ignored
+with a warning.
 
 Phases are referenced to the earliest time and lowest frequency in the *MS*,
 and gains are sized from the ``ANTENNA`` table, not from the rows a given run
@@ -343,6 +344,86 @@ after the antenna gains, so a noisy run computes :math:`V'_{pq} = J_p V_{pq}
 J_q^H + n_{pq}`: ``--sefd`` noise is added after the corruptions and is not
 gain-modulated.  A noise-only run (``--sefd`` with no sky model) therefore has
 nothing for ``--corruptions`` to act on, and warns.
+
+Pointing errors
+~~~~~~~~~~~~~~~
+
+The same file can carry a top-level ``pointing`` block, on its own or beside
+``gains``.  A mispointed antenna sees the sky through a shifted primary beam,
+which is direction-dependent, so pointing errors are applied inside the beam
+kernels rather than in the post-prediction gain chain:
+
+.. code-block:: yaml
+
+    pointing:                 # needs --ascii-sky and --primary-beam
+      static: "30arcsec"      # rms of each antenna's constant offset, per axis
+      amplitude: "10arcsec"   # drift amplitude per axis (0/omitted = no drift)
+      period: "20min"         # required when amplitude > 0 (bare number = seconds)
+      taylor: laplacian       # default; 'first' drops the curvature term
+    gains:                    # optional when 'pointing' is present
+      terms: [G]
+      spec:
+        - {label: G, type: scalar, axes: [time], period: "2min", amplitude: 0.1}
+
+Each antenna :math:`a` points off by, along each axis independently,
+
+.. math::
+
+    \delta_a(t) = s_a + A \cos\!\left(\frac{2\pi (t - t_0)}{P} + \phi_a\right),
+    \qquad s_a \sim \mathcal{N}(0, \sigma_s^2),\quad \phi_a \sim U[0, 2\pi),
+
+with :math:`\sigma_s` = ``static``, :math:`A` = ``amplitude`` and :math:`P` =
+``period``.  The axes are those of the beam's feed frame, the frame the beam
+model is evaluated in: sky :math:`l`/:math:`m` at the pointing centre rotated by
+the parallactic angle for an alt-az mount, and unrotated for any other mount.
+So an alt-az antenna's offsets turn with the sky, as a mount-fixed pointing
+error would.
+
+Angles need an explicit unit (``"30arcsec"``, ``"0.5arcmin"``): a bare number is
+ambiguous and is rejected, except ``0``.  ``period`` follows the gain rules -- a
+bare number is seconds, or give an ``astropy`` string.
+
+The draws come from ``--seed-gains`` under the label ``pointing``, so the same
+seed reproduces them and gains and pointing can be changed independently (a
+gains term may not itself be labelled ``pointing`` beside a ``pointing``
+block, since it would share that random stream).  As
+for the gains, :math:`t_0` is the earliest time in the whole MS and the offsets
+are drawn for every row of the ``ANTENNA`` table, so per-field runs agree.
+
+Pointing errors need ``--ascii-sky`` with ``--primary-beam``; a FITS or WSClean
+sky model, or a noise-only run, is an error.  They are evaluated by expanding
+each antenna's beam about its nominal pointing, with derivative grids sampled
+on the same parallactic-angle grid as the beam itself:
+
+``taylor: laplacian`` (default)
+    :math:`E + \delta_l D_l + \delta_m D_m + \tfrac14 |\delta|^2 \nabla^2 E`.
+    Averaged over antennas the beam becomes
+    :math:`E + \tfrac12 \sigma_\mathrm{eff}^2 \nabla^2 E` with
+    :math:`\sigma_\mathrm{eff}^2 = \sigma_s^2 + A^2/2`, which is exact to second
+    order in expectation.  For MeerKAT L band at 1.4 GHz and
+    :math:`\sigma_\mathrm{eff}` = 30″ that is a voltage loss of about
+    1.8e-4 on axis (3.5e-4 in power).  On the flanks beyond about 0.95° the
+    beam curves upward (:math:`\nabla^2 E > 0`), so sources there brighten on
+    average.  Each realisation is still only right to first order where the
+    beam is anisotropic -- the isotropic Laplacian cannot represent a
+    curvature that differs between directions.  In RMS over realisations it
+    is smaller than ``first``'s error everywhere except where the curvature
+    changes sign (near 0.9° at 1.4 GHz), where the two are equal; measured at
+    30″ and 1.4 GHz for MeerKAT L band it is about 25 times smaller on axis.
+``taylor: first``
+    :math:`E + \delta_l D_l + \delta_m D_m`.  The mean over antennas is
+    :math:`E`, with no pointing loss at all, and each realisation is off by
+    order :math:`(\delta/\mathrm{FWHM})^2` -- an RMS of 7e-5 to 2.5e-4 in
+    voltage at 30″ in MeerKAT L band, largest on axis.
+
+The derivatives are taken by central differences.  ``first`` holds 3 times the
+beam grid in memory and ``laplacian`` 4 times, all within
+``--beam-grid-max-gib``; the ceiling is checked before anything is allocated.
+A measured FITS-cube beam is interpolated bilinearly, so it has no meaningful
+curvature: those types fall back to first-order pointing with a warning (and a
+run whose every type is a FITS cube is effectively ``taylor: first``).  A
+warning also flags offsets large enough that the expansion itself is more than
+1% wrong at the largest offset drawn.
 
 Polarisation and polarisation basis
 -------------------------------------

@@ -247,7 +247,15 @@ class BeamProvider:
     Subclasses implement :meth:`_eval` in the feed frame. The base handles the
     parallactic-angle rotation so a source at sky direction cosines ``(l, m)`` is
     evaluated at the feed-frame coordinates ``R(-chi) . (l, m)``.
+
+    ``voltage``/``jones`` take an optional pointing ``offset`` ``(dl, dm)``: where the
+    beam centre actually points relative to nominal, in the feed frame (radians), so
+    the pattern is evaluated at ``(l_feed - dl, m_feed - dm)``.
     """
+
+    #: Whether the pattern is smooth enough for a finite-difference Laplacian. A
+    #: bilinear FITS cube is not: its second difference is noise, not curvature.
+    smooth_curvature: bool = True
 
     def _eval(self, l_feed: np.ndarray, m_feed: np.ndarray, freqs: np.ndarray) -> np.ndarray:
         """Feed-frame voltages ``(nsrc, nchan, 2)`` (feed 0 = H/X, 1 = V/Y)."""
@@ -273,7 +281,18 @@ class BeamProvider:
             return ell * c + emm * s, -ell * s + emm * c
         return ell, emm
 
-    def jones(self, ell, emm, freqs, chi) -> np.ndarray:
+    @staticmethod
+    def _apply_offset(l_feed, m_feed, offset):
+        """Shift feed-frame cosines by a pointing ``offset`` ``(dl, dm)``; identity for ``None``.
+
+        Never in place: at zero parallactic angle :meth:`_rotate_to_feed` hands back the
+        caller's own arrays.
+        """
+        if offset is None:
+            return l_feed, m_feed
+        return l_feed - float(offset[0]), m_feed - float(offset[1])
+
+    def jones(self, ell, emm, freqs, chi, offset=None) -> np.ndarray:
         """2x2 voltage Jones per parallactic-angle sample.
 
         Same inputs as :meth:`voltage`; returns ``(ntime, nsrc, nchan, 2, 2)`` complex.
@@ -284,11 +303,11 @@ class BeamProvider:
         chi = np.atleast_1d(np.asarray(chi, dtype=np.float64))
         out = np.empty((chi.size, ell.size, freqs.size, 2, 2), dtype=np.complex128)
         for ti, angle in enumerate(chi):
-            l_feed, m_feed = self._rotate_to_feed(ell, emm, angle)
+            l_feed, m_feed = self._apply_offset(*self._rotate_to_feed(ell, emm, angle), offset)
             out[ti] = self._eval_jones(l_feed, m_feed, freqs)
         return out
 
-    def voltage(self, ell, emm, freqs, chi) -> np.ndarray:
+    def voltage(self, ell, emm, freqs, chi, offset=None) -> np.ndarray:
         """Voltage beam for each parallactic angle.
 
         Parameters
@@ -300,6 +319,9 @@ class BeamProvider:
         chi : numpy.ndarray
             Parallactic angle per sample (radians), shape ``(ntime,)``. Pass zeros
             for a non-rotating (e.g. equatorial-mount) beam.
+        offset : tuple of float, optional
+            Pointing offset ``(dl, dm)`` in the feed frame (radians): where the beam
+            centre points relative to nominal. ``None`` (default) is nominal pointing.
 
         Returns
         -------
@@ -312,7 +334,7 @@ class BeamProvider:
         chi = np.atleast_1d(np.asarray(chi, dtype=np.float64))
         out = np.empty((chi.size, ell.size, freqs.size, 2), dtype=np.complex128)
         for ti, angle in enumerate(chi):
-            l_feed, m_feed = self._rotate_to_feed(ell, emm, angle)
+            l_feed, m_feed = self._apply_offset(*self._rotate_to_feed(ell, emm, angle), offset)
             out[ti] = self._eval(l_feed, m_feed, freqs)
         return out
 
@@ -418,6 +440,10 @@ class FitsBeamProvider(BeamProvider):
     Use :meth:`from_fits` for the on-disk layout, or :meth:`from_arrays` to build one
     directly (e.g. in tests).
     """
+
+    # Bilinear in (l, m): piecewise-linear, so a second difference of it is not the
+    # pattern's curvature. Pointing errors fall back to first order on these types.
+    smooth_curvature = False
 
     def __init__(self, l_grid, m_grid, freqs_hz, values, name: str = ""):
         from scipy.interpolate import RegularGridInterpolator
@@ -925,26 +951,36 @@ def _beam_grid_gib(ntype, n_pa, nsrc, nchan, fold):
     return ntype * n_pa * nsrc * nchan * fold * 8 / 2**30
 
 
-def _check_beam_grid_footprint(ntype, n_pa, nsrc, nchan, fold, max_gib):
+def _check_beam_grid_footprint(ntype, n_pa, nsrc, nchan, fold, max_gib, pointing_grids=0):
     """Warn/raise on the beam-grid footprint before it is allocated.
 
     Warns above half the ceiling and raises :class:`MemoryError` above ``max_gib``, with an
     actionable message naming the levers (the grid scales with PA samples x sources x
     channels). See :data:`BEAM_GRID_MAX_GIB_DEFAULT`.
+
+    ``pointing_grids`` counts the pointing-error derivative grids (2 or 3) held beside the
+    beam grid, each the same size; the check then covers all of them at once and says so.
     """
-    gib = _beam_grid_gib(ntype, n_pa, nsrc, nchan, fold)
+    copies = 1 + pointing_grids
+    gib = _beam_grid_gib(ntype, n_pa, nsrc, nchan, fold) * copies
     dims = f"{ntype} type(s) x {n_pa} PA x {nsrc} src x {nchan} chan x {fold}"
+    what = "Primary-beam grid"
+    if pointing_grids:
+        dims += f", x {copies} for the beam plus {pointing_grids} pointing-error derivative grids"
+        what = "Primary-beam grid with pointing errors"
     if gib > max_gib:
         raise MemoryError(
-            f"Primary-beam grid would need {gib:.2f} GiB ({dims}), above the "
+            f"{what} would need {gib:.2f} GiB ({dims}), above the "
             f"{max_gib:.2f} GiB ceiling. Reduce it with a coarser --beam-pa-step (fewer PA "
             f"samples), fewer sky components, or raise --beam-grid-max-gib. --chan-chunks "
             f"does not help: the grid is built once for all channels."
+            + (" taylor: first needs one derivative grid fewer than laplacian." if pointing_grids == 3 else "")
         )
     if gib > 0.5 * max_gib:
         log.warning(
-            "Primary-beam grid needs %.2f GiB (%s), over half the %.2f GiB ceiling; a "
+            "%s needs %.2f GiB (%s), over half the %.2f GiB ceiling; a "
             "coarser --beam-pa-step or fewer components lowers it.",
+            what,
             gib,
             dims,
             max_gib,
@@ -1006,6 +1042,105 @@ def build_beam_grid_jones(
         jones = prov.jones(ell, emm, freqs, use_chi)  # (n_pa, nsrc, nchan, 2, 2)
         grid[ti] = np.einsum("ij,tsfjk->tsfik", basis_transform, jones)
     return grid
+
+
+# Central-difference step (radians) for the pointing-error beam derivatives. Small
+# against any beam's curvature scale (an L-band FWHM is ~2e-2 rad), large enough that
+# the second difference of a complex128 pattern keeps ~6 significant figures.
+POINTING_FD_STEP = 1e-5
+
+
+def _pointing_derivatives(prov, ell, emm, freqs, chi, laplacian, step, jones):
+    """``(D_l, D_m, L)`` of one provider at one PA sample, complex128, by central differences.
+
+    ``D = dE/d(offset) = -grad_feed E`` (an offset moves the beam, not the source), and
+    ``L = E_ll + E_mm`` is ``None`` unless ``laplacian`` (or 0 for a non-smooth provider).
+    The centre comes from a fresh complex128 evaluation: a complex64 one would leave the
+    second difference dominated by rounding.
+    """
+    evaluate = prov.jones if jones else prov.voltage
+    p_l = evaluate(ell, emm, freqs, chi, offset=(step, 0.0))[0]
+    m_l = evaluate(ell, emm, freqs, chi, offset=(-step, 0.0))[0]
+    p_m = evaluate(ell, emm, freqs, chi, offset=(0.0, step))[0]
+    m_m = evaluate(ell, emm, freqs, chi, offset=(0.0, -step))[0]
+    d_l = (p_l - m_l) / (2.0 * step)
+    d_m = (p_m - m_m) / (2.0 * step)
+    if not laplacian:
+        return d_l, d_m, None
+    if not prov.smooth_curvature:
+        return d_l, d_m, np.zeros_like(d_l)
+    centre = evaluate(ell, emm, freqs, chi)[0]
+    return d_l, d_m, (p_l + m_l + p_m + m_m - 4.0 * centre) / (step * step)
+
+
+def _build_derivative_grids(providers, type_is_altaz, ell, emm, freqs, chi_grid, laplacian, step, max_gib, transform):
+    """Shared body of the two derivative-grid builders; ``transform`` is ``None`` for diagonal."""
+    jones = transform is not None
+    fold = 4 if jones else 2
+    ntype, n_pa = len(providers), chi_grid.size
+    _check_beam_grid_footprint(ntype, n_pa, ell.size, freqs.size, fold * (3 if laplacian else 2), max_gib)
+    shape = (ntype, n_pa, ell.size, freqs.size, *((2, 2) if jones else (2,)))
+    d_l = np.empty(shape, dtype=np.complex64)
+    d_m = np.empty(shape, dtype=np.complex64)
+    lap = np.empty(shape, dtype=np.complex64) if laplacian else None
+    zeros = np.zeros_like(chi_grid)
+    for ti, prov in enumerate(providers):
+        use_chi = chi_grid if type_is_altaz[ti] else zeros
+        # One PA sample at a time keeps the complex128 scratch to a few slabs.
+        for i in range(n_pa):
+            slabs = _pointing_derivatives(prov, ell, emm, freqs, use_chi[i : i + 1], laplacian, step, jones)
+            if jones:
+                slabs = [None if s is None else np.einsum("ij,sfjk->sfik", transform, s) for s in slabs]
+            d_l[ti, i] = slabs[0]
+            d_m[ti, i] = slabs[1]
+            if laplacian:
+                lap[ti, i] = slabs[2]
+    return d_l, d_m, lap
+
+
+def build_beam_derivative_grids(
+    providers,
+    type_is_altaz,
+    ell,
+    emm,
+    freqs,
+    chi_grid,
+    laplacian: bool,
+    step=POINTING_FD_STEP,
+    max_gib=BEAM_GRID_MAX_GIB_DEFAULT,
+):
+    """Pointing-error Taylor grids matching :func:`build_beam_grid`.
+
+    Returns ``(D_l, D_m, L)``, each ``(ntype, n_pa, nsrc, nchan, 2)`` complex64: the
+    derivative of the feed voltages with respect to a feed-frame pointing offset along
+    ``l`` and ``m``, and (only if ``laplacian``, else ``None``) the feed-frame Laplacian
+    ``E_ll + E_mm``, zero for providers without :attr:`BeamProvider.smooth_curvature`.
+    Raises :class:`MemoryError` if the 2 (or 3) grids would exceed ``max_gib``.
+    """
+    return _build_derivative_grids(providers, type_is_altaz, ell, emm, freqs, chi_grid, laplacian, step, max_gib, None)
+
+
+def build_beam_derivative_grids_jones(
+    providers,
+    type_is_altaz,
+    ell,
+    emm,
+    freqs,
+    chi_grid,
+    basis_transform,
+    laplacian: bool,
+    step=POINTING_FD_STEP,
+    max_gib=BEAM_GRID_MAX_GIB_DEFAULT,
+):
+    """As :func:`build_beam_derivative_grids` for the 2x2 Jones grid of :func:`build_beam_grid_jones`.
+
+    Each grid is ``(ntype, n_pa, nsrc, nchan, 2, 2)`` complex64 holding ``S . D_l``,
+    ``S . D_m`` and ``S . L``, the basis transform folded in exactly as for ``E``.
+    """
+    transform = np.eye(2, dtype=np.complex128) if basis_transform is None else basis_transform
+    return _build_derivative_grids(
+        providers, type_is_altaz, ell, emm, freqs, chi_grid, laplacian, step, max_gib, transform
+    )
 
 
 # Points evaluated per beam-provider call. A provider returns complex128 voltages (32 B

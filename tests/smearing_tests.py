@@ -20,7 +20,14 @@ from simms import SCHEMADIR
 from simms.apps import skysim
 from simms.constants import OMEGA_EARTH, C
 from simms.skymodel.ascii_skies import ASCIISkymodel
-from simms.skymodel.kernels import NO_SMEAR_UVW, predict_vis, predict_vis_beam, predict_vis_jones
+from simms.skymodel.kernels import (
+    NO_POINTING,
+    NO_POINTING_JONES,
+    NO_SMEAR_UVW,
+    predict_vis,
+    predict_vis_beam,
+    predict_vis_jones,
+)
 from simms.skymodel.mstools import attach_smearing, predict_block, prepare_skymodel
 from simms.skymodel.smearing import Smearing, SubsampleSmearing, midpoint_fractions, subsample_counts
 from simms.telescope.generate_ms import create_ms
@@ -234,6 +241,7 @@ def test_the_beam_kernels_smear_identically(full_jones):
             args["pa_lo"],
             args["pa_wt"],
             *smear_args,
+            *NO_POINTING_JONES,
         )
     else:
         grid = np.ones((1, 2, nsrc, nchan, 2), dtype=np.complex128)
@@ -249,6 +257,7 @@ def test_the_beam_kernels_smear_identically(full_jones):
             np.array([0, 1, 1, 0][:ncorr] if ncorr == 4 else [0, 1], dtype=np.int64),
             np.array([0, 1, 0, 1][:ncorr] if ncorr == 4 else [0, 1], dtype=np.int64),
             *smear_args,
+            *NO_POINTING,
         )
 
     expected = kernel_vis(uvw, freqs, lmn, smearing, exposure)

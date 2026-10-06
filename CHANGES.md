@@ -1,5 +1,26 @@
 ### 3.0.1 -> unreleased
 
+- `skysim`: antenna pointing errors, via a new top-level `pointing:` block in
+  the `--corruptions` YAML (on its own or beside `gains:`). Each antenna gets a
+  static offset drawn from `N(0, static)` plus an optional sinusoidal drift
+  (`amplitude`, `period`, random phase per antenna), independently on each
+  feed-frame axis, seeded by `--seed-gains` and referenced to the whole MS like
+  the gains. A pointing error is direction-dependent, so it is applied inside
+  the beam kernels, not the gain chain: each antenna's beam is Taylor-expanded
+  about nominal pointing with derivative grids interpolated in parallactic
+  angle like the beam itself. `taylor: laplacian` (the default) adds the
+  `1/4 |offset|^2 lap(E)` term, which makes the mean over antennas
+  `E + 1/2 sigma^2 lap(E)` -- exact to second order, about a 1.8e-4 voltage
+  loss on axis for 30 arcsec in MeerKAT L band, and a gain on the flanks past
+  ~0.95 degrees where the beam curves upward; `taylor: first` has no mean loss
+  and a per-realisation error of order `(offset/FWHM)**2`. Angles need explicit
+  units. The derivative grids cost 2x (first) or 3x (laplacian) the beam grid,
+  within `--beam-grid-max-gib`, and FITS-cube beams fall back to first order
+  (their bilinear interpolation has no usable curvature). Supported for
+  `--ascii-sky` with `--primary-beam` only; FITS, WSClean and noise-only runs
+  refuse a pointing block rather than ignore it. The spec is now loaded and
+  validated before the sky is prepared, and an unknown top-level key warns.
+
 - `primary-beam`: `apply`/`correct` now fold the beam into a model's *spectrum*
   rather than scaling its flux by one band-averaged number. The beam narrows
   across the band, so an off-axis source is attenuated far harder at the top of
