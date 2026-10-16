@@ -1,4 +1,16 @@
-### 3.0.1 -> unreleased
+### 3.0.2 -> unreleased
+
+- **Licence: simms is now Apache-2.0, not GPL-3.0-only.** The project was
+  relicensed from the GNU GPL v3 to the Apache License, Version 2.0 (`LICENSE`
+  replaced; a `NOTICE` added; `pyproject.toml`, `CITATION.cff` and the docs
+  updated, and both files shipped in the distributions). Releases up to and
+  including 3.0.2 were published as `GPL-3.0-only`; this applies from the
+  next release. The `NOTICE` records the project's policy that it stays open
+  source irrespective of contributors' employment or institutional
+  affiliations, that each contributor is responsible for having the right to
+  submit their contribution under this licence, and the request to cite simms
+  in research (a scholarly request, not a licence condition). The vendored
+  katbeam beam tables keep their own BSD-3-Clause attribution.
 
 - `skysim`: antenna pointing errors, via a new top-level `pointing:` block in
   the `--corruptions` YAML (on its own or beside `gains:`). Each antenna gets a
@@ -180,6 +192,26 @@
   the same noise realisation; a deprecation warning is emitted). Corruption
   terms draw from their own `--seed-gains`, so adding corruptions cannot change
   the noise realisation.
+- Packaging: dropped the `[tool.uv.sources]` GitHub-archive pin for
+  `stimela-ninja` and raised the floor to `>=0.1.0b7`. The pin originally
+  existed for the CASA CI image's lack of a `git` binary, but it was also
+  pinning an unreleased feature -- the `ParamMeta.abbreviation` fix
+  (stimela-ninja#127) that the short CLI aliases (`-tel`, `-nt`, ...) need,
+  which no PyPI release had. `0.1.0b7` ships that fix, so the dependency now
+  resolves from the registry alone. The pin was leaking into downstream uv
+  installs: any project that also named stimela-ninja by a different URL (even
+  the same commit as `git+…@<sha>`) failed with a "conflicting URLs" error, and
+  pip/uv diverged on the same requirements file. Downstream users can now pick
+  their own stimela-ninja again.
+
+### 3.0.1 -> 3.0.2
+
+- Dependencies: `fitstoolz` is now required at `>=0.1.0` (was `>=0.1.0b4`), and
+  the `[tool.uv.sources]` GitHub-archive pin for it is dropped, so it resolves
+  from the registry; the lock is reconciled with that release.
+
+### 3.0.0 -> 3.0.1
+
 - `skysim`: `--row-chunks` is now an upper bound rather than a fixed chunk size.
   A fixed size tied the task count to the length of the MS, so a short track
   produced fewer chunks than workers and left most of them idle (76608 rows at
@@ -212,20 +244,6 @@
   segment in diagonal mode; `attach_fits_aterm` and `component_sky_from_fits_dft`
   reject a circular-basis model rather than silently producing wrong cross-hands;
   the planned gridder-pass count is logged at DEBUG.
-- Packaging: dropped the `[tool.uv.sources]` GitHub-archive pin for
-  `stimela-ninja` and raised the floor to `>=0.1.0b7`. The pin originally
-  existed for the CASA CI image's lack of a `git` binary, but it was also
-  pinning an unreleased feature -- the `ParamMeta.abbreviation` fix
-  (stimela-ninja#127) that the short CLI aliases (`-tel`, `-nt`, ...) need,
-  which no PyPI release had. `0.1.0b7` ships that fix, so the dependency now
-  resolves from the registry alone. The pin was leaking into downstream uv
-  installs: any project that also named stimela-ninja by a different URL (even
-  the same commit as `git+…@<sha>`) failed with a "conflicting URLs" error, and
-  pip/uv diverged on the same requirements file. Downstream users can now pick
-  their own stimela-ninja again.
-
-### 3.0.0 -> 3.0.1
-
 - gitingore poetry|uv.lock
 - Port cabs to shinobi/dosho
 - Fix `-pb` duplicate abbrevation. The `primary-beam` option retains it
