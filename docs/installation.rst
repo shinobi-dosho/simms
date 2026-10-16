@@ -71,11 +71,9 @@ The existing ``simms.apps.telsim:telsim``, ``simms.apps.skysim:skysim`` and
 loads its workflow adapter; without Ninja, it reports how to install the extra.
 Both command interfaces derive their options from the same typed functions.
 
-Currently ``fitstoolz`` still requires ``stimela-ninja`` transitively. Until
-`fitstoolz issue #30 <https://github.com/shinobi-dosho/fitstoolz/issues/30>`_
-is resolved and released, even a base install can therefore include Ninja.
-FITS support remains part of the base simms installation. CI checks a fresh base
-wheel installation for this dependency so that this limitation stays visible.
+FITS support remains part of the base simms installation. The required
+``fitstoolz>=0.2.2`` keeps Stimela Ninja out of a base install. CI checks this
+in a fresh wheel installation.
 
 To run the optional workflow integration tests:
 
