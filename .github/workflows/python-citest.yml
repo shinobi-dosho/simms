@@ -56,7 +56,7 @@ jobs:
         uv run --no-sync ruff check src tests
         uv run --no-sync ruff format --check src tests
     - name: Unit tests
-      run: uv run --no-sync pytest tests/
+      run: uv run --no-sync python -m pytest tests/
     - name: Smoke test CLI
       run: |
         uv run --no-sync simms telsim --help
@@ -97,4 +97,38 @@ jobs:
     - name: Install locked dependencies
       run: uv sync --locked --no-default-groups --group tests --group casa
     - name: CASA round-trip
-      run: uv run --no-sync pytest tests/casa_roundtrip_tests.py -v
+      run: uv run --no-sync python -m pytest tests/casa_roundtrip_tests.py -v
+
+  wheel-install:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: base
+            extra: ""
+          - kind: ninja
+            extra: "[ninja]"
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: ${{ env.UV_VERSION }}
+        python-version: ${{ env.PYTHON_VERSION }}
+    - name: Build wheel
+      run: uv build --wheel --out-dir "$RUNNER_TEMP/wheels"
+    - name: Install wheel with declared dependencies
+      run: |
+        uv venv "$RUNNER_TEMP/wheel-env"
+        wheels=("$RUNNER_TEMP"/wheels/*.whl)
+        uv pip install --python "$RUNNER_TEMP/wheel-env/bin/python" "${wheels[0]}${{ matrix.extra }}"
+    - name: Verify installed package outside checkout
+      working-directory: ${{ runner.temp }}
+      run: >-
+        uv run --no-project --python "$RUNNER_TEMP/wheel-env/bin/python" python
+        "$GITHUB_WORKSPACE/scripts/check_wheel_install.py" "${{ matrix.kind }}"
+    - name: Test workflow integration
+      if: matrix.kind == 'ninja'
+      run: |
+        uv sync --locked --extra ninja --group tests
+        uv run --no-sync python -m pytest tests/ninja_integration_tests.py

@@ -27,11 +27,13 @@ dependencies = [
     "ephem>=4.1,<5.0",
     "pydantic>=2.6",
     "pyyaml>=6.0",
-    "stimela-ninja>=0.1.0b7",
     "codex-africanus[complete]>=0.3.7,<1.0",
     "ducc0>=0.41.0",
     "fitstoolz>=0.1.0",
 ]
+
+[project.optional-dependencies]
+ninja = ["stimela-ninja>=0.1.0b7"]
 
 [build-system]
 requires = ["hatchling"]

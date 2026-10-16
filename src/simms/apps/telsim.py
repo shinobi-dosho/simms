@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Annotated
 
-import shinobi
 from pydantic import BaseModel, Field
-from shinobi.steps.schema import ParamMeta
 
 from simms import BIN
+from simms.apps.schema import inputs_from_signature, optional_step
 from simms.telescope import generate_ms, layouts
 from simms.utilities import set_dask_workers
 
@@ -39,7 +37,7 @@ def print_data_database(ctx, param, value):
 def _antenna_selection(values, cast=str):
     """Flatten a repeatable antenna-selection option into a plain list, or None if unset.
 
-    shinobi renders the list-typed fields as click ``multiple=True`` options, so the repeated
+    The CLI renders the list-typed fields as click ``multiple=True`` options, so the repeated
     form (``-sublist M000 -sublist M005``) arrives as a tuple of separate values, while the
     comma form the help text documents (``-sublist M000,M005``) arrives as one string. Accept
     both. A recipe or cab passing a real YAML list lands here as a list and passes straight
@@ -116,96 +114,139 @@ def runit(opts):
     )
 
 
-@shinobi.pystep(name=BIN.telsim, info="Create an empty Measurement Set from a telescope layout.")
-def telsim(
+def telsim_impl(
     ms: str = Field(..., description="Observation name/id/label"),
-    telescope: Annotated[str, ParamMeta(abbreviation="tel")] = Field(
-        ..., description="Name of telescope you are simulating"
+    telescope: str = Field(
+        ...,
+        description="Name of telescope you are simulating",
+        json_schema_extra={"param_meta": {"abbreviation": "tel"}},
     ),
-    subarray_list: Annotated[list[str] | None, ParamMeta(abbreviation="sublist")] = Field(
+    subarray_list: list[str] | None = Field(
         None,
         description="Custom list of antennas to use, e.g., M000,M005,SKA009. "
         "Must be a subarray of the given telescope.",
+        json_schema_extra={"param_meta": {"abbreviation": "sublist"}},
     ),
-    # `str` deliberately leads the union: shinobi picks the click type from the first
-    # int/float/bool/str leaf, so a bare `list[int]` renders as `INTEGER` and click rejects
-    # the documented comma form ("'0,64' is not a valid integer") before the value ever
-    # reaches us. Leading with `str` gives a STRING option that takes both `0,64` and
-    # `-subrange 0 -subrange 64`, while the `int` arm still accepts a YAML list of ints from
-    # a recipe. `_antenna_selection` casts to int. Narrowing this to `list[int]` re-breaks
-    # the CLI -- see test_subarray_range_accepts_comma_separated_indices.
-    subarray_range: Annotated[list[str | int] | None, ParamMeta(abbreviation="subrange")] = Field(
+    # The string arm accepts comma-separated values at the CLI; the integer arm
+    # preserves YAML lists of indices in recipes. `_antenna_selection` casts both
+    # forms to integers. A bare list[int] would reject comma-separated values.
+    subarray_range: list[str | int] | None = Field(
         None,
         description="Custom range of antenna indices to use, e.g. start,end,step (step optional; "
         "end is inclusive when no step is given). Must be a subarray of the given telescope.",
+        json_schema_extra={"param_meta": {"abbreviation": "subrange"}},
     ),
-    subarray_file: Annotated[str | None, ParamMeta(abbreviation="subfile")] = Field(
+    subarray_file: str | None = Field(
         None,
         description="File listing custom antennas to use (antnames key, e.g. [M000,M005,SKA009]). "
         "Must be a subarray of the given telescope.",
+        json_schema_extra={"param_meta": {"abbreviation": "subfile"}},
     ),
-    telescope_name_column: Annotated[str, ParamMeta(abbreviation="tnc")] = Field(
+    telescope_name_column: str = Field(
         "TELESCOPE_NAME",
         description="Name of the ANTENNA-table column that holds the per-antenna telescope/type label "
         "(used by skysim to select a primary beam).",
+        json_schema_extra={"param_meta": {"abbreviation": "tnc"}},
     ),
-    direction: Annotated[str, ParamMeta(abbreviation="dir")] = Field(
-        "J2000,1h0m0s,-31d0m0s", description="Direction of field centre for MS, e.g. J2000,0h24m20s,-30d12m33s."
+    direction: str = Field(
+        "J2000,1h0m0s,-31d0m0s",
+        description="Direction of field centre for MS, e.g. J2000,0h24m20s,-30d12m33s.",
+        json_schema_extra={"param_meta": {"abbreviation": "dir"}},
     ),
-    starttime: Annotated[str | None, ParamMeta(abbreviation="st")] = Field(
+    starttime: str | None = Field(
         None,
         description="Observation start time in UTC, e.g. '2024-03-14T06:15:10'. Default is the current machine time.",
+        json_schema_extra={"param_meta": {"abbreviation": "st"}},
     ),
-    startha: Annotated[float | None, ParamMeta(abbreviation="sha")] = Field(
-        None, description="Hour angle at start of observation. Can be used instead of date."
+    startha: float | None = Field(
+        None,
+        description="Hour angle at start of observation. Can be used instead of date.",
+        json_schema_extra={"param_meta": {"abbreviation": "sha"}},
     ),
-    dtime: Annotated[float, ParamMeta(abbreviation="dt")] = Field(
-        8, description="Integration/exposure time in seconds."
+    dtime: float = Field(
+        8, description="Integration/exposure time in seconds.", json_schema_extra={"param_meta": {"abbreviation": "dt"}}
     ),
-    ntime: Annotated[int, ParamMeta(abbreviation="nt")] = Field(10, description="Number of time slots for MS."),
-    startfreq: Annotated[str | float, ParamMeta(abbreviation="sf")] = Field(
-        "1420MHz", description="Centre of first frequency channel, e.g 0.55GHz. Hertz assumed if no units."
+    ntime: int = Field(
+        10, description="Number of time slots for MS.", json_schema_extra={"param_meta": {"abbreviation": "nt"}}
     ),
-    dfreq: Annotated[str | float, ParamMeta(abbreviation="df")] = Field(
-        "1MHz", description="Channel width, e.g 2.4MHz. Hertz assumed if no units."
+    startfreq: str | float = Field(
+        "1420MHz",
+        description="Centre of first frequency channel, e.g 0.55GHz. Hertz assumed if no units.",
+        json_schema_extra={"param_meta": {"abbreviation": "sf"}},
     ),
-    nchan: Annotated[int, ParamMeta(abbreviation="nc")] = Field(9, description="Number of frequency channels."),
-    correlations: Annotated[str, ParamMeta(abbreviation="corr")] = Field(
-        "XX,YY", description="Feed correlations for MS, e.g., 'XX,YY'."
+    dfreq: str | float = Field(
+        "1MHz",
+        description="Channel width, e.g 2.4MHz. Hertz assumed if no units.",
+        json_schema_extra={"param_meta": {"abbreviation": "df"}},
+    ),
+    nchan: int = Field(
+        9, description="Number of frequency channels.", json_schema_extra={"param_meta": {"abbreviation": "nc"}}
+    ),
+    correlations: str = Field(
+        "XX,YY",
+        description="Feed correlations for MS, e.g., 'XX,YY'.",
+        json_schema_extra={"param_meta": {"abbreviation": "corr"}},
     ),
     nworkers: int = Field(4, description="Number of workers (one per CPU)."),
-    rowchunks: Annotated[int, ParamMeta(abbreviation="rc")] = Field(
-        50000, description="Number of chunks to divide the data into; more chunks improves computation speed."
+    rowchunks: int = Field(
+        50000,
+        description="Number of chunks to divide the data into; more chunks improves computation speed.",
+        json_schema_extra={"param_meta": {"abbreviation": "rc"}},
     ),
-    column: Annotated[str, ParamMeta(abbreviation="col")] = Field(
-        "MODEL_DATA", description="The column in which to corrupt the visibilities with noise."
+    column: str = Field(
+        "MODEL_DATA",
+        description="The column in which to corrupt the visibilities with noise.",
+        json_schema_extra={"param_meta": {"abbreviation": "col"}},
     ),
     sefd: float | None = Field(None, description="Antenna SEFD (one value for all frequencies)."),
-    tsys_over_eta: Annotated[float | None, ParamMeta(abbreviation="tos")] = Field(
-        None, description="Antenna system temperature over aperture efficiency (one value for all frequencies)."
+    tsys_over_eta: float | None = Field(
+        None,
+        description="Antenna system temperature over aperture efficiency (one value for all frequencies).",
+        json_schema_extra={"param_meta": {"abbreviation": "tos"}},
     ),
-    sensitivity_file: Annotated[str | None, ParamMeta(abbreviation="sfile")] = Field(
-        None, description="File with antenna spectral sensitivity info. Keys: 'freq, tsys, sefd, tsys_over_eta'."
+    sensitivity_file: str | None = Field(
+        None,
+        description="File with antenna spectral sensitivity info. Keys: 'freq, tsys, sefd, tsys_over_eta'.",
+        json_schema_extra={"param_meta": {"abbreviation": "sfile"}},
     ),
-    low_source_limit: Annotated[float | None, ParamMeta(abbreviation="lsl")] = Field(
-        None, description="Minimum reliable source elevation (deg); data below this is flagged."
+    low_source_limit: float | None = Field(
+        None,
+        description="Minimum reliable source elevation (deg); data below this is flagged.",
+        json_schema_extra={"param_meta": {"abbreviation": "lsl"}},
     ),
-    high_source_limit: Annotated[float | None, ParamMeta(abbreviation="hsl")] = Field(
-        None, description="Maximum reliable source elevation (deg); data above this is flagged."
+    high_source_limit: float | None = Field(
+        None,
+        description="Maximum reliable source elevation (deg); data above this is flagged.",
+        json_schema_extra={"param_meta": {"abbreviation": "hsl"}},
     ),
-    freq_range: Annotated[str | None, ParamMeta(abbreviation="fr")] = Field(
+    freq_range: str | None = Field(
         None,
         description="A list of start frequency, end frequency, and number of channels, e.g. startfreq,endfreq,nchan.",
+        json_schema_extra={"param_meta": {"abbreviation": "fr"}},
     ),
     smooth: str | None = Field(
         None,
         description="SEFD fitting option when a sensitivity file is given: 'polyn' or 'spline'.",
     ),
-    fit_order: Annotated[int | None, ParamMeta(abbreviation="fo")] = Field(
-        None, description="Fitting order used when approximating the MS-frequency SEFDs."
+    fit_order: int | None = Field(
+        None,
+        description="Fitting order used when approximating the MS-frequency SEFDs.",
+        json_schema_extra={"param_meta": {"abbreviation": "fo"}},
     ),
     log_level: str = Field("INFO", description="Logging verbosity."),
 ) -> SimmsOutputs:
     opts = SimpleNamespace(**locals())
     runit(opts)
     return SimmsOutputs(ms=ms)
+
+
+inputs_model = inputs_from_signature(telsim_impl)
+INFO = "Create an empty Measurement Set from a telescope layout."
+
+
+def __getattr__(name):
+    if name == "telsim":
+        step = optional_step(telsim_impl, name=BIN.telsim, info=INFO)
+        globals()[name] = step
+        return step
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

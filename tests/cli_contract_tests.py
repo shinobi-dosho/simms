@@ -1,7 +1,7 @@
 """Contract tests for the generated CLI surface.
 
 The options of every subcommand are generated from its pydantic ``inputs_model`` by
-shinobi's ``build_options``, so ``--help`` cannot drift from the model. It can still drift
+simms' ``build_options``, so ``--help`` cannot drift from the model. It can still drift
 from the *code*: an option can be declared and never read, and a help string can promise a
 value syntax that the rendered click type rejects. Both have happened. These tests check the
 whole option surface at once, so a new option cannot reintroduce either.
@@ -13,19 +13,19 @@ import re
 
 import click
 import pytest
-from shinobi.clickutil import build_options
 
 from simms.apps import primary_beam, skysim, telsim
 from simms.apps.main import FLAG_ALIASES, cli
+from simms.apps.schema import build_options
 from simms.skymodel import pb_ops
 from simms.telescope import generate_ms
 
 SRC = pathlib.Path(inspect.getfile(telsim)).parent.parent
 
 STEPS = {
-    "telsim": telsim.telsim,
-    "skysim": skysim.skysim,
-    "primary-beam": primary_beam.primary_beam,
+    "telsim": telsim,
+    "skysim": skysim,
+    "primary-beam": primary_beam,
 }
 
 # Modules a subcommand hands its `opts` (or the values pulled off it) to. An option is
@@ -50,7 +50,7 @@ def consumer_source(cmd):
 
 
 def options(cmd):
-    return [opt for opt in build_options(STEPS[cmd].step.inputs_model) if opt.name not in NOT_READ_VIA_OPTS]
+    return [opt for opt in build_options(STEPS[cmd].inputs_model) if opt.name not in NOT_READ_VIA_OPTS]
 
 
 @pytest.mark.parametrize("cmd", sorted(STEPS))
@@ -67,14 +67,15 @@ def test_every_option_is_consumed(cmd):
 
 @pytest.mark.parametrize("cmd", sorted(STEPS))
 def test_list_options_render_as_strings(cmd):
-    """List-typed fields become click ``multiple=True`` options. Their click type comes from
-    the first int/float/bool/str leaf of the annotation, so a bare ``list[int]`` renders as
-    INTEGER and rejects a comma-separated value before any simms code runs. Leading the
-    annotation with ``str`` keeps both the repeated and the comma form working.
+    """List-typed fields become click ``multiple=True`` options.
+
+    A bare ``list[int]`` renders as INTEGER and rejects a comma-separated value
+    before any simms code runs. Including a string arm keeps both the repeated
+    and the comma form working.
     """
     bad = [
         (opt.name, opt.type.name)
-        for opt in build_options(STEPS[cmd].step.inputs_model)
+        for opt in build_options(STEPS[cmd].inputs_model)
         if opt.multiple and opt.type is not click.STRING
     ]
     assert not bad, (
@@ -126,7 +127,7 @@ def test_no_duplicate_flags(cmd):
 def test_flag_aliases_name_real_fields():
     """An alias for a field that no longer exists would silently do nothing."""
     for cmd, aliases in FLAG_ALIASES.items():
-        fields = set(STEPS[cmd].step.inputs_model.model_fields)
+        fields = set(STEPS[cmd].inputs_model.model_fields)
         unknown = sorted(set(aliases) - fields)
         assert not unknown, f"{cmd}: FLAG_ALIASES names fields that do not exist: {unknown}"
 
@@ -163,5 +164,5 @@ def test_drifted_spellings_are_accepted_on_every_subcommand():
 
 @pytest.mark.parametrize("cmd", sorted(STEPS))
 def test_every_option_has_help(cmd):
-    missing = [opt.name for opt in build_options(STEPS[cmd].step.inputs_model) if not opt.help]
+    missing = [opt.name for opt in build_options(STEPS[cmd].inputs_model) if not opt.help]
     assert not missing, f"{cmd}: options with no help text: {missing}"

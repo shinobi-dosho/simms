@@ -5,18 +5,17 @@ import logging
 import os.path
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Annotated
+from typing import Literal
 
 import dask
 import dask.array as da
 import numpy as np
-import shinobi
 from daskms import xds_from_ms, xds_from_table, xds_to_table
 from pydantic import BaseModel, Field
-from shinobi.steps.schema import ParamMeta
 from tqdm.dask import TqdmCallback
 
 from simms import BIN, SCHEMADIR
+from simms.apps.schema import inputs_from_signature, optional_step
 from simms.exceptions import InvalidInputError
 from simms.skymodel.ascii_skies import ASCIISkymodel
 from simms.skymodel.beams import load_beam_config, resolve_antenna_beams
@@ -862,81 +861,89 @@ class SimmsOutputs(BaseModel):
     ms: str | None = None
 
 
-@shinobi.pystep(name=BIN.skysim, info="Predict model visibilities from a sky model into an MS.")
-def skysim(
+def skysim_impl(
     ms: str = Field(..., description="Measurement set."),
-    ascii_sky: Annotated[str | None, ParamMeta(abbreviation="as")] = Field(
+    ascii_sky: str | None = Field(
         None,
         description="Catalogue of sources. See the documentation for accepted units.",
+        json_schema_extra={"param_meta": {"abbreviation": "as"}},
     ),
-    fits_sky: Annotated[str | None, ParamMeta(abbreviation="fs")] = Field(
+    fits_sky: str | None = Field(
         None,
         description="FITS file (or directory of Stokes cubes) containing the sky model.",
+        json_schema_extra={"param_meta": {"abbreviation": "fs"}},
     ),
-    wsclean_sky: Annotated[str | None, ParamMeta(abbreviation="ws")] = Field(
+    wsclean_sky: str | None = Field(
         None,
         description="WSClean component list (point and Gaussian components, Stokes I).",
+        json_schema_extra={"param_meta": {"abbreviation": "ws"}},
     ),
-    fits_sky_interp: Annotated[str, ParamMeta(choices=["nearest", "linear", "cubic"], abbreviation="fsi")] = Field(
+    fits_sky_interp: Literal["nearest", "linear", "cubic"] = Field(
         "linear",
         description="Interpolation method when the MS and FITS frequency grids do not match and the cube is kept.",
+        json_schema_extra={"param_meta": {"abbreviation": "fsi"}},
     ),
-    polarisation: Annotated[bool, ParamMeta(abbreviation="pol")] = Field(
+    polarisation: bool = Field(
         True,
         description="Simulate all available Stokes parameters. If false, only Stokes I.",
+        json_schema_extra={"param_meta": {"abbreviation": "pol"}},
     ),
-    pol_basis: Annotated[str, ParamMeta(choices=["linear", "circular"])] = Field(
-        "linear", description="Polarization basis for the simulation."
-    ),
-    pixel_tol: Annotated[float, ParamMeta(abbreviation="pt")] = Field(
+    pol_basis: Literal["linear", "circular"] = Field("linear", description="Polarization basis for the simulation."),
+    pixel_tol: float = Field(
         1e-7,
         description="Minimum brightness for a pixel to be considered in direct Fourier transform.",
+        json_schema_extra={"param_meta": {"abbreviation": "pt"}},
     ),
-    fits_spectrum: Annotated[str, ParamMeta(choices=["auto", "flat", "poly", "cube"], abbreviation="fsp")] = Field(
+    fits_spectrum: Literal["auto", "flat", "poly", "cube"] = Field(
         "auto",
         description="How the FITS sky model varies with frequency.",
+        json_schema_extra={"param_meta": {"abbreviation": "fsp"}},
     ),
     fits_spi: list[str] | None = Field(
         None,
         description="Spectral-index (and higher-order) coefficient maps, ordered c1, c2, ... Requires --fits-ref-freq.",
     ),
-    fits_ref_freq: Annotated[float | None, ParamMeta(abbreviation="frf")] = Field(
+    fits_ref_freq: float | None = Field(
         None,
         description="Reference frequency (Hz) of an analytic FITS spectrum. Defaults to the MS band centre.",
+        json_schema_extra={"param_meta": {"abbreviation": "frf"}},
     ),
     fits_spectrum_order: int = Field(
         2, description="Order of the fitted log-polynomial spectrum. 1 is a plain spectral index."
     ),
-    predict_backend: Annotated[str, ParamMeta(choices=["auto", "dft", "fft", "perchan"])] = Field(
+    predict_backend: Literal["auto", "dft", "fft", "perchan"] = Field(
         "auto", description="Backend for FITS sky model prediction."
     ),
-    fft_precision: Annotated[str, ParamMeta(choices=["single", "double"])] = Field(
-        "double", description="Precision of the FFT calculation."
-    ),
+    fft_precision: Literal["single", "double"] = Field("double", description="Precision of the FFT calculation."),
     do_wstacking: bool = Field(True, description="Whether to use w-stacking for FFT-based visibility prediction."),
-    ascii_delimiter: Annotated[str | None, ParamMeta(abbreviation="ad")] = Field(
-        None, description="Delimiter used in the ascii-sky."
+    ascii_delimiter: str | None = Field(
+        None, description="Delimiter used in the ascii-sky.", json_schema_extra={"param_meta": {"abbreviation": "ad"}}
     ),
-    column: Annotated[str, ParamMeta(abbreviation="col")] = Field("DATA", description="Data column for simulation."),
+    column: str = Field(
+        "DATA", description="Data column for simulation.", json_schema_extra={"param_meta": {"abbreviation": "col"}}
+    ),
     nworkers: int = Field(4, description="Number of workers (one per CPU)."),
-    row_chunks: Annotated[int, ParamMeta(abbreviation="rcs")] = Field(
+    row_chunks: int = Field(
         10000,
         description="Maximum number of rows per chunk. Controls the row-wise task/memory "
         "granularity; the effective size is reduced when needed so every worker gets "
         "several chunks.",
+        json_schema_extra={"param_meta": {"abbreviation": "rcs"}},
     ),
-    chan_chunks: Annotated[int | None, ParamMeta(abbreviation="ccs")] = Field(
+    chan_chunks: int | None = Field(
         None,
         description="Number of channels per chunk. Defaults to all channels in one chunk.",
+        json_schema_extra={"param_meta": {"abbreviation": "ccs"}},
     ),
-    primary_beam: Annotated[str | None, ParamMeta(abbreviation="pb")] = Field(
+    primary_beam: str | None = Field(
         None,
         description="Beam model config: a simms beam-config YAML mapping each ANTENNA telescope "
         "name to a beam model, or a Cattery/DDFacet heterogeneous-beam json (--Beam-FITSFile json "
         "form, keyed by ANTENNA.NAME) if the path ends in .json. For Cattery/DDFacet beams a "
         "circular-correlation MS may be used when --beam-jones full is selected.",
+        json_schema_extra={"param_meta": {"abbreviation": "pb"}},
     ),
-    beam_band: Annotated[str, ParamMeta(choices=["UHF", "L"])] = Field(
+    beam_band: Literal["UHF", "L"] = Field(
         "L", description="Default band for JimBeam entries that omit an explicit model/CSV."
     ),
     beam_pa_step: float = Field(
@@ -947,38 +954,43 @@ def skysim(
         description="Hard ceiling (GiB) on the sampled beam grid held in memory for the whole run; "
         "pointing errors add 2 (first) or 3 (laplacian) derivative grids of the same size.",
     ),
-    beam_jones: Annotated[str, ParamMeta(choices=["diagonal", "full"])] = Field(
+    beam_jones: Literal["diagonal", "full"] = Field(
         "diagonal", description="Primary-beam application: per-feed voltage or full 2x2 E-Jones."
     ),
-    fits_beam_mode: Annotated[str, ParamMeta(choices=["aterm", "average"], abbreviation="fbm")] = Field(
+    fits_beam_mode: Literal["aterm", "average"] = Field(
         "aterm",
         description="Primary-beam handling for the FITS-image path: 'aterm' applies exact per-antenna "
         "a-terms in the image domain (time- and frequency-interpolated, heterogeneity-aware); 'average' "
         "multiplies the sky by a single PA-averaged power beam (legacy approximation).",
+        json_schema_extra={"param_meta": {"abbreviation": "fbm"}},
     ),
-    aterm_freq_tol: Annotated[float, ParamMeta(abbreviation="aft")] = Field(
+    aterm_freq_tol: float = Field(
         1e-3,
         description="Largest allowed error (in voltage-beam units, beam peak ~1) of the a-term's "
         "linear-in-frequency interpolation between knot channels. Smaller means more frequency knots; "
         "0 or negative samples the beam at every channel.",
+        json_schema_extra={"param_meta": {"abbreviation": "aft"}},
     ),
-    telescope_name_column: Annotated[str, ParamMeta(abbreviation="tnc")] = Field(
+    telescope_name_column: str = Field(
         "TELESCOPE_NAME",
         description="ANTENNA-table column holding the per-antenna telescope/type label that maps to a beam model.",
+        json_schema_extra={"param_meta": {"abbreviation": "tnc"}},
     ),
-    beam_l_axis: Annotated[str, ParamMeta(choices=["-X", "X"], abbreviation="bla")] = Field(
+    beam_l_axis: Literal["-X", "X"] = Field(
         "-X",
         description="Sign convention for a Cattery/DDFacet .json primary-beam config's L axis; "
         "ignored for YAML beam configs, which specify their own axis convention. "
         "Matches DDFacet's --Beam-FITSLAxis.",
+        json_schema_extra={"param_meta": {"abbreviation": "bla"}},
     ),
-    beam_m_axis: Annotated[str, ParamMeta(choices=["Y", "-Y"], abbreviation="bma")] = Field(
+    beam_m_axis: Literal["Y", "-Y"] = Field(
         "Y",
         description="Sign convention for a Cattery/DDFacet .json primary-beam config's M axis; "
         "ignored for YAML beam configs, which specify their own axis convention. "
         "Matches DDFacet's --Beam-FITSMAxis.",
+        json_schema_extra={"param_meta": {"abbreviation": "bma"}},
     ),
-    smearing: Annotated[str, ParamMeta(choices=["analytic", "subsample", "none"])] = Field(
+    smearing: Literal["analytic", "subsample", "none"] = Field(
         "analytic",
         description="Time and bandwidth smearing of the predicted model. 'analytic' (default) "
         "applies the sinc decorrelation implied by the MS's own CHAN_WIDTH and EXPOSURE, so the "
@@ -991,14 +1003,15 @@ def skysim(
         "per-visibility paths keep the analytic factor. 'none' predicts a monochromatic, "
         "instantaneous model everywhere.",
     ),
-    smearing_subsamples: Annotated[int, ParamMeta(abbreviation="sss")] = Field(
+    smearing_subsamples: int = Field(
         8,
         ge=1,
         description="Cap on the automatically chosen per-axis (time and frequency) sub-sample "
         "counts under --smearing subsample; capped runs warn with the residual amplitude bias. "
         "No effect for other --smearing modes.",
+        json_schema_extra={"param_meta": {"abbreviation": "sss"}},
     ),
-    field_id: Annotated[int, ParamMeta(abbreviation="fi")] = Field(0, description="Field ID."),
+    field_id: int = Field(0, description="Field ID.", json_schema_extra={"param_meta": {"abbreviation": "fi"}}),
     spw_id: int = Field(0, description="Spectral Window ID."),
     sefd: float | None = Field(None, description="Add noise using this SEFD value."),
     seed_noise: int | None = Field(
@@ -1024,14 +1037,15 @@ def skysim(
         "visibilities and/or antenna 'pointing' errors, which are applied through the primary beam "
         "(--ascii-sky with --primary-beam only).",
     ),
-    ascii_species: Annotated[
-        str | None, ParamMeta(choices=["bdsf_gaul", "bdsf_srl", "aegean", "wsclean"], abbreviation="asp")
-    ] = Field(None, description="Non-simms sky model type."),
-    input_column: Annotated[str | None, ParamMeta(abbreviation="ic")] = Field(
+    ascii_species: Literal["bdsf_gaul", "bdsf_srl", "aegean", "wsclean"] | None = Field(
+        None, description="Non-simms sky model type.", json_schema_extra={"param_meta": {"abbreviation": "asp"}}
+    ),
+    input_column: str | None = Field(
         None,
         description="Column that 'add'/'subtract' combine the simulation with. Defaults to --column.",
+        json_schema_extra={"param_meta": {"abbreviation": "ic"}},
     ),
-    mode: Annotated[str, ParamMeta(choices=["sim", "add", "subtract"])] = Field(
+    mode: Literal["sim", "add", "subtract"] = Field(
         "sim",
         description="How the simulation reaches --column: 'sim' overwrites it, 'add' adds the simulation to "
         "--input-column, 'subtract' subtracts it from --input-column. --input-column defaults to --column.",
@@ -1045,3 +1059,15 @@ def skysim(
     opts = SimpleNamespace(**locals())
     runit(opts)
     return SimmsOutputs(ms=ms)
+
+
+inputs_model = inputs_from_signature(skysim_impl)
+INFO = "Predict model visibilities from a sky model into an MS."
+
+
+def __getattr__(name):
+    if name == "skysim":
+        step = optional_step(skysim_impl, name=BIN.skysim, info=INFO)
+        globals()[name] = step
+        return step
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -10,10 +10,10 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from click.testing import CliRunner
 from daskms import xds_from_table
-from shinobi.clickutil import build_options
 
 from simms.apps import primary_beam
 from simms.apps.main import cli
+from simms.apps.schema import build_options
 from simms.skymodel.beams import CosineTaperBeam, FitsBeamProvider, JimBeamProvider
 from simms.telescope.generate_ms import create_ms
 
@@ -276,12 +276,12 @@ def test_outputs_declare_both_passthrough_paths():
 
 
 def test_mosaic_inputs_are_repeatable_and_keep_scalar_recipe_compatibility():
-    options = {option.name: option for option in build_options(primary_beam.primary_beam.step.inputs_model)}
+    options = {option.name: option for option in build_options(primary_beam.inputs_model)}
     assert options["ms"].multiple
     assert options["pointing_centre"].multiple
     assert options["mosaic_weight"].multiple
-    assert primary_beam.primary_beam.step.inputs_model(mode="apply", ms="one.ms").ms == ["one.ms"]
-    assert primary_beam.primary_beam.step.inputs_model(mode="apply", mosaic_weight=2.0).mosaic_weight == [2.0]
+    assert primary_beam.inputs_model(mode="apply", ms="one.ms").ms == ["one.ms"]
+    assert primary_beam.inputs_model(mode="apply", mosaic_weight=2.0).mosaic_weight == [2.0]
 
 
 def test_real_cli_collects_repeated_mosaic_options(monkeypatch):
