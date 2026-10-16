@@ -346,7 +346,7 @@ gain-modulated.  A noise-only run (``--sefd`` with no sky model) therefore has
 nothing for ``--corruptions`` to act on, and warns.
 
 Pointing errors
-~~~~~~~~~~~~~~~
+................
 
 The same file can carry a top-level ``pointing`` block, on its own or beside
 ``gains``.  A mispointed antenna sees the sky through a shifted primary beam,
