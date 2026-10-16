@@ -27,11 +27,13 @@ dependencies = [
     "ephem>=4.1,<5.0",
     "pydantic>=2.6",
     "pyyaml>=6.0",
-    "stimela-ninja>=0.1.0b7",
     "codex-africanus[complete]>=0.3.7,<1.0",
     "ducc0>=0.41.0",
-    "fitstoolz>=0.1.0",
+    "fitstoolz>=0.2.2",
 ]
+
+[project.optional-dependencies]
+ninja = ["stimela-ninja>=0.1.0b7"]
 
 [build-system]
 requires = ["hatchling"]
@@ -60,7 +62,7 @@ simms = "simms.apps.main:cli"
 
 [tool.uv]
 # Pre-releases are allowed only where a requirement explicitly asks for one
-# (fitstoolz>=0.1.0b4, stimela-ninja) or where a package publishes nothing else -- uv's
+# (stimela-ninja) or where a package publishes nothing else -- uv's
 # own default, stated here so it is not widened back to "allow". A blanket "allow" put
 # pydantic on a 2.14 alpha and omegaconf on a dev build, at runtime.
 prerelease = "if-necessary-or-explicit"

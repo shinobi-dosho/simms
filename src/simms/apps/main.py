@@ -3,11 +3,10 @@ from __future__ import annotations
 import os
 
 import click
-from shinobi.clickutil import build_options, unflatten_kwargs
-from shinobi.steps.dispatch import _dispatch
 
 from simms import BIN, __version__
 from simms.apps import primary_beam, skysim, telsim
+from simms.apps.schema import build_options
 from simms.exceptions import SimmsError
 
 
@@ -138,21 +137,13 @@ def _add_alias(opt, alias):
         opt.opts.append(alias)
 
 
-def _make_command(step, *, positional, chained, extra_options=()):
-    """Build a `click.Command` for a `@shinobi.pystep` StepRef.
+def _make_command(module, *, positional, chained, extra_options=()):
+    """Build a native Click command from the application's typed function."""
+    func = getattr(module, module.__name__.rsplit(".", 1)[-1] + "_impl")
+    command_name = module.__name__.rsplit(".", 1)[-1].replace("_", "-")
+    options = [opt for opt in build_options(module.inputs_model) if opt.name != "log_level"]
 
-    Options come from the step's pydantic ``inputs_model`` via shinobi's
-    ``build_options`` (choices, abbreviations, bool/list handling). The
-    ``log_level`` field is dropped -- the root group's ``--log-level``
-    controls it -- and the ``positional`` field is rendered as a
-    ``click.Argument`` (build_options only emits ``--options``), and any
-    field in ``FLAG_ALIASES`` gains a second long flag. The
-    callback re-nests the flat kwargs and dispatches the step in-process
-    via shinobi, exactly as ``shinobi.cli``'s ``run`` command does.
-    """
-    options = [opt for opt in build_options(step.step.inputs_model) if opt.name != "log_level"]
-
-    aliases = FLAG_ALIASES.get(step.step.name, {})
+    aliases = FLAG_ALIASES.get(command_name, {})
     for opt in options:
         if opt.name in aliases:
             _add_alias(opt, aliases[opt.name])
@@ -166,20 +157,19 @@ def _make_command(step, *, positional, chained, extra_options=()):
 
     def _callback(**raw):
         ctx = click.get_current_context()
-        kwargs = unflatten_kwargs(step.step.inputs_model, raw)
+        kwargs = {name: value for name, value in raw.items() if value is not None and value != ()}
         kwargs["log_level"] = ctx.obj["log_level"]
         if chained and ctx.obj["chain"]:
             kwargs["ms"] = ctx.obj["ms"]
-        result = _dispatch(step.step, step.func, **kwargs)
-        if not result.success:
-            raise click.ClickException(f"{step.step.name!r} failed (returncode {result.returncode}).")
+        validated = module.inputs_model(**kwargs)
+        return func(**{name: getattr(validated, name) for name in module.inputs_model.model_fields})
 
     cls = RemoveMSIfChained if chained else SimmsCommand
     return cls(
-        name=step.step.name,
+        name=command_name,
         params=params,
         callback=_callback,
-        help=step.step.info,
+        help=module.INFO,
         no_args_is_help=True,
     )
 
@@ -237,8 +227,6 @@ _list_option = click.Option(
     help="Displays a list of available telescope array layouts",
 )
 
-cli.add_command(
-    _make_command(telsim.telsim, positional="ms", chained=True, extra_options=[_list_option]), name=BIN.telsim
-)
-cli.add_command(_make_command(skysim.skysim, positional="ms", chained=True), name=BIN.skysim)
-cli.add_command(_make_command(primary_beam.primary_beam, positional="mode", chained=False), name=BIN.primary_beam)
+cli.add_command(_make_command(telsim, positional="ms", chained=True, extra_options=[_list_option]), name=BIN.telsim)
+cli.add_command(_make_command(skysim, positional="ms", chained=True), name=BIN.skysim)
+cli.add_command(_make_command(primary_beam, positional="mode", chained=False), name=BIN.primary_beam)

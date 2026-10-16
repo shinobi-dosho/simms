@@ -54,3 +54,29 @@ To build the documentation locally:
 along with the Sphinx extensions listed in ``pyproject.toml``. Read the Docs
 builds the same group, so adding a documentation dependency there is the only
 change needed.
+
+Optional workflow integration
+-----------------------------
+
+The native ``simms`` CLI and Python simulation code do not import Stimela Ninja.
+To use the Python steps in Ninja recipes or dosho, install the ``ninja`` extra:
+
+.. code-block:: console
+
+    $ uv pip install 'simms[ninja]'
+    $ ninja run simms.apps.telsim:telsim --help
+
+The existing ``simms.apps.telsim:telsim``, ``simms.apps.skysim:skysim`` and
+``simms.apps.primary_beam:primary_beam`` targets remain available. Accessing one
+loads its workflow adapter; without Ninja, it reports how to install the extra.
+Both command interfaces derive their options from the same typed functions.
+
+FITS support remains part of the base simms installation. The required
+``fitstoolz>=0.2.2`` keeps Stimela Ninja out of a base install. CI checks this
+in a fresh wheel installation.
+
+To run the optional workflow integration tests:
+
+.. code-block:: console
+
+    $ uv run --extra ninja --group tests python -m pytest tests/ninja_integration_tests.py

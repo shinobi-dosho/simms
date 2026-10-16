@@ -7,9 +7,9 @@ import pytest
 from astropy.coordinates import SkyCoord
 from daskms import xds_from_table
 from scipy.optimize import least_squares
-from shinobi.clickutil import build_options
 
-from simms.apps.telsim import _antenna_selection, telsim
+from simms.apps.schema import build_options
+from simms.apps.telsim import _antenna_selection, inputs_model
 from simms.telescope import array_utilities, layouts
 from simms.telescope.generate_ms import create_ms
 from simms.telescope.layouts import custom_telescopes
@@ -205,7 +205,7 @@ def test_pointing_table_is_per_antenna_per_time(params):
 
 
 def test_subarray_options_accept_comma_separated_and_repeated_forms():
-    # Both antenna-selection options document a comma-separated syntax, and shinobi renders
+    # Both antenna-selection options document a comma-separated syntax, and the CLI renders
     # them as click `multiple=True` options, so the repeated form arrives as a tuple. Accept
     # both, and flatten to the plain list the layout code expects.
     assert _antenna_selection(("M000,M005,M010",)) == ["M000", "M005", "M010"]
@@ -221,10 +221,9 @@ def test_subarray_options_accept_comma_separated_and_repeated_forms():
 
 
 def test_subarray_range_accepts_comma_separated_indices():
-    # Guards the `list[str | int]` annotation on subarray_range: shinobi picks the click type
-    # from the first int/float/bool/str leaf, so narrowing this to `list[int]` renders an
+    # Guards the string arm of subarray_range: narrowing this to `list[int]` renders an
     # INTEGER option and click rejects "0,9" before the value reaches _antenna_selection.
-    option = next(opt for opt in build_options(telsim.step.inputs_model) if opt.name == "subarray_range")
+    option = next(opt for opt in build_options(inputs_model) if opt.name == "subarray_range")
     assert option.multiple
     assert option.type is click.STRING
     assert option.type.convert("0,9", None, None) == "0,9"

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Annotated
+from typing import Annotated, Literal
 
-import shinobi
 from pydantic import BaseModel, BeforeValidator, Field
-from shinobi.steps.schema import ParamMeta
 
 from simms import BIN
+from simms.apps.schema import inputs_from_signature, optional_step
 from simms.utilities import set_dask_workers
 
 
@@ -88,82 +87,90 @@ def runit(opts) -> PrimaryBeamOutputs:
         raise RuntimeError(f"Unknown primary-beam mode {mode!r}.")
 
 
-@shinobi.pystep(
-    name=BIN.primary_beam, info="Primary-beam utilities (build/tag/apply/correct); no visibility simulation."
-)
-def primary_beam(
-    mode: Annotated[str, ParamMeta(choices=["to-fits", "tag-ms", "apply", "correct"])] = Field(
-        ..., description="Operation to perform."
-    ),
-    beam_pattern: Annotated[str | None, ParamMeta(abbreviation="bp")] = Field(
+def primary_beam_impl(
+    mode: Literal["to-fits", "tag-ms", "apply", "correct"] = Field(..., description="Operation to perform."),
+    beam_pattern: str | None = Field(
         None,
         description="Beam model: a cosine-taper CSV path, a built-in name, a band shorthand (L/UHF), or a FITS cube.",
+        json_schema_extra={"param_meta": {"abbreviation": "bp"}},
     ),
-    beam_band: Annotated[str, ParamMeta(choices=["UHF", "L"])] = Field(
+    beam_band: Literal["UHF", "L"] = Field(
         "L", description="Default band for a built-in beam when beam-pattern omits one."
     ),
     beam_pa_step: float = Field(
         1.0, description="Parallactic-angle sampling step (degrees) for the time-averaged beam."
     ),
-    fits_format: Annotated[str, ParamMeta(choices=["simms", "cattery"], abbreviation="ff")] = Field(
+    fits_format: Literal["simms", "cattery"] = Field(
         "simms",
         description="to-fits output layout: simms's own single-file 4-plane HH/VV cube, or "
         "the Cattery/DDFacet 8-file per-Jones-element schema (--Beam-Model FITS).",
+        json_schema_extra={"param_meta": {"abbreviation": "ff"}},
     ),
-    pol_basis: Annotated[str, ParamMeta(choices=["linear", "circular"], abbreviation="pol")] = Field(
+    pol_basis: Literal["linear", "circular"] = Field(
         "linear",
         description="Correlation basis for the cattery fits-format output (xx/xy/yx/yy vs "
         "rr/rl/lr/ll); must match the target MS's feed basis.",
+        json_schema_extra={"param_meta": {"abbreviation": "pol"}},
     ),
-    beam_l_axis: Annotated[str, ParamMeta(choices=["-X", "X"], abbreviation="bla")] = Field(
+    beam_l_axis: Literal["-X", "X"] = Field(
         "-X",
         description="Sign convention for the cattery fits-format L axis, matching DDFacet's "
         "--Beam-FITSLAxis (pass the same value to both).",
+        json_schema_extra={"param_meta": {"abbreviation": "bla"}},
     ),
-    beam_m_axis: Annotated[str, ParamMeta(choices=["Y", "-Y"], abbreviation="bma")] = Field(
+    beam_m_axis: Literal["Y", "-Y"] = Field(
         "Y",
         description="Sign convention for the cattery fits-format M axis, matching DDFacet's "
         "--Beam-FITSMAxis (pass the same value to both).",
+        json_schema_extra={"param_meta": {"abbreviation": "bma"}},
     ),
     ms: Annotated[list[str] | None, BeforeValidator(_as_list)] = Field(
         None,
         description="Measurement set supplying time/PA range, array position, frequencies and pointing centre. "
         "Required for tag-ms/apply/correct; repeat for every pointing in a mosaic.",
     ),
-    pointing_centre: Annotated[list[str] | None, BeforeValidator(_as_list), ParamMeta(abbreviation="pc")] = Field(
+    pointing_centre: Annotated[list[str] | None, BeforeValidator(_as_list)] = Field(
         None,
         description="Explicit mosaic pointing centre as 'frame,ra,dec' or 'ra,dec'; repeat for each pointing. "
         "The two-part form defaults to J2000. Requires one --ms whose time, location, mount and frequencies are "
         "reused for every centre (apply/correct).",
+        json_schema_extra={"param_meta": {"abbreviation": "pc"}},
     ),
-    mosaic_weight: Annotated[list[str | float] | None, BeforeValidator(_as_list), ParamMeta(abbreviation="mw")] = Field(
+    mosaic_weight: Annotated[list[str | float] | None, BeforeValidator(_as_list)] = Field(
         None,
         description="Relative inverse-variance/imaging weight for each mosaic pointing; repeat in the same order "
         "as --ms or --pointing-centre. Defaults to equal weights.",
+        json_schema_extra={"param_meta": {"abbreviation": "mw"}},
     ),
-    fits_sky: Annotated[str | None, ParamMeta(abbreviation="fits")] = Field(
-        None, description="Input FITS image sky model (apply/correct)."
+    fits_sky: str | None = Field(
+        None,
+        description="Input FITS image sky model (apply/correct).",
+        json_schema_extra={"param_meta": {"abbreviation": "fits"}},
     ),
-    ascii_sky: Annotated[str | None, ParamMeta(abbreviation="ascii")] = Field(
+    ascii_sky: str | None = Field(
         None,
         description="Input ASCII component sky model (apply/correct).",
+        json_schema_extra={"param_meta": {"abbreviation": "ascii"}},
     ),
-    ascii_delimiter: Annotated[str | None, ParamMeta(abbreviation="ad")] = Field(
+    ascii_delimiter: str | None = Field(
         None,
         description="Delimiter used in the ascii-sky file. Defaults to whitespace.",
+        json_schema_extra={"param_meta": {"abbreviation": "ad"}},
     ),
     source_schema: str | None = Field(
         None,
         description="Custom source schema (YAML) mapping the ascii-sky columns to the fields simms expects.",
     ),
-    output: Annotated[str | None, ParamMeta(abbreviation="o")] = Field(
+    output: str | None = Field(
         None,
         description="Output path - FITS beam (to-fits, or filename prefix when --fits-format cattery) "
         "or beamed/corrected sky model (apply/correct).",
+        json_schema_extra={"param_meta": {"abbreviation": "o"}},
     ),
-    telescope_name_column: Annotated[str, ParamMeta(abbreviation="tnc")] = Field(
+    telescope_name_column: str = Field(
         "TELESCOPE_NAME",
         description="ANTENNA-table column holding the per-antenna telescope/type label (tag-ms).",
+        json_schema_extra={"param_meta": {"abbreviation": "tnc"}},
     ),
     label: str | None = Field(None, description="Single telescope-name label applied to all antennas (tag-ms)."),
     label_map: str | None = Field(None, description="YAML mapping antenna NAME -> telescope-name label (tag-ms)."),
@@ -172,30 +179,46 @@ def primary_beam(
         description="simms layout whose per-antenna telescope_name is matched to the MS antenna names (tag-ms).",
     ),
     pb_cutoff: float = Field(0.1, description="In correct mode, blank (NaN) where the beam is below this level."),
-    field_id: Annotated[int, ParamMeta(abbreviation="fi")] = Field(
+    field_id: int = Field(
         0,
         description="FIELD_ID whose phase centre and time span define the beam (apply/correct).",
+        json_schema_extra={"param_meta": {"abbreviation": "fi"}},
     ),
     spw_id: int = Field(
         0, description="Spectral-window (DATA_DESC_ID) whose frequencies define the beam (apply/correct)."
     ),
     pixel_size: str = Field("1arcmin", description="Angular pixel size for the to-fits grid, e.g. '1arcmin'."),
     npix: int = Field(256, description="Number of pixels per side for the to-fits grid."),
-    start_freq: Annotated[str | None, ParamMeta(abbreviation="sf")] = Field(
+    start_freq: str | None = Field(
         None,
         description="Start frequency of the to-fits cube, e.g. '856MHz'. Defaults to the beam's first frequency.",
+        json_schema_extra={"param_meta": {"abbreviation": "sf"}},
     ),
-    chan_width: Annotated[str | None, ParamMeta(abbreviation="cw")] = Field(
+    chan_width: str | None = Field(
         None,
         description="Channel width of the to-fits cube, e.g. '10MHz'. "
         "Defaults to spanning the beam range across nchan.",
+        json_schema_extra={"param_meta": {"abbreviation": "cw"}},
     ),
-    nchan: Annotated[int | None, ParamMeta(abbreviation="nc")] = Field(
+    nchan: int | None = Field(
         None,
         description="Number of output channels in the to-fits cube. Defaults to the beam's channel count.",
+        json_schema_extra={"param_meta": {"abbreviation": "nc"}},
     ),
     nworkers: int = Field(4, description="Number of worker threads."),
     log_level: str = Field("INFO", description="Logging verbosity."),
 ) -> PrimaryBeamOutputs:
     opts = SimpleNamespace(**locals())
     return runit(opts)
+
+
+inputs_model = inputs_from_signature(primary_beam_impl)
+INFO = "Primary-beam utilities (build/tag/apply/correct); no visibility simulation."
+
+
+def __getattr__(name):
+    if name == "primary_beam":
+        step = optional_step(primary_beam_impl, name=BIN.primary_beam, info=INFO)
+        globals()[name] = step
+        return step
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
