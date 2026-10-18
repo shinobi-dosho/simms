@@ -12,6 +12,71 @@
   in research (a scholarly request, not a licence condition). The vendored
   katbeam beam tables keep their own BSD-3-Clause attribution.
 
+- **Stimela Ninja is now optional.** The `simms` CLI and the Python
+  simulation code no longer import it; install `simms[ninja]` to use the
+  `simms.apps.telsim:telsim`, `simms.apps.skysim:skysim` and
+  `simms.apps.primary_beam:primary_beam` steps in Ninja recipes or dosho.
+  Those targets keep their names and load their workflow adapter lazily;
+  without the extra they say how to install it. The CLI options are now
+  generated from the same typed app signatures. `fitstoolz` is required at
+  `>=0.2.2`, the first release that does not pull Ninja in itself, so a base
+  install is Ninja-free.
+
+- `primary-beam`: mosaic operations. Repeat `--ms` (or `--pointing-centre`)
+  once per pointing, and `apply`/`correct` use the weighted-RMS effective
+  response of a linear PB-aware mosaic. Weights default to equal; repeat
+  `--mosaic-weight` to give relative inverse-noise-variance or imaging weights
+  in pointing order. The beams page documents how this differs from
+  Montage/MosaicQueen's normalisation and cutoffs.
+
+- `skysim --mode add/subtract` now combines with `--column` by default.
+  **Behaviour change:** without `--input-column`, the arithmetic was skipped
+  and `--mode add` silently overwrote the column it was asked to add to.
+  `--input-column` now defaults to `--column` (and the choice is logged); a
+  missing input column raises instead of overwriting; and `--input-column`
+  with `--mode sim` warns that it is ignored.
+
+- ASCII sky models: one catalogue can hold line, transient and plain sources.
+  A `null`/`none`/`nan` (or, in a delimited file, empty) value leaves that
+  parameter off the row's source, so a mixed table no longer fails with a
+  `TypeError`. `transient_start` now defaults to seconds like the other
+  transient fields, and parse/validation errors name the file and line.
+
+- Beam centre: when `POINTING.DIRECTION` is unusable, the beam centre now
+  falls back through `FIELD.REFERENCE_DIR` and `FIELD.DELAY_DIR` before the
+  phase centre. On an MS rephased with `chgcentre`/`phaseshift` the beam was
+  previously centred on the new phase centre (a source 62.5' off the pointing
+  came out 50x too bright). Unchanged on an MS that has not been rephased.
+
+- The `POINTING` row is now chosen from the time span a run selects, not
+  always row 0, so each field of a multi-field or mosaic MS gets its own beam
+  centre. MSs without a usable `TIME` column still use row 0.
+
+- `primary-beam apply`/`correct` honour `ANTENNA.MOUNT`: the beam is averaged
+  over the parallactic-angle track only for an alt-az array (the standalone
+  tool always assumed alt-az). The first antenna's mount decides, with a
+  warning for a mixed array. Alt-az mounts are now matched by name (`ALT-AZ`,
+  `ALTAZ`, `AZEL`, `AZ-EL`, ignoring a `+NASMYTH` focus suffix) everywhere, not
+  by substring, and an unrecognised mount warns before falling back to
+  non-rotating. A missing `MOUNT` column now fails clearly in both
+  `primary-beam` and `skysim` instead of raising an `AttributeError`.
+
+- FITS beam cubes: `CUNIT` is honoured on the L/M and FREQ axes, so a cube in
+  radians no longer loads scaled by 180/pi. An absent `CUNIT` still means
+  degrees/Hz; one that is unparseable or measures the wrong quantity is an
+  error.
+
+- `primary-beam`: the `output` it reports is now the path actually written,
+  including a defaulted filename (previously `None`). For
+  `--fits-format cattery` it is the file prefix, and a new `files` output
+  lists every path written.
+
+- Beam tables: evaluating a band-tabulated beam outside its range (e.g. the
+  default L-band table on UHF channels) still clamps, but now warns once,
+  naming both ranges. The averaged power beam is evaluated in bounded slabs,
+  so the fallback skysim takes when the a-term cache exceeds
+  `--beam-grid-max-gib` no longer has unbounded memory use.
+
 - `skysim`: antenna pointing errors, via a new top-level `pointing:` block in
   the `--corruptions` YAML (on its own or beside `gains:`). Each antenna gets a
   static offset drawn from `N(0, static)` plus an optional sinusoidal drift
@@ -193,7 +258,8 @@
   terms draw from their own `--seed-gains`, so adding corruptions cannot change
   the noise realisation.
 - Packaging: dropped the `[tool.uv.sources]` GitHub-archive pin for
-  `stimela-ninja` and raised the floor to `>=0.1.0b7`. The pin originally
+  `stimela-ninja` and raised the floor to `>=0.1.0b7` (now the floor of the
+  optional `ninja` extra; see above). The pin originally
   existed for the CASA CI image's lack of a `git` binary, but it was also
   pinning an unreleased feature -- the `ParamMeta.abbreviation` fix
   (stimela-ninja#127) that the short CLI aliases (`-tel`, `-nt`, ...) need,
