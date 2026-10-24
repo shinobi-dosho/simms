@@ -98,18 +98,20 @@ def primary_beam_impl(
         "L", description="Default band for a built-in beam when beam-pattern omits one."
     ),
     beam_pa_step: float = Field(
-        1.0, description="Parallactic-angle sampling step (degrees) for the time-averaged beam."
+        1.0,
+        description="Parallactic-angle sampling step (degrees) for the time-averaged beam or WSClean a-term export.",
     ),
-    fits_format: Literal["simms", "cattery"] = Field(
+    fits_format: Literal["simms", "cattery", "wsclean"] = Field(
         "simms",
         description="to-fits output layout: simms's own single-file 4-plane HH/VV cube, or "
-        "the Cattery/DDFacet 8-file per-Jones-element schema (--Beam-Model FITS).",
+        "the Cattery/DDFacet 8-file per-Jones-element schema (--Beam-Model FITS), or a WSClean IDG "
+        "diagonal a-term cube and parset (requires one --ms).",
         json_schema_extra={"param_meta": {"abbreviation": "ff"}},
     ),
     pol_basis: Literal["linear", "circular"] = Field(
         "linear",
         description="Correlation basis for the cattery fits-format output (xx/xy/yx/yy vs "
-        "rr/rl/lr/ll); must match the target MS's feed basis.",
+        "rr/rl/lr/ll); must match the target MS's feed basis. WSClean export requires linear feeds.",
         json_schema_extra={"param_meta": {"abbreviation": "pol"}},
     ),
     beam_l_axis: Literal["-X", "X"] = Field(
@@ -127,7 +129,7 @@ def primary_beam_impl(
     ms: Annotated[list[str] | None, BeforeValidator(_as_list)] = Field(
         None,
         description="Measurement set supplying time/PA range, array position, frequencies and pointing centre. "
-        "Required for tag-ms/apply/correct; repeat for every pointing in a mosaic.",
+        "Required for tag-ms/apply/correct and WSClean to-fits; repeat for every pointing in a mosaic (apply/correct).",
     ),
     pointing_centre: Annotated[list[str] | None, BeforeValidator(_as_list)] = Field(
         None,
@@ -164,7 +166,7 @@ def primary_beam_impl(
     output: str | None = Field(
         None,
         description="Output path - FITS beam (to-fits, or filename prefix when --fits-format cattery) "
-        "or beamed/corrected sky model (apply/correct).",
+        "or beamed/corrected sky model (apply/correct). WSClean to-fits also writes an adjacent .parset.",
         json_schema_extra={"param_meta": {"abbreviation": "o"}},
     ),
     telescope_name_column: str = Field(
@@ -181,28 +183,32 @@ def primary_beam_impl(
     pb_cutoff: float = Field(0.1, description="In correct mode, blank (NaN) where the beam is below this level."),
     field_id: int = Field(
         0,
-        description="FIELD_ID whose phase centre and time span define the beam (apply/correct).",
+        description="FIELD_ID whose pointing and time span define the beam (apply/correct or WSClean to-fits).",
         json_schema_extra={"param_meta": {"abbreviation": "fi"}},
     ),
     spw_id: int = Field(
-        0, description="Spectral-window (DATA_DESC_ID) whose frequencies define the beam (apply/correct)."
+        0,
+        description="Spectral-window selection (DATA_DESC_ID) defining beam frequencies "
+        "(apply/correct or WSClean to-fits).",
     ),
     pixel_size: str = Field("1arcmin", description="Angular pixel size for the to-fits grid, e.g. '1arcmin'."),
     npix: int = Field(256, description="Number of pixels per side for the to-fits grid."),
     start_freq: str | None = Field(
         None,
-        description="Start frequency of the to-fits cube, e.g. '856MHz'. Defaults to the beam's first frequency.",
+        description="Start frequency of the to-fits cube, e.g. '856MHz'. Defaults to the beam's first frequency "
+        "(selected MS channels for WSClean).",
         json_schema_extra={"param_meta": {"abbreviation": "sf"}},
     ),
     chan_width: str | None = Field(
         None,
         description="Channel width of the to-fits cube, e.g. '10MHz'. "
-        "Defaults to spanning the beam range across nchan.",
+        "Defaults to spanning the beam range across nchan (selected MS range for WSClean).",
         json_schema_extra={"param_meta": {"abbreviation": "cw"}},
     ),
     nchan: int | None = Field(
         None,
-        description="Number of output channels in the to-fits cube. Defaults to the beam's channel count.",
+        description="Number of output channels in the to-fits cube. Defaults to the beam's channel count "
+        "(selected MS channels for WSClean).",
         json_schema_extra={"param_meta": {"abbreviation": "nc"}},
     ),
     nworkers: int = Field(4, description="Number of worker threads."),

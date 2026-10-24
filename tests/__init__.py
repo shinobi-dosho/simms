@@ -47,6 +47,7 @@ def skysim_opts(ms, ascii_sky=None, column="DATA", **overrides):
         "ascii_species": None,
         "ascii_delimiter": None,
         "primary_beam": None,
+        "aterm_config": None,
         "beam_band": "L",
         "beam_pa_step": 1.0,
         "beam_grid_max_gib": 4.0,

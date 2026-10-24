@@ -70,12 +70,20 @@ pinned release tag (`git diff v0.1.0b3..origin/main`), never against a local che
 - **casacore STRING columns are numpy `object` dtype**, written in one chunk
   (`da.from_array(values, chunks=n)`). Adding a *new* column to a standard subtable needs an
   explicit descriptor, e.g. `xds_to_table(..., "{ms}::ANTENNA", columns=[col], descriptor="mssubtable('ANTENNA')")`.
+  For direct `casacore.tables.table.putcol` calls, pass Python string lists instead;
+  the numpy-object rule is for daskms arrays, and the direct native converter can crash on them.
 
 ## Beam data
 
 Cosine-taper (`beams.py`) tables under `src/simms/skymodel/beam_data/`. The `MKAT-AA-*` model and its
 tables are vendored from katbeam (BSD-3-Clause) — keep that attribution in `beam_data/NOTICE`. The
 other tables ship as ordinary bundled package data.
+
+WSClean IDG diagonal FITS screens (`--aterm-config`) are already in sky coordinates:
+their celestial WCS is authoritative, and they must never receive the feed-frame
+parallactic rotation used by `BeamProvider`. Select time/frequency screens by nearest
+coordinate (TIME is MJD seconds), preserving ANTENNA-table row order; do not interpolate
+them through the ordinary PA beam grids or silently fall back to an averaged beam.
 
 ## Smearing
 

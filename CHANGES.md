@@ -1,5 +1,11 @@
 ### 3.0.2 -> unreleased
 
+- WSClean IDG diagonal a-term FITS screens can be exported with
+  `primary-beam to-fits --fits-format wsclean --ms ...` and imported with
+  `skysim --aterm-config ...`. Export writes a sky-frame time-dependent
+  voltage cube and companion parset; import preserves per-antenna complex
+  gains with nearest time/frequency selection across component and FITS skies.
+
 - **Licence: simms is now Apache-2.0, not GPL-3.0-only.** The project was
   relicensed from the GNU GPL v3 to the Apache License, Version 2.0 (`LICENSE`
   replaced; a `NOTICE` added; `pyproject.toml`, `CITATION.cff` and the docs

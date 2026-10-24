@@ -1166,6 +1166,10 @@ def _predict_fits_once(prepared, uvw, times, antenna1, antenna2, exposure, epsil
     nrow, nchan, ncorr = uvw.shape[0], prepared.chan_freqs.size, prepared.ncorr
 
     if prepared.aterm is not None:
+        from simms.skymodel.wsclean_aterms import ScreenATerm, predict_screen_block
+
+        if isinstance(prepared.aterm, ScreenATerm):
+            return predict_screen_block(prepared, uvw, times, antenna1, antenna2, epsilon, do_wgridding, nthreads)
         from simms.skymodel.aterms import predict_aterm_block
 
         return predict_aterm_block(prepared, uvw, times, antenna1, antenna2, epsilon, do_wgridding, nthreads)
