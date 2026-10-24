@@ -228,6 +228,10 @@ visibilities. It has four modes:
     the Cattery/DDFacet 8-file per-Jones-element schema that ``--Beam-Model
     FITS`` expects, in which case ``--pol-basis`` must match the target MS's feed
     basis (``linear`` for xx/xy/yx/yy, ``circular`` for rr/rl/lr/ll).
+    ``--fits-format wsclean`` writes a diagonal IDG a-term cube and an adjacent
+    ``.parset`` configuration. This format requires exactly one ``--ms`` and
+    linear correlations; the selected MS supplies the pointing, time span,
+    antenna mounts and default frequencies.
 
 ``tag-ms``
     Write the per-antenna telescope/type labels into the ``ANTENNA`` table
@@ -319,6 +323,98 @@ visibilities. It has four modes:
     behaviour, use the imager's own PB product; to apply a beam during prediction,
     use ``skysim --primary-beam``, which works per channel and needs no spectral
     fit.
+
+WSClean IDG screen import and export
+--------------------------------------
+
+The `WSClean IDG a-term format
+<https://wsclean.readthedocs.io/en/latest/idg_a_term_correction.html>`_ stores
+direction-dependent gains on a sky grid. simms supports its **diagonal Jones**
+FITS screens for both export and visibility prediction. TEC, position-shift
+(``dldm``), built-in telescope beams and fitted solution terms are not supported
+through this interface.
+
+Export the selected analytic beam for an observation:
+
+.. code-block:: console
+
+    $ simms primary-beam to-fits --fits-format wsclean --ms obs.ms \
+        --beam-pattern L --npix 128 --pixel-size 2arcmin --output beam.fits
+
+This writes ``beam.fits`` and ``beam.parset``. The parset names the FITS file
+with an absolute path, so it can be passed to either tool from another working
+directory. ``PrimaryBeamOutputs.output`` remains the FITS path, and ``files``
+lists both artifacts. The parset has the following structure:
+
+.. code-block:: ini
+
+    aterms = [diagonal]
+    diagonal.images = [/absolute/path/to/beam.fits]
+
+WSClean's parset list syntax does not support quoting or escaping filenames;
+export paths must avoid whitespace, list delimiters, comment characters,
+quotes and backslashes.
+
+The FITS axis order is RA, DEC, MATRIX, ANTENNA, FREQ, TIME. MATRIX contains
+real XX, imaginary XX, real YY and imaginary YY **voltage** gains. Frequency is
+in Hz and time is in MS seconds (MJD multiplied by 86400). The sky projection
+is SIN, centred on the antenna pointing. ``--beam-pa-step`` controls a uniform
+time grid fine enough to sample the parallactic-angle track. Alt-az antennas
+rotate with that track; fixed mounts do not. Export retains a plane for every
+MS antenna in table order, including identical responses: WSClean 3.6's
+diagonal reader requires the full antenna count.
+An entirely fixed array needs only one time plane. The exporter streams image
+slabs rather than holding the complete time-dependent cube in memory.
+
+For screen import and export, ``--spw-id`` selects the MS ``DATA_DESC_ID``:
+its row in ``DATA_DESCRIPTION`` identifies the spectral window and polarization
+setup, whose row numbers may differ from the data-description ID.
+
+The default frequency grid comes from the selected MS channels. The linear
+FITS axis requires uniform spacing; supply ``--start-freq``, ``--chan-width``
+and ``--nchan`` to resample a nonuniform band or choose a coarser grid. The
+export uses the explicitly selected ``--beam-pattern`` for every antenna;
+telescope-specific beam models are not selected automatically.
+
+Use the configuration in WSClean, which requires four MS correlations for IDG:
+
+.. code-block:: console
+
+    $ wsclean -gridder idg -idg-mode cpu -aterm-config beam.parset \
+        -size 512 512 -scale 30asec -name image obs.ms
+
+Or import the same screens into simms:
+
+.. code-block:: console
+
+    $ simms skysim --ascii-sky intrinsic.txt --aterm-config beam.parset \
+        --column DATA obs.ms
+
+``--aterm-config`` supports ASCII and WSClean component skies and every FITS
+prediction backend. It applies the per-antenna gains as
+:math:`V' = J_p V J_q^H`, before post-prediction gain corruptions and thermal
+noise. It requires standard linear correlations and cannot be combined with
+``--primary-beam``, pointing-error corruptions, ``--beam-jones full`` or
+``--fits-beam-mode average``.
+
+Import selects the **nearest** supplied time and frequency, using the earlier
+time or lower frequency on a tie and the edge screen outside the supplied
+range. It interpolates complex gains bilinearly in sky position. Screen WCS
+coordinates are authoritative even when their centre differs from the MS
+phase or pointing centre; no further parallactic rotation is applied.
+An ANTENNA dimension of one broadcasts to all antennas; otherwise its size
+must match the whole MS ANTENNA table. The TIME axis may be omitted for a
+constant screen. A list of image files may cover separate time ranges with
+gaps, provided their spatial, antenna and frequency grids agree; duplicate
+timestamps and mixtures of timeless and timed files are rejected. Relative
+image paths resolve from the parset directory.
+
+The ``window`` option in a diagonal parset is accepted as an IDG gridding
+control. simms samples the original screen; it does not reproduce IDG's
+windowed low-pass resampling onto its subgrid. Gains are zero outside spatial
+coverage, so pad screens beyond the sky/image footprint, including WSClean's
+image padding. Use enough frequency and time samples to resolve variation;
+nearest-screen selection does not interpolate between them.
 
 Examples
 --------

@@ -2,8 +2,8 @@
 
 Four modes, none of which run a visibility simulation:
 
-* ``to_fits``: sample an analytic cosine-taper beam onto a FITS beam cube, in either
-  simms' own single-file layout or the Cattery/DDFacet 8-file ``--Beam-Model FITS`` schema.
+* ``to_fits``: sample an analytic cosine-taper beam onto a FITS beam cube, in simms'
+  own layout, the Cattery/DDFacet 8-file schema, or WSClean's time-dependent IDG format.
 * ``tag_ms``: write the per-antenna telescope-name column onto an existing MS.
 * ``apply``/``correct``: multiply / divide a sky model (FITS image or ASCII components) by
   the parallactic-angle-averaged Stokes-I power beam ``A(l, m, nu)``. The beam narrows across
@@ -344,6 +344,109 @@ def _angular_separation(ra1, dec1, ra2, dec2):
 # --------------------------------------------------------------------- to-fits
 
 
+def _to_fits_wsclean(opts, beam, pixel_rad, npix):
+    """Export sky-frame screens using one MS's actual pointing and antenna mounts."""
+    from pathlib import Path
+
+    import dask
+    from casacore.tables import table
+    from daskms import xds_from_ms
+
+    from simms.apps.skysim import _corr_basis
+    from simms.skymodel.beams import (
+        array_lonlat,
+        is_altaz_mount,
+        pa_sample_grid,
+        read_pointing_centre,
+        warn_unknown_mounts,
+        write_beam_fits_wsclean,
+    )
+    from simms.telescope.generate_ms import parse_frequency
+
+    paths = _ms_paths(opts.ms)
+    if len(paths) != 1:
+        raise RuntimeError("--fits-format wsclean requires exactly one --ms.")
+    if opts.pol_basis != "linear":
+        raise RuntimeError("--fits-format wsclean requires --pol-basis linear.")
+    if opts.pointing_centre or opts.mosaic_weight:
+        raise RuntimeError("WSClean to-fits takes its pointing from --ms; mosaic options apply to apply/correct.")
+    if not np.isfinite(opts.beam_pa_step) or opts.beam_pa_step <= 0:
+        raise ValueError("WSClean export requires a finite, positive --beam-pa-step.")
+    ms = paths[0]
+    # DATA_DESC_ID selects both the spectral window and its polarization row;
+    # neither ID is necessarily the position of an xds partition in a list.
+    with table(f"{ms}::DATA_DESCRIPTION", ack=False) as dd:
+        spw_id = int(dd.getcell("SPECTRAL_WINDOW_ID", int(opts.spw_id)))
+        pol_id = int(dd.getcell("POLARIZATION_ID", int(opts.spw_id)))
+    with table(f"{ms}::POLARIZATION", ack=False) as pol:
+        basis = _corr_basis(pol.getcell("CORR_TYPE", pol_id).tolist(), what="WSClean a-term export")
+    if basis != "linear":
+        raise RuntimeError("WSClean diagonal a-term export requires an MS with linear correlations.")
+    with table(f"{ms}::ANTENNA", ack=False) as ant:
+        if "MOUNT" not in ant.colnames():
+            raise RuntimeError("The ANTENNA table has no MOUNT column; WSClean export needs per-antenna mounts.")
+        mounts, positions = ant.getcol("MOUNT"), ant.getcol("POSITION")
+    warn_unknown_mounts(mounts)
+    antenna_is_altaz = np.array([is_altaz_mount(mount) for mount in mounts], dtype=bool)
+    with table(f"{ms}::SPECTRAL_WINDOW", ack=False) as spw:
+        ms_freqs = np.asarray(spw.getcell("CHAN_FREQ", spw_id), dtype=np.float64)
+    with table(f"{ms}::FIELD", ack=False) as field:
+        phase_ra0, phase_dec0 = field.getcell("PHASE_DIR", int(opts.field_id))[0]
+    selected = xds_from_ms(
+        ms,
+        columns=["TIME"],
+        group_cols=[],
+        taql_where=f"FIELD_ID=={int(opts.field_id)} && DATA_DESC_ID=={int(opts.spw_id)}",
+    )
+    if not selected or selected[0].sizes["row"] == 0:
+        raise RuntimeError("No MS rows match the selected --field-id and --spw-id for WSClean export.")
+    t0, t1 = (float(t) for t in dask.compute(selected[0].TIME.data.min(), selected[0].TIME.data.max()))
+    ra0, dec0 = read_pointing_centre(ms, phase_ra0, phase_dec0, opts.field_id, time_range=(t0, t1))
+    if np.any(antenna_is_altaz) and t1 > t0:
+        lon, lat = array_lonlat(positions)
+        times, chi = pa_sample_grid(t0, t1 - t0, ra0, dec0, lon, lat, opts.beam_pa_step)
+    else:
+        times = np.array([t0])
+        if np.any(antenna_is_altaz):
+            from simms.skymodel.beams import parallactic_angle
+
+            lon, lat = array_lonlat(positions)
+            chi = parallactic_angle(times, ra0, dec0, lon, lat)
+        else:
+            chi = np.zeros(1)
+
+    if any(value is not None for value in (opts.start_freq, opts.chan_width, opts.nchan)):
+        nchan = int(opts.nchan) if opts.nchan is not None else ms_freqs.size
+        if nchan < 1:
+            raise ValueError("WSClean export requires --nchan to be at least 1.")
+        start = parse_frequency(opts.start_freq, "start-freq") if opts.start_freq else ms_freqs[0]
+        if opts.chan_width:
+            freqs = start + np.arange(nchan) * parse_frequency(opts.chan_width, "chan-width")
+        else:
+            freqs = np.linspace(start, ms_freqs[-1], nchan) if nchan > 1 else np.array([start])
+    else:
+        freqs = ms_freqs
+    if freqs.size > 2 and not np.allclose(np.diff(freqs), freqs[1] - freqs[0], rtol=1e-8, atol=1e-6):
+        raise ValueError(
+            "The selected MS frequencies are not uniformly spaced. WSClean export needs a linear FREQ axis; "
+            "supply --start-freq, --chan-width and --nchan for a uniform output grid."
+        )
+    if opts.beam_l_axis != "-X" or opts.beam_m_axis != "Y":
+        log.warning("--beam-l-axis/--beam-m-axis only apply to --fits-format cattery; ignored for 'wsclean'.")
+    output = str(opts.output or "beam.fits")
+    config = str(Path(output).with_suffix(".parset")) if output.lower().endswith(".fits") else output + ".parset"
+    image_path = str(Path(output).resolve())
+    if any(char.isspace() or char in "[],#\"'\\" for char in image_path):
+        raise ValueError(
+            "WSClean parset image paths cannot contain whitespace, list delimiters, comments, quotes or backslashes; "
+            "choose another --output path."
+        )
+    write_beam_fits_wsclean(beam, npix, pixel_rad, freqs, times, chi, antenna_is_altaz, ra0, dec0, output)
+    Path(config).write_text(f"aterms = [diagonal]\ndiagonal.images = [{image_path}]\n")
+    log.info("Wrote WSClean diagonal a-term cube %s and configuration %s", output, config)
+    return output, [output, config]
+
+
 def to_fits(opts):
     """Write the beam as FITS and return ``(handle, files)``.
 
@@ -367,6 +470,9 @@ def to_fits(opts):
     pixel_rad = Angle(opts.pixel_size).to_value("rad")
     npix = int(opts.npix)
     grid = (np.arange(npix) - npix // 2) * pixel_rad  # direction cosines, centred at 0
+
+    if opts.fits_format == "wsclean":
+        return _to_fits_wsclean(opts, beam, pixel_rad, npix)
 
     # Uniform frequency grid (the FITS FREQ axis is linear and the model is continuous in
     # frequency, so a uniform resample loses nothing). Defaults follow the beam's table.

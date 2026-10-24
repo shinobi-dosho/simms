@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import dask.array as da
 import numpy as np
-from daskms import xds_from_ms, xds_from_table
+from daskms import xds_from_ms
 
 from simms import BIN
 from simms.constants import FWHM_TO_GAUSS_SCALE
@@ -102,7 +102,7 @@ def vis_noise_from_sefd_and_ms(ms: str, sefd: float, spw_id: int = 0, field_id: 
     sefd : float
         Antenna System Equivalent Flux Density in Jy.
     spw_id : int, optional
-        DATA_DESC_ID (spectral window) to use. Default is 0.
+        DATA_DESC_ID to use; its DATA_DESCRIPTION row selects the spectral window. Default is 0.
     field_id : int, optional
         FIELD_ID to filter rows. Default is 0.
 
@@ -111,10 +111,23 @@ def vis_noise_from_sefd_and_ms(ms: str, sefd: float, spw_id: int = 0, field_id: 
     float
         RMS noise per visibility (Jy).
     """
-    spw_ds = xds_from_table(f"{ms}::SPECTRAL_WINDOW")[0]
-    msds = xds_from_ms(ms, group_cols=["DATA_DESC_ID"], taql_where=f"FIELD_ID=={field_id}")[spw_id]
+    from casacore.tables import table
 
-    df = spw_ds.CHAN_WIDTH.data[spw_id][0]
+    # DATA_DESC_ID is a row in DATA_DESCRIPTION, not a partition position or
+    # necessarily the spectral-window row. Read the authoritative mapping.
+    with table(f"{ms}::DATA_DESCRIPTION", ack=False) as dd:
+        spectral_window_id = int(dd.getcell("SPECTRAL_WINDOW_ID", int(spw_id)))
+    with table(f"{ms}::SPECTRAL_WINDOW", ack=False) as spw:
+        df = float(spw.getcell("CHAN_WIDTH", spectral_window_id)[0])
+    selected = xds_from_ms(
+        ms,
+        columns=["EXPOSURE"],
+        group_cols=[],
+        taql_where=f"FIELD_ID=={int(field_id)} && DATA_DESC_ID=={int(spw_id)}",
+    )
+    if not selected or selected[0].sizes["row"] == 0:
+        raise ValueError(f"No MS rows match FIELD_ID {field_id} and DATA_DESC_ID {spw_id} for thermal noise.")
+    msds = selected[0]
     dt = msds.EXPOSURE.data[0]
     # Reduce to a plain float here. A lazy dask scalar would otherwise be carried
     # into every predict task, where evaluating it re-opens the MS.
@@ -269,6 +282,7 @@ class PreparedSky:
     polarisation: bool
     # Primary-beam fields, all None/False unless a beam is attached (see attach_beam).
     beam_enabled: bool = False
+    beam_time_mode: str = "linear"  # Imported sky screens select nearest actual TIME.
     beam_full_jones: bool = False  # True -> beam_grid is (...,2,2) and predict_vis_jones is used
     ant_type: np.ndarray | None = None
     beam_grid: np.ndarray | None = None  # (ntype, n_pa, nsrc, nchan, 2[, 2]) complex
@@ -845,13 +859,20 @@ def predict_block(
         # Map each row's timestamp to its position on the (time-uniform) PA grid and
         # interpolate between the two bracketing samples.
         tgrid = prepared.tgrid
-        dt = tgrid[1] - tgrid[0]
-        if dt > 0:
-            gpos = np.clip((np.asarray(times, dtype=np.float64) - tgrid[0]) / dt, 0.0, tgrid.size - 1)
+        if prepared.beam_time_mode == "nearest":
+            from simms.skymodel.wsclean_aterms import nearest_indices
+
+            index = nearest_indices(tgrid, times)
+            pa_lo = np.minimum(index, tgrid.size - 2)
+            pa_wt = (index - pa_lo).astype(np.float64)
         else:
-            gpos = np.zeros(nrow, dtype=np.float64)  # degenerate (zero-span) grid
-        pa_lo = np.clip(np.floor(gpos).astype(np.int64), 0, tgrid.size - 2)
-        pa_wt = np.clip(gpos - pa_lo, 0.0, 1.0)
+            dt = tgrid[1] - tgrid[0]
+            if dt > 0:
+                gpos = np.clip((np.asarray(times, dtype=np.float64) - tgrid[0]) / dt, 0.0, tgrid.size - 1)
+            else:
+                gpos = np.zeros(nrow, dtype=np.float64)
+            pa_lo = np.clip(np.floor(gpos).astype(np.int64), 0, tgrid.size - 2)
+            pa_wt = np.clip(gpos - pa_lo, 0.0, 1.0)
         a1 = np.ascontiguousarray(antenna1)
         a2 = np.ascontiguousarray(antenna2)
         common = (

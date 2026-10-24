@@ -1470,6 +1470,82 @@ def write_beam_fits(beam: CosineTaperBeam, l_grid, m_grid, freqs_hz, path):
     fits.PrimaryHDU(data=data, header=hdr).writeto(path, overwrite=True)
 
 
+def write_beam_fits_wsclean(beam, npix, pixel_rad, freqs_hz, times, chi, antenna_is_altaz, ra0, dec0, path):
+    """Stream diagonal sky-frame Jones screens in WSClean's IDG FITS layout.
+
+    FITS axes are RA, DEC, MATRIX, ANTENNA, FREQ, TIME; MATRIX contains
+    Re XX, Im XX, Re YY, Im YY. Times use MS seconds (MJD * 86400).
+    Antenna planes retain MS antenna order, including identical responses:
+    WSClean 3.6 requires the full antenna count for diagonal screens. Only one
+    time/frequency/antenna slab is evaluated at once.
+    """
+    from contextlib import closing
+
+    from astropy.io import fits
+
+    freqs_hz = np.atleast_1d(np.asarray(freqs_hz, dtype=np.float64))
+    times = np.atleast_1d(np.asarray(times, dtype=np.float64))
+    chi = np.atleast_1d(np.asarray(chi, dtype=np.float64))
+    antenna_is_altaz = np.atleast_1d(np.asarray(antenna_is_altaz, dtype=bool))
+    if npix < 1 or not np.isfinite(pixel_rad) or pixel_rad <= 0:
+        raise ValueError("WSClean export requires positive --npix and --pixel-size.")
+    if not np.isfinite([ra0, dec0]).all() or abs(dec0) > np.pi / 2:
+        raise ValueError("WSClean export requires a finite celestial pointing centre.")
+    if not antenna_is_altaz.size or times.size != chi.size or not np.isfinite(chi).all():
+        raise ValueError("WSClean export needs antenna mounts and one parallactic angle per time.")
+    for values, label in ((freqs_hz, "FREQ"), (times, "TIME")):
+        if not values.size or not np.isfinite(values).all():
+            raise ValueError(f"WSClean export requires finite, nonempty {label} coordinates.")
+        if values.size > 1:
+            delta = np.diff(values)
+            if delta[0] == 0 or not np.allclose(delta, delta[0], rtol=1e-8, atol=1e-6):
+                raise ValueError(f"WSClean export requires uniformly spaced, distinct {label} coordinates.")
+    if np.any(freqs_hz <= 0):
+        raise ValueError("WSClean export requires positive frequencies.")
+
+    # SIN projection intermediate coordinates are direction cosines scaled to
+    # degrees. Match the conventional negative RA / positive DEC pixel signs.
+    offset = (np.arange(npix) - npix // 2) * pixel_rad
+    ell, emm = np.meshgrid(-offset, offset)
+    if np.any(ell**2 + emm**2 >= 1):
+        raise ValueError("WSClean export grid extends outside the SIN projection hemisphere; reduce its size.")
+    provider = JimBeamProvider(beam)
+    mounts = antenna_is_altaz
+
+    hdr = fits.Header()
+    hdr["SIMPLE"], hdr["BITPIX"], hdr["NAXIS"] = True, -32, 6
+    for axis, size in enumerate((npix, npix, 4, mounts.size, freqs_hz.size, times.size), 1):
+        hdr[f"NAXIS{axis}"] = int(size)
+    for axis, ctype, crval, cdelt, crpix, unit in (
+        (1, "RA---SIN", np.degrees(ra0) % 360, -np.degrees(pixel_rad), npix // 2 + 1, "deg"),
+        (2, "DEC--SIN", np.degrees(dec0), np.degrees(pixel_rad), npix // 2 + 1, "deg"),
+        (3, "MATRIX", 0, 1, 1, None),
+        (4, "ANTENNA", 0, 1, 1, None),
+        (5, "FREQ", float(freqs_hz[0]), float(freqs_hz[1] - freqs_hz[0]) if freqs_hz.size > 1 else 1.0, 1, "Hz"),
+        (6, "TIME", float(times[0]), float(times[1] - times[0]) if times.size > 1 else 1.0, 1, "s"),
+    ):
+        hdr[f"CTYPE{axis}"] = ctype
+        hdr[f"CRVAL{axis}"], hdr[f"CDELT{axis}"], hdr[f"CRPIX{axis}"] = crval, cdelt, crpix
+        if unit:
+            hdr[f"CUNIT{axis}"] = unit
+    hdr["BUNIT"], hdr["RADESYS"], hdr["EQUINOX"] = "1", "FK5", 2000.0
+    # StreamingHDU requires an append-mode handle. Truncate it first so a rerun
+    # replaces the primary HDU instead of appending an image extension.
+    with open(path, "ab+") as stream:
+        stream.truncate(0)
+        with closing(fits.StreamingHDU(stream, hdr)) as hdu:
+            for angle in chi:
+                for freq in freqs_hz:
+                    for rotating in mounts:
+                        v = provider.voltage(ell.ravel(), emm.ravel(), [freq], [angle if rotating else 0.0])[0, :, 0]
+                        v = v.reshape(npix, npix, 2)
+                        hdu.write(
+                            np.stack((v[..., 0].real, v[..., 0].imag, v[..., 1].real, v[..., 1].imag)).astype(
+                                np.float32
+                            )
+                        )
+
+
 _VALID_AXIS_SIGNS = frozenset({"-X", "X", "-Y", "Y"})
 
 

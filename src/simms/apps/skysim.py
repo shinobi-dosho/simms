@@ -10,6 +10,7 @@ from typing import Literal
 import dask
 import dask.array as da
 import numpy as np
+from casacore.tables import table
 from daskms import xds_from_ms, xds_from_table, xds_to_table
 from pydantic import BaseModel, Field
 from tqdm.dask import TqdmCallback
@@ -377,6 +378,45 @@ class _BeamContext:
         )
 
 
+class _ScreenContext:
+    """Absolute-sky diagonal screens: antenna row IDs, with no mount/PA metadata."""
+
+    brightness_linear_basis = True
+    full_jones = False
+    basis = "linear"
+
+    def __init__(self, opts, ms, ra0, dec0):
+        from simms.skymodel.wsclean_aterms import DiagonalScreens
+
+        if opts.primary_beam:
+            raise RuntimeError("--aterm-config cannot be combined with --primary-beam.")
+        if opts.beam_jones == "full" or opts.fits_beam_mode == "average":
+            raise RuntimeError("--aterm-config requires diagonal Jones and --fits-beam-mode aterm.")
+        # DATA_DESCRIPTION is authoritative for the selected polarization row.
+        with table(f"{ms}::DATA_DESCRIPTION", ack=False) as dd:
+            pol_id = int(dd.getcell("POLARIZATION_ID", int(opts.spw_id)))
+        with table(f"{ms}::POLARIZATION", ack=False) as pol:
+            codes = pol.getcell("CORR_TYPE", pol_id)
+        if _corr_basis(np.asarray(codes).ravel(), "WSClean diagonal screens") != "linear":
+            raise RuntimeError("WSClean diagonal screens require standard linear correlations.")
+        nant = xds_from_table(f"{ms}::ANTENNA")[0].sizes["row"]
+        self.screens = DiagonalScreens.from_parset(opts.aterm_config, nant)
+        self.ra0, self.dec0 = ra0, dec0
+        self.max_gib = opts.beam_grid_max_gib
+
+    def attach(self, prepared, pointing=None):
+        from simms.skymodel.wsclean_aterms import attach_component_screens
+
+        if pointing is not None:
+            raise RuntimeError("--aterm-config cannot be combined with pointing-error corruptions.")
+        return attach_component_screens(prepared, self.screens, self.ra0, self.dec0, self.max_gib)
+
+    def attach_aterm(self, prepared, freq_tol):
+        from simms.skymodel.wsclean_aterms import attach_fits_screens
+
+        return attach_fits_screens(prepared, self.screens, self.ra0, self.dec0, self.max_gib)
+
+
 def runit(opts):
 
     # --seed only ever seeded the thermal noise, so it maps onto --seed-noise.
@@ -386,6 +426,7 @@ def runit(opts):
         if seed_noise is None:
             seed_noise = opts.seed
 
+    aterm_config = getattr(opts, "aterm_config", None)
     ms = opts.ms
     ascii_sky = opts.ascii_sky
     fs = opts.fits_sky
@@ -408,7 +449,16 @@ def runit(opts):
         group_cols=["DATA_DESC_ID"],
         taql_where=f"FIELD_ID=={opts.field_id}",
     )
-    nrows = xds_from_ms(ms, **ms_open, chunks=dict(row=opts.row_chunks))[opts.spw_id].UVW.data.shape[0]
+
+    def selected(datasets):
+        if not aterm_config:
+            return datasets[opts.spw_id]
+        for dataset in datasets:
+            if dataset.attrs.get("DATA_DESC_ID") == opts.spw_id:
+                return dataset
+        raise RuntimeError(f"No rows selected for DATA_DESC_ID {opts.spw_id} and FIELD_ID {opts.field_id}.")
+
+    nrows = selected(xds_from_ms(ms, **ms_open, chunks=dict(row=opts.row_chunks))).UVW.data.shape[0]
     row_chunks = auto_row_chunks(nrows, opts.nworkers, cap=opts.row_chunks)
     if row_chunks != opts.row_chunks:
         log.info(
@@ -417,18 +467,29 @@ def runit(opts):
             f"{-(-nrows // opts.row_chunks)}."
         )
 
-    msds = xds_from_ms(ms, **ms_open, chunks=dict(row=row_chunks))[opts.spw_id]
+    msds = selected(xds_from_ms(ms, **ms_open, chunks=dict(row=row_chunks)))
 
     vis_noise = vis_noise_from_sefd_and_ms(ms, opts.sefd, opts.spw_id, opts.field_id) if opts.sefd else 0
 
-    spw_ds = xds_from_table(f"{ms}::SPECTRAL_WINDOW")[0]
     field_ds = xds_from_table(f"{ms}::FIELD")[0]
-
-    radec0, freqs, chan_width = dask.compute(
-        field_ds.PHASE_DIR.data[opts.field_id],
-        spw_ds.CHAN_FREQ.data[opts.spw_id],
-        spw_ds.CHAN_WIDTH.data[opts.spw_id],
-    )
+    polarization_id = 0
+    if aterm_config:
+        # Selected cells may have different array lengths from unused table rows;
+        # a rectangular dask array cannot represent those variable-shaped columns.
+        with table(f"{ms}::DATA_DESCRIPTION", ack=False) as dd:
+            spectral_window_id = int(dd.getcell("SPECTRAL_WINDOW_ID", int(opts.spw_id)))
+            polarization_id = int(dd.getcell("POLARIZATION_ID", int(opts.spw_id)))
+        with table(f"{ms}::SPECTRAL_WINDOW", ack=False) as spw:
+            freqs = np.asarray(spw.getcell("CHAN_FREQ", spectral_window_id), dtype=np.float64)
+            chan_width = np.asarray(spw.getcell("CHAN_WIDTH", spectral_window_id), dtype=np.float64)
+        radec0 = field_ds.PHASE_DIR.data[opts.field_id].compute()
+    else:
+        spw_ds = xds_from_table(f"{ms}::SPECTRAL_WINDOW")[0]
+        radec0, freqs, chan_width = dask.compute(
+            field_ds.PHASE_DIR.data[opts.field_id],
+            spw_ds.CHAN_FREQ.data[opts.spw_id],
+            spw_ds.CHAN_WIDTH.data[opts.spw_id],
+        )
     dfreq = chan_width[0]
     ra0, dec0 = radec0[0][0], radec0[0][1]
     ncorr = msds.DATA.data.shape[-1]
@@ -446,9 +507,15 @@ def runit(opts):
             # diagonal/full terms map correlation index to feed index by
             # position, so they need the correlations in a standard order. A
             # scalar gain reaches every correlation alike and does not.
-            corr_type = xds_from_table(f"{ms}::POLARIZATION")[0].CORR_TYPE.data[0].compute()
+            if aterm_config:
+                with table(f"{ms}::POLARIZATION", ack=False) as pol:
+                    corr_type = pol.getcell("CORR_TYPE", polarization_id)
+            else:
+                corr_type = xds_from_table(f"{ms}::POLARIZATION")[0].CORR_TYPE.data[0].compute()
             _corr_basis(list(np.asarray(corr_type).ravel()), what="Non-scalar RIME corruptions")
     if spec is not None and spec.pointing is not None:
+        if aterm_config:
+            raise RuntimeError("--aterm-config cannot be combined with pointing-error corruptions.")
         if not ascii_sky:
             raise RuntimeError(
                 "Pointing errors are only supported for --ascii-sky in this version "
@@ -483,7 +550,11 @@ def runit(opts):
     has_sky = bool(ascii_sky or wsclean_sky or fs)
     if opts.primary_beam and not has_sky:
         log.warning("--primary-beam is set but no sky model was given; the primary beam is ignored.")
-    beam_ctx = _BeamContext(opts, ms, msds, ra0, dec0, ncorr) if opts.primary_beam and has_sky else None
+    if aterm_config:
+        # Validate even a noise-only invocation before scheduling any MS writes.
+        beam_ctx = _ScreenContext(opts, ms, ra0, dec0)
+    else:
+        beam_ctx = _BeamContext(opts, ms, msds, ra0, dec0, ncorr) if opts.primary_beam and has_sky else None
 
     # Primary-beam handling for the FITS-image path. The default ('aterm') applies exact
     # per-antenna a-terms; diagonal per-feed beams cannot represent circular correlations,
@@ -660,7 +731,7 @@ def runit(opts):
             from simms.skymodel.aterms import aterm_cache_min_gib
 
             needed = aterm_cache_min_gib(prepared.npix_l, prepared.npix_m, beam_ctx.full_jones)
-            if needed > opts.beam_grid_max_gib:
+            if needed > opts.beam_grid_max_gib and not aterm_config:
                 log.warning(
                     "A-term beams need a %.2f GiB voltage-map cache for this %dx%d image, above the "
                     "%.2f GiB --beam-grid-max-gib ceiling; falling back to the PA-averaged power beam "
@@ -786,8 +857,14 @@ def runit(opts):
             # the subtable into one dataset per distinct channel count, so an MS
             # whose SPWs differ in width would otherwise reference only some of
             # its bandwidth.
-            spw_dss = xds_from_table(f"{ms}::SPECTRAL_WINDOW")
-            ms_freq0 = float(min(dask.compute(*[sds.CHAN_FREQ.data.min() for sds in spw_dss])))
+            if aterm_config:
+                # Preserve the whole-MS gain phase origin even when unused SPWs
+                # have different channel counts from the selected window.
+                with table(f"{ms}::SPECTRAL_WINDOW", ack=False) as spw:
+                    ms_freq0 = float(min(np.min(spw.getcell("CHAN_FREQ", row)) for row in range(spw.nrows())))
+            else:
+                spw_dss = xds_from_table(f"{ms}::SPECTRAL_WINDOW")
+                ms_freq0 = float(min(dask.compute(*[sds.CHAN_FREQ.data.min() for sds in spw_dss])))
 
             simvis = apply_corruptions(
                 simvis,
@@ -943,6 +1020,11 @@ def skysim_impl(
         "circular-correlation MS may be used when --beam-jones full is selected.",
         json_schema_extra={"param_meta": {"abbreviation": "pb"}},
     ),
+    aterm_config: str | None = Field(
+        None,
+        description="WSClean IDG parset containing one diagonal FITS a-term; nearest time/frequency, "
+        "bilinear absolute-sky sampling with zero outside coverage. Mutually exclusive with --primary-beam.",
+    ),
     beam_band: Literal["UHF", "L"] = Field(
         "L", description="Default band for JimBeam entries that omit an explicit model/CSV."
     ),
@@ -1012,7 +1094,11 @@ def skysim_impl(
         json_schema_extra={"param_meta": {"abbreviation": "sss"}},
     ),
     field_id: int = Field(0, description="Field ID.", json_schema_extra={"param_meta": {"abbreviation": "fi"}}),
-    spw_id: int = Field(0, description="Spectral Window ID."),
+    spw_id: int = Field(
+        0,
+        description="Spectral Window ID. With --aterm-config, this is a DATA_DESC_ID selecting "
+        "its spectral window and polarization.",
+    ),
     sefd: float | None = Field(None, description="Add noise using this SEFD value."),
     seed_noise: int | None = Field(
         None,
