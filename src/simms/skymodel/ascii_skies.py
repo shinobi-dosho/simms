@@ -101,6 +101,7 @@ class SkymodelParameter:
 class ASCIISourceSchema:
     info: str
     parameters: dict[str, SkymodelParameter]
+    catalogue_format: str | None = None
 
     def __post_init__(self):
         # SkymodelParameter is a dataclass whose every field has a default, so constructing
@@ -415,60 +416,84 @@ class ASCIISkymodel:
         alias_to_field = dummy_source.alias_to_field_mapper()
 
         with open(self.skymodel_file) as stdr:
-            line = stdr.readline().strip()
+            lines = list(stdr)
+        header_index, header, native, reference_frequency = self._read_header(lines)
+        unknown = [key for key in header if key not in alias_to_field]
+        if unknown and not native:
+            raise ASCIISkymodelError(
+                f"ASCII sky model header has unknown fields {unknown}."
+                f" Known fields/aliases are: {sorted(alias_to_field.keys())}"
+            )
+        try:
+            point_source.is_valid(
+                fields=[alias_to_field[key] for key in header if key in alias_to_field], raise_exception=True
+            )
+        except ASCIISourceError as exc:
+            raise ASCIISkymodelError(f"ASCII sky model file header is missing required fields: {exc}") from exc
 
-            if not line.startswith("#format:"):
-                raise ASCIISkymodelError("ASCII sky model needs to have a header starting with the string #format:")
-
-            header = line.strip().replace("#format:", "").strip().split(self.delimiter)
-
-            unknown = [key for key in header if key not in alias_to_field]
-            if unknown:
+        for counter in range(header_index + 1, len(lines)):
+            line = lines[counter].strip()
+            if not line or line.startswith("#"):
+                continue
+            rowdata = line.split(self.delimiter)
+            if len(rowdata) != len(header):
                 raise ASCIISkymodelError(
-                    f"ASCII sky model header has unknown fields {unknown}."
-                    f" Known fields/aliases are: {sorted(alias_to_field.keys())}"
+                    f"The number of columns in row {counter + 1} does not match the number of columns in the header"
                 )
-
+            source = ASCIISource(self.schema)
             try:
-                point_source.is_valid(fields=[alias_to_field[key] for key in header], raise_exception=True)
-            except ASCIISourceError as exc:
-                raise ASCIISkymodelError(f"ASCII Sky model file header is missig required fields: {exc}") from exc
-
-            for counter, line in enumerate(stdr.readlines()):
-                # skip lines that are commented
-                if line.startswith("#"):
-                    continue
-                # skip empty lines before splitting: "".split(",") is [""], not [],
-                # so a blank line in a delimited file would fail the column count
-                if not line.strip():
-                    continue
-                rowdata = line.strip().split(self.delimiter)
-                if len(rowdata) != len(header):
-                    # plus 2 because header line is not counted (+1), and python starts counting at 0 (+1)
-                    raise ASCIISkymodelError(
-                        f"The number of columns in row {counter + 2} rows does not match the number of"
-                        " the number of columns in the header"
-                    )
-
-                source = ASCIISource(self.schema)
-                try:
-                    for param, value in zip(header, rowdata, strict=True):
+                for param, value in zip(header, rowdata, strict=True):
+                    if param in alias_to_field:
                         source.set_source_param(alias_to_field[param], value)
-                    # source has been fully set, finalise and add it to rest of the sources
-                    source.finalise()
-                except (ASCIISourceError, SkymodelSchemaError, ValueError, aunits.UnitsError) as exc:
-                    # Point at the offending row: the parse and validation errors name a
-                    # field but not which source it came from, which is useless in a
-                    # catalogue of thousands. Re-raise the same type so callers that
-                    # discriminate on ASCIISourceError still see it.
-                    raise type(exc)(f"{self.skymodel_file}, line {counter + 2}: {exc}") from exc
-                # Record the source's line index in the file (header is line 0, so the first
-                # data line -- counter 0 -- is line 1). Lets consumers map a parsed source back
-                # to its original text line without re-deriving the comment/blank-line skips.
-                source.lineno = counter + 1
-                sources.append(source)
+                if self.schema.catalogue_format == "pybdsf":
+                    if reference_frequency is not None and "cont_reffreq" not in source.existing_fields:
+                        source.set_source_param("cont_reffreq", reference_frequency)
+                    # Single-frequency PyBDSF output has no Spec_Indx column.
+                    if "cont_coeff_1" not in source.existing_fields:
+                        source.set_source_param("cont_coeff_1", 0.0)
+                    coeffs = source.continuum_coefficients()
+                    freq = getattr(source, "cont_reffreq", None)
+                    if any(not np.isfinite(c) for c in coeffs):
+                        raise ASCIISourceError("PyBDSF spectral coefficients must be finite")
+                    if any(c != 0 for c in coeffs) and (freq is None or not np.isfinite(freq) or freq <= 0):
+                        raise ASCIISourceError(
+                            "PyBDSF nonzero spectral coefficients require a positive reference frequency"
+                        )
+                source.finalise()
+            except (ASCIISourceError, SkymodelSchemaError, ValueError, aunits.UnitsError) as exc:
+                raise type(exc)(f"{self.skymodel_file}, line {counter + 1}: {exc}") from exc
+            # Zero-based physical line index, including native catalogue preambles.
+            source.lineno = counter
+            sources.append(source)
 
         self.sources = sources
+
+    def _read_header(self, lines):
+        """Read Simms headers, or the commented table header of native PyBDSF ASCII."""
+        reference_frequency = None
+        pybdsf = self.schema.catalogue_format == "pybdsf"
+        for index, raw in enumerate(lines):
+            line = raw.strip()
+            if line.startswith("#format:"):
+                return index, line.removeprefix("#format:").strip().split(self.delimiter), False, reference_frequency
+            if not pybdsf:
+                break
+            if line.startswith("# Reference frequency"):
+                try:
+                    reference_frequency = aunits.Quantity(line.partition(":")[2].strip()).to_value("Hz")
+                    if not np.isfinite(reference_frequency) or reference_frequency <= 0:
+                        raise ValueError("frequency must be finite and positive")
+                except (ValueError, TypeError, aunits.UnitsError) as exc:
+                    raise ASCIISkymodelError(f"Invalid PyBDSF reference frequency at line {index + 1}: {line}") from exc
+            fields = line.removeprefix("#").strip().split(self.delimiter)
+            if line.startswith("#") and {"RA", "DEC", "Total_flux"}.issubset(fields):
+                return index, fields, True, reference_frequency
+            if line and not line.startswith("#"):
+                break
+        raise ASCIISkymodelError(
+            "ASCII sky model needs a header starting with #format:"
+            + (" or a native PyBDSF commented column header" if pybdsf else "")
+        )
 
     def _has_source_type(self, source_type: str):
         has_it = False

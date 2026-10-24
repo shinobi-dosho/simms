@@ -609,8 +609,8 @@ def test_pybdsf_gaul_schema_parsing(params):
     schema_path = os.path.join(SCHEMADIR, "bdsf_gaul_source_mapper.yaml")
     content = "\n".join(
         [
-            "#format: Source_id RA DEC Total_flux DC_Maj DC_Min DC_PA Spec_Indx",
-            "0 0.0 -30.0 1.5 0.01 0.005 45.0 -0.7",
+            "#format: Source_id RA DEC Total_flux DC_Maj DC_Min DC_PA Spec_Indx cont_reffreq",
+            "0 0.0 -30.0 1.5 0.01 0.005 45.0 -0.7 1.42e9",
         ]
     )
     model = ASCIISkymodel(params.write_temp_file(content), source_schema_file=schema_path)
@@ -628,8 +628,8 @@ def test_pybdsf_srl_schema_parsing(params):
     schema_path = os.path.join(SCHEMADIR, "bdsf_srl_source_mapper.yaml")
     content = "\n".join(
         [
-            "#format: Source_id RA DEC Total_flux Maj Min PA Spec_Indx",
-            "0 0.0 -30.0 1.5 0.01 0.005 45.0 -0.7",
+            "#format: Source_id RA DEC Total_flux Maj Min PA Spec_Indx cont_reffreq",
+            "0 0.0 -30.0 1.5 0.01 0.005 45.0 -0.7 1.42e9",
         ]
     )
     model = ASCIISkymodel(params.write_temp_file(content), source_schema_file=schema_path)

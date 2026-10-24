@@ -1,5 +1,7 @@
 info: "Mapper for PyBDSF SRL (source-list) catalogues: maps SRL catalogue columns to the simms sky model schema using the 'alias' fields. Use with the --ascii-species option of simms skysim."
 
+catalogue_format: pybdsf
+
 parameters:
   name:
     info: Source name/label
