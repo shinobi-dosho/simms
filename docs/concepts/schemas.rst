@@ -117,7 +117,19 @@ maps the measured source sizes ``Maj``/``Min``/``PA``. Both map ``Total_flux``,
 ``RA``/``DEC``, ``Source_id`` and, when present, ``Total_Q``/``Total_U``/
 ``Total_V`` and ``Spec_Indx``.
 
-The delimiter is detected automatically unless the file needs ``--ascii-delimiter ,``.
+The PyBDSF mappers accept native ASCII catalogues, including their metadata
+preamble and commented column header; extra measurement and error columns are
+ignored. The reference frequency comes from the detection-image header.
+``Spec_Indx`` is used as a power-law index; a nonzero index requires a finite,
+positive reference frequency. Without an index, the spectrum is explicitly
+flat. Gaussian axes are deconvolved FWHM in degrees, and each Gaussian retains
+its integrated ``Total_flux``. Negative RA values wrap into [0, 360) degrees.
+
+Ordinary Simms and custom-mapper tables retain the ``#format:`` header and
+reject unknown columns. They split on whitespace by default; use
+``--ascii-delimiter ,`` for comma-separated tables. The Aegean and WSClean
+built-in mappers select column aliases for such tables; native WSClean files
+can instead be read with ``--wsclean-sky``.
 
 Writing a custom mapper
 -------------------------

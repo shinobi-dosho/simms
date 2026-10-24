@@ -1,4 +1,6 @@
-info: "Mapper for PyBDSF GAUL sources: maps GAUL catalogue columns to the simms sky model schema using the 'alias' fields. Use with the --mapping option of simms skysim."
+info: "Mapper for PyBDSF GAUL sources: maps GAUL catalogue columns to the simms sky model schema using the 'alias' fields. Use with the --source-schema option of simms skysim."
+
+catalogue_format: pybdsf
 
 parameters:
   name:

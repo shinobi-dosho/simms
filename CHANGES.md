@@ -1,5 +1,12 @@
 ### 3.0.2 -> unreleased
 
+- Fix built-in ASCII species mapper selection and accept native PyBDSF ASCII
+  catalogues with their metadata preamble, full commented column header and
+  measurement/error columns. Preserve each Gaussian's integrated flux,
+  deconvolved FWHM, optional Stokes polarization and reference-frequency
+  spectrum. Missing indices are flat; nonzero indices without a valid
+  reference frequency fail rather than silently predicting a flat spectrum.
+
 - WSClean IDG diagonal a-term FITS screens can be exported with
   `primary-beam to-fits --fits-format wsclean --ms ...` and imported with
   `skysim --aterm-config ...`. Export writes a sky-frame time-dependent

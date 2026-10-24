@@ -584,7 +584,7 @@ def runit(opts):
         elif opts.source_schema:
             source_schema = opts.source_schema
         elif opts.ascii_species:
-            source_schema = f"{SCHEMADIR}/{opts.ascii_species}.yaml"
+            source_schema = f"{SCHEMADIR}/{opts.ascii_species}_source_mapper.yaml"
         else:
             source_schema = f"{SCHEMADIR}/source_schema.yaml"
 
