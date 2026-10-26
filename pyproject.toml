@@ -33,7 +33,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ninja = ["stimela-ninja>=0.1.0b7"]
+ninja = ["stimela-ninja>=0.1.0"]
 
 [build-system]
 requires = ["hatchling"]
@@ -80,7 +80,7 @@ Changelog = "https://github.com/shinobi-dosho/simms/blob/main/CHANGES.md"
 # rules exist (UP038 was removed between 0.12 and 0.15, so a pinned-elsewhere hook could
 # pass while CI failed).
 ruff = [
-    "ruff>=0.15.22,<0.16",
+    "ruff>=0.15.22,<0.18",
 ]
 
 tests = [
