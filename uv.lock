@@ -2810,7 +2810,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.6" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "scipy" },
-    { name = "stimela-ninja", marker = "extra == 'ninja'", specifier = ">=0.1.0b7" },
+    { name = "stimela-ninja", marker = "extra == 'ninja'", specifier = ">=0.1.0" },
     { name = "tqdm" },
 ]
 provides-extras = ["ninja"]
