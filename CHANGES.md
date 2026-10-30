@@ -1,5 +1,11 @@
 ### 3.0.2 -> unreleased
 
+- Correct `telsim --startha` to local hours at the first integration centre,
+  including zero. Resolve the nearest occurrence to `--starttime` (or now),
+  and derive UVW and elevations from the actual MS timestamps. This replaces
+  the undocumented pi-radian, Greenwich, track-centre convention; timestamp
+  mode also no longer centres UVW half a track before TIME. See #207 and #206.
+
 - Fix built-in ASCII species mapper selection and accept native PyBDSF ASCII
   catalogues with their metadata preamble, full commented column header and
   measurement/error columns. Preserve each Gaussian's integrated flux,

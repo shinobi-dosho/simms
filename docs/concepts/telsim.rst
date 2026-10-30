@@ -39,11 +39,24 @@ List the available telescope layouts:
 Time and frequency specification
 ---------------------------------
 
-``--starttime`` is a UTC ISO timestamp; if omitted the current machine time is
-used. ``--dtime`` is the integration (dump) length in seconds and ``--ntime``
-is the number of dumps. ``--startha`` lets you give the starting hour angle
-instead of a date, which is useful for short test tracks where only the
-relative geometry matters.
+``--starttime`` is the UTC ISO timestamp of the first integration centre;
+if omitted, the current time is used. ``--dtime`` is the integration interval
+in seconds and ``--ntime`` is the number of integrations. Samples are spaced
+by exactly ``dtime`` seconds, without including an extra endpoint.
+
+``--startha`` specifies the **local hour angle in hours** of the first
+integration centre, including zero. With this option, ``--starttime`` selects
+the nearest occurrence of that hour angle (using now if omitted). The MS
+timestamps, UVW and elevations all describe that same track.
+
+For example, ``--startha=-2 --dtime=32 --ntime=450`` makes a four-hour
+observation starting at local HA -2 h. Its last sample is 449 x 32 seconds
+later, approximately +2 h; hour angle advances in sidereal hours while
+integration intervals are SI seconds. There is no extra endpoint sample.
+
+This changes the historical, undocumented ``startha * pi`` Greenwich-angle
+convention and the centred UVW span. Scripts that compensated for those
+behaviours must supply local starting hour angles instead.
 
 ``--startfreq`` and ``--dfreq`` accept units (``900MHz``, ``1MHz``) or bare
 numbers in Hz. ``--nchan`` is the number of channels. Alternatively,
