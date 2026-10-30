@@ -155,12 +155,18 @@ def telsim_impl(
     ),
     starttime: str | None = Field(
         None,
-        description="Observation start time in UTC, e.g. '2024-03-14T06:15:10'. Default is the current machine time.",
+        description=(
+            "UTC time of the first integration centre (nearest-epoch reference with --startha), "
+            "e.g. '2024-03-14T06:15:10'. Default is the current machine time."
+        ),
         json_schema_extra={"param_meta": {"abbreviation": "st"}},
     ),
     startha: float | None = Field(
         None,
-        description="Hour angle at start of observation. Can be used instead of date.",
+        description=(
+            "Local hour angle of the first integration centre, in hours. "
+            "Selects the occurrence nearest --starttime (or now)."
+        ),
         json_schema_extra={"param_meta": {"abbreviation": "sha"}},
     ),
     dtime: float = Field(

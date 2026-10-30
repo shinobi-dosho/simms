@@ -1,5 +1,4 @@
 import logging
-from datetime import datetime
 
 import astropy.units as u
 import numpy as np
@@ -267,7 +266,7 @@ class Array:
         start_time: Union[str, List[str]]
                     : start time of the observation in UTC (YYYY-MM-DDTHH:MM:SS). Default is the current machine time.
         start_ha: float
-                    : start hour angle in radians
+                    : local hour angle of the first integration centre, in hours
 
         Returns
         ---
@@ -284,39 +283,23 @@ class Array:
         ra0 = ra_dec["m0"]["value"]
         dec0 = ra_dec["m1"]["value"]
 
-        if not start_time:
-            date = datetime.now()
-            start_time = date.strftime("%Y-%m-%dT%H:%M:%S")
-            start_day = Time(start_time, format="isot", scale="utc")
-        else:
-            if isinstance(start_time, str):
-                start_day = Time(start_time, format="isot", scale="utc")
+        start_day = Time(start_time, format="isot", scale="utc") if start_time else Time.now()
+        if start_ha is not None:
+            if not np.isfinite(start_ha):
+                raise ValueError("start_ha must be a finite local hour angle in hours")
+            # Choose the occurrence nearest the supplied UTC epoch (or now).
+            # Iterate in sidereal time so the geometry and MS timestamps agree.
+            target = start_ha * u.hourangle
+            for _ in range(3):
+                local_ha = start_day.sidereal_time("mean", longitude=self.lon0 * u.rad) - ra0 * u.rad
+                error = (local_ha - target).wrap_at(180 * u.deg)
+                start_day -= error.to_value(u.hourangle) / 1.00273790935 * u.hour
 
-        start_time_sec = start_day.to_value("mjd") * 24 * 3600
-        total_time = ntimes * dtime
-        time_entries = np.array([start_time_sec + i * dtime for i in range(ntimes)])
-
-        if start_ha:
-            ih0 = start_ha * constants.PI
-        else:
-            # Greenwich hour angle: the baselines below are differences of absolute
-            # ECEF/ITRF antenna positions (X axis at longitude 0), so the UVW rotation
-            # uses GMST - RA, not the local hour angle. The array longitude is already
-            # encoded in the antenna coordinates. (The beam parallactic angle, by
-            # contrast, uses the *local* hour angle -- a different, site-local quantity.)
-            gmst = start_day.sidereal_time(kind="mean", longitude=0 * u.deg)
-            gmst_rad = gmst.to_value("rad")
-            gha = gmst_rad - ra0
-            gha = gha % (2 * constants.PI)
-
-            start_day_rads = start_day.to_value("mjd") % 1
-            start_day_rads *= 24 * 15 * constants.PI / 180
-            ih0 = gha
-
-        total_time_rad = np.deg2rad(total_time / 3600 * 15)
-        h0 = ih0 + np.linspace(-total_time_rad / 2, total_time_rad / 2, ntimes)
-
-        source_elevations = self.get_source_elevation(latitude, dec0, h0)
+        sample_times = start_day + np.arange(ntimes) * dtime * u.s
+        time_entries = sample_times.to_value("mjd") * 86400
+        # Absolute ITRF baselines need Greenwich HA; elevations need local HA.
+        h0 = sample_times.sidereal_time("mean", longitude=0 * u.deg).to_value("rad") - ra0
+        source_elevations = self.get_source_elevation(latitude, dec0, h0 + self.lon0)
 
         # Transformation matrix
         dec = np.ones(ntimes) * dec0

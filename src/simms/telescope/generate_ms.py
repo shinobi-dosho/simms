@@ -223,7 +223,7 @@ def create_ms(
     start_time : Union[str, List[str]], optional
         Observation start time (string or list for multi-part definitions).
     start_ha : float, optional
-        Starting hour angle (radians).
+        Local hour angle of the first integration centre (hours); selects the occurrence nearest start_time (or now).
     freq_range : str, optional
         Alternative frequency specification: [start, end, nchan].
     sfile : File, optional
